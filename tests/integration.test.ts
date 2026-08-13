@@ -46,12 +46,12 @@ function userMsg(id: string, text: string) {
   return { type: "message", id, parentId: null, timestamp: "", message: { role: "user", content: text, timestamp: Date.now() } };
 }
 
-test("factory registers the compress tool and 4 flat commands", () => {
+test("factory registers the compress tool and 6 flat commands", () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as any);
 
   assert.ok(api.tools.some((t) => t.name === "compress"), "compress tool registered");
-  assert.deepEqual([...api.commands.keys()].sort(), ["acp", "acp-decompress", "acp-search", "acp-status"]);
+  assert.deepEqual([...api.commands.keys()].sort(), ["acp", "acp-decompress", "acp-model", "acp-search", "acp-settings", "acp-status"]);
   assert.ok(handlers.has("context"), "context event wired");
   assert.ok(handlers.has("session_before_compact"), "compaction-disable wired");
   assert.ok(handlers.has("before_agent_start"), "system-prompt wired");

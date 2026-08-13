@@ -6,7 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { CoreMessage, NudgeDecision, CompressionBlock, Prompts } from "acp-kernel";
 import { renderNudgeText, resolvePrompts, defaultPrompts } from "acp-kernel";
-import { type AdapterConfig, resolveDelegate } from "./config.js";
+import { type AdapterConfig, compressorModeForTier, resolveDelegate } from "./config.js";
 import { createRuntime, type AcpRuntime } from "./runtime.js";
 import { makeCompressTool } from "./compress-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
@@ -14,7 +14,7 @@ import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
 import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, resetDelegateUsage, setDelegateDisplayUsage } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
-import { coreOutToAgentMessages } from "./messages.js";
+import { coreOutToAgentMessages, materializeCompressionAnchors } from "./messages.js";
 import { buildAcpSystemPrompt, ACP_DELEGATE_PROMPT } from "./system-prompt.js";
 import { delegateStatusWidget } from "./fleet-widget.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
@@ -172,7 +172,11 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
     });
 
     const originalById = collectOriginals(entries);
-    const rebuilt = coreOutToAgentMessages(turn.messages, originalById);
+    const rebuilt = materializeCompressionAnchors(
+      coreOutToAgentMessages(turn.messages, originalById),
+      turn.state.blocks,
+      "compress",
+    );
     const debugOn = debug.enabled;
 
     if (turn.nudge?.shouldInject) {
@@ -193,10 +197,13 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
       const turnKey = lastUserMessageId(entries) ?? sid;
       const alreadyShown = !emergency && runtime.nudgeShownFor(turnKey);
       if (!alreadyShown) {
-        rebuilt.push(nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts));
+        rebuilt.push(nudgeMessage(turn.nudge, turn.state.blocks.filter((b) => b.active), runtime.prompts, runtime.adapter));
         const rendered = renderNudgeText(turn.nudge, runtime.prompts);
         const top = [...turn.nudge.compressibleRanges].sort((a, b) => b.tokens - a.tokens)[0];
-        const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}", summary: "..." }] })` : "";
+        const targetTier = (turn.nudge.tier ?? 1) as 1 | 2 | 3;
+        const externalWriter = compressorModeForTier(runtime.adapter, targetTier) === "configured";
+        const summaryArg = externalWriter ? "" : ', summary: "..."';
+        const example = top ? `\n\nExample: compress({ content: [{ startId: "${top.startRef}", endId: "${top.endRef}"${summaryArg} }] })` : "";
         if (emergency) {
           logWarn("nudge", { sid: ctx.sessionManager.getSessionId(), event: "emergency-inject", pct: Math.round(turn.nudge.contextUsage * 100), voice: rendered.voice, compressible: turn.nudge.compressibleRanges.length });
         }
@@ -233,7 +240,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
 function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime): void {
   pi.on("before_agent_start", (event) => {
     const delegate = runtime.adapter.delegate !== false;
-    const acp = buildAcpSystemPrompt(runtime.prompts);
+    const acp = buildAcpSystemPrompt(runtime.prompts, runtime.adapter);
     const prompt = delegate ? `${acp}\n${ACP_DELEGATE_PROMPT}` : acp;
     return { systemPrompt: formatSystemPromptForEvent(event.systemPrompt, prompt) };
   });
@@ -257,9 +264,17 @@ function collectOriginals(entries: Array<{ type: string; id: string; message?: A
   return map;
 }
 
-function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts: Prompts): AgentMessage {
+export function routeCompressionNudgeText(text: string, adapter: AdapterConfig, tier: 1 | 2 | 3): string {
+  return compressorModeForTier(adapter, tier) === "configured"
+    ? text.replaceAll(', summary: "..."', "").replaceAll(', "summary": "..."', "")
+    : text;
+}
+
+function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts: Prompts, adapter: AdapterConfig): AgentMessage {
   const rendered = renderNudgeText(nudge, prompts);
-  const lines = [rendered.text];
+  const tier = (nudge.tier ?? 1) as 1 | 2 | 3;
+  const routedText = routeCompressionNudgeText(rendered.text, adapter, tier);
+  const lines = [routedText];
 
   if (blocks.length > 0) {
     const totalSummary = blocks.reduce((s, b) => s + Math.ceil((b.summary || "").length / 4), 0);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveConfig, resolveDelegate, type AdapterConfig } from "../src/config.js";
+import { compressionThinkingLevel, compressorModeForTier, parseCompressionModel, resolveConfig, resolveDelegate, type AdapterConfig } from "../src/config.js";
 
 const EMPTY: AdapterConfig = {};
 
@@ -136,4 +136,33 @@ test("resolveDelegate: legacy flat displayUsage still works with undefined deleg
 test("resolveDelegate: object displayUsage takes priority over legacy flat", () => {
   const r = resolveDelegate({ delegate: { displayUsage: "separate" }, displayUsage: "merged" });
   assert.equal(r.displayUsage, "separate");
+});
+
+test("compression tiers default to the main model independently", () => {
+  assert.equal(compressorModeForTier({}, 1), "main");
+  assert.equal(compressorModeForTier({}, 2), "main");
+  assert.equal(compressorModeForTier({}, 3), "main");
+  const adapter: AdapterConfig = { compress: { tier1Compressor: "configured", tier3Compressor: "configured" } };
+  assert.equal(compressorModeForTier(adapter, 1), "configured");
+  assert.equal(compressorModeForTier(adapter, 2), "main");
+  assert.equal(compressorModeForTier(adapter, 3), "configured");
+  assert.equal(compressorModeForTier({ compress: { tier2Compressor: "invalid" as never } }, 2), "main");
+});
+
+test("configured compressor thinking level defaults to medium and validates config", () => {
+  assert.equal(compressionThinkingLevel({}), "medium");
+  assert.equal(compressionThinkingLevel({ compress: { thinkingLevel: "high" } }), "high");
+  assert.equal(compressionThinkingLevel({ compress: { thinkingLevel: "off" } }), "off");
+  assert.equal(compressionThinkingLevel({ compress: { thinkingLevel: "unsupported" as never } }), "medium");
+});
+
+test("parseCompressionModel preserves slashes inside model ids", () => {
+  assert.deepEqual(parseCompressionModel("openrouter/anthropic/claude-sonnet"), {
+    provider: "openrouter",
+    id: "anthropic/claude-sonnet",
+  });
+  assert.equal(parseCompressionModel(undefined), undefined);
+  assert.equal(parseCompressionModel(42), undefined);
+  assert.equal(parseCompressionModel("missing-provider"), undefined);
+  assert.equal(parseCompressionModel("/missing"), undefined);
 });

@@ -43,7 +43,12 @@ Create `~/.pi/acp.json` (or `<project>/.pi/acp.json`) and drop in whichever keys
   "compress": {
     "maxContextLimit": "75%",
     "emergencyThresholdPercent": "95%",
-    "nudgeGrowthTokens": 50000
+    "nudgeGrowthTokens": 50000,
+    "model": "openai/gpt-5.6-luna",
+    "thinkingLevel": "medium",
+    "tier1Compressor": "main",
+    "tier2Compressor": "main",
+    "tier3Compressor": "main"
   }
 }
 ```
@@ -108,6 +113,11 @@ All keys below are currently **ACTIVE**.
 | `compress.maxContextLimit` | number \| string | `"75%"` | 🟢 ACTIVE | Context threshold that triggers forced compression nudges. |
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | Context threshold that triggers emergency truncation. |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | Token growth step for soft compression nudges. |
+| `compress.model` | string | *(none)* | 🟢 ACTIVE | Model selected by `/acp-model`, written as `provider/model-id`. |
+| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | Thinking level for the configured model: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. |
+| `compress.tier1Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 1. |
+| `compress.tier2Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 2. |
+| `compress.tier3Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 3. |
 
 **Prompts keys**
 
@@ -222,6 +232,18 @@ The flow is:
 - **Default:** `50000`
 - **Status:** 🟢 ACTIVE
 - **Description:** The token-growth threshold that controls the cadence of **soft** compression nudges. A soft nudge fires roughly every time this many tokens of new compressible content accumulate. A lower value means the model is nudged to compress more often; a higher value means less frequent nudges. This only governs *growth-driven* nudges — once usage crosses `compress.maxContextLimit`, forced nudges take over regardless of this setting. Maps to the kernel settings `nudge.growthFloor` and `nudge.growthCap`.
+
+### Compression model routing
+
+Use `/acp-model` to select an authenticated compression model, then `/acp-settings` to choose its thinking level and the writer independently for Tier 1, Tier 2, and Tier 3. Both commands persist their choices in the global `~/.pi/acp.json`; project-local config can override them on the next session.
+
+- **`compress.model`** — `provider/model-id` selected by `/acp-model`. No default.
+- **`compress.thinkingLevel`** — configured-model thinking level; default `"medium"`. `/acp-settings` offers only levels supported by the selected model.
+- **`compress.tier1Compressor`** — `"main"` or `"configured"`; default `"main"`.
+- **`compress.tier2Compressor`** — `"main"` or `"configured"`; default `"main"`.
+- **`compress.tier3Compressor`** — `"main"` or `"configured"`; default `"main"`.
+
+When a tier uses `"configured"`, the main agent still decides when and what to compress. The selected model receives only the resolved source range, framed as untrusted JSON data under a separate system policy, and writes the summary. Unselected recent context and protected tool results are not forwarded. Its usage is attached to the `compress` tool result. If it fails, ACP visibly falls back to the authenticated main model. Configured compressors require Pi 0.84.1 or newer.
 
 ---
 

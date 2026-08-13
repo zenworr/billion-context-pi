@@ -14,6 +14,15 @@ export interface DelegateConfig {
   displayUsage?: "merged" | "separate";
 }
 
+/** Selects who writes a compression summary for a tier. */
+export type CompressorMode = "main" | "configured";
+
+/** Thinking level for the configured compression model. */
+export type CompressionThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** Compression tiers supported by acp-kernel. */
+export type CompressionTier = 1 | 2 | 3;
+
 /** Compression tuning. All fields accept a ratio (0.75) or percent string
  *  ("75%") where noted. */
 export interface CompressConfig {
@@ -29,6 +38,16 @@ export interface CompressConfig {
   /** Token growth threshold for soft compression nudges. Default: 50000.
    *  Maps to kernel nudge.growthFloor + nudge.growthCap. */
   nudgeGrowthTokens?: number;
+  /** Model selected by /acp-model, stored as "provider/model-id". */
+  model?: string;
+  /** Thinking level used by the configured compression model. Default: "medium". */
+  thinkingLevel?: CompressionThinkingLevel;
+  /** Summary writer for Tier 1. Default: "main". */
+  tier1Compressor?: CompressorMode;
+  /** Summary writer for Tier 2. Default: "main". */
+  tier2Compressor?: CompressorMode;
+  /** Summary writer for Tier 3. Default: "main". */
+  tier3Compressor?: CompressorMode;
 }
 
 /**
@@ -142,4 +161,29 @@ export function parsePercent(v: number | string): number {
   const s = v.trim();
   if (s.endsWith("%")) return Number(s.slice(0, -1)) / 100;
   return Number(s);
+}
+
+export function compressorModeForTier(adapter: AdapterConfig, tier: CompressionTier): CompressorMode {
+  const compress = adapter.compress;
+  const configured = tier === 1
+    ? compress?.tier1Compressor
+    : tier === 2
+      ? compress?.tier2Compressor
+      : compress?.tier3Compressor;
+  return configured === "configured" ? "configured" : "main";
+}
+
+export function compressionThinkingLevel(adapter: AdapterConfig): CompressionThinkingLevel {
+  const level = adapter.compress?.thinkingLevel;
+  if (level === "off" || level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max") {
+    return level;
+  }
+  return "medium";
+}
+
+export function parseCompressionModel(value: unknown): { provider: string; id: string } | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1) return undefined;
+  return { provider: value.slice(0, slash), id: value.slice(slash + 1) };
 }

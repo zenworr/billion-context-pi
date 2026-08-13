@@ -133,6 +133,12 @@ Blocks: 3 active (3.7K summary, 15.2K original compressed)
   b3 (T2)  3.3K→1.0K  age=1m  "Architecture review"
 ```
 
+## Compression model commands
+
+`/acp-model` selects an authenticated model that can write compression summaries. `/acp-settings` configures its thinking level and independently routes Tier 1, Tier 2, and Tier 3 to either the main model (default) or the configured model. Choices are saved globally in `~/.pi/acp.json`.
+
+The main agent always decides when and what to compress. A configured compressor only writes the summary for the resolved range. If it fails, ACP reports the failure and falls back to the authenticated main model. Configured compressors require Pi 0.84.1 or newer.
+
 ## Configuration
 
 billion-context-pi works out of the box with no configuration. Three optional keys can be set in a JSON config file.
@@ -149,9 +155,16 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
   "delegate": true,
   "toolBashDefaultTimeout": 60,
   "toolOutputMaxBytes": 200000,
-  "maxContextLimit": "75%",
-  "emergencyThresholdPercent": "95%",
-  "nudgeGrowthTokens": 50000,
+  "compress": {
+    "maxContextLimit": "75%",
+    "emergencyThresholdPercent": "95%",
+    "nudgeGrowthTokens": 50000,
+    "model": "openai/gpt-5.6-luna",
+    "thinkingLevel": "medium",
+    "tier1Compressor": "main",
+    "tier2Compressor": "main",
+    "tier3Compressor": "main"
+  },
 
   "prompts": {
     "compressPhilosophy": "Override the compression philosophy...",
@@ -171,13 +184,18 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
 | `delegate` | `true` | Enable the `acp_delegate` tools (delegate/wait/cancel) and their system-prompt section. Set `false` to skip registering them (e.g. you use a different sub-agent extension, or run headless where async injection adds no value). |
 | `toolBashDefaultTimeout` | `60` | Seconds injected into the `bash` tool when the model omits `timeout`. Pi has **no** default of its own, so without this a forgotten timeout can hang for thousands of seconds. On timeout the model is guided to re-run with a larger `timeout`. `0` restores Pi's unbounded behavior. |
 | `toolOutputMaxBytes` | `200000` | Hard byte cap on tool result text (~5000 lines at ~40 B/line; applied via the `tool_result` hook). Stops runaway output that Pi's own 50KB/2000-line cap can't catch (e.g. tools Pi doesn't cap). When it fires the model is told how to see the full output — for `bash` the full output is in its temp file (`BashToolDetails.fullOutputPath`); set lower (e.g. `8192`) for a tighter context budget, or `0` to disable. |
-| `maxContextLimit` | `"75%"` | Context usage threshold that triggers **forced compression** nudges (bypasses growth-gate + cadence). Accepts a ratio (`0.75`) or percent string (`"75%"`). Lower = compress earlier / more aggressively. Maps to kernel `nudge.maxContextLimitPct`. |
-| `emergencyThresholdPercent` | `"95%"` | Context usage threshold that triggers **emergency truncation** of large tool outputs to keep the session alive. Accepts a ratio (`0.95`) or percent string (`"95%"`). Must be ≥ `maxContextLimit`. Maps to kernel `nudge.emergencyThresholdPct` + `truncate.threshold`. |
-| `nudgeGrowthTokens` | `50000` | Token growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower = compress more often; higher = compress less often. Maps to kernel `nudge.growthFloor` + `nudge.growthCap`. |
+| `compress.maxContextLimit` | `"75%"` | Context usage threshold that triggers **forced compression** nudges (bypasses growth-gate + cadence). Accepts a ratio (`0.75`) or percent string (`"75%"`). Lower = compress earlier / more aggressively. |
+| `compress.emergencyThresholdPercent` | `"95%"` | Context usage threshold that triggers **emergency truncation** of large tool outputs. Must be ≥ `compress.maxContextLimit`. |
+| `compress.nudgeGrowthTokens` | `50000` | Token growth step for soft compression nudges. |
+| `compress.model` | *(none)* | Authenticated `provider/model-id` selected by `/acp-model`. |
+| `compress.thinkingLevel` | `"medium"` | Thinking level used by the configured model. |
+| `compress.tier1Compressor` | `"main"` | Tier-1 summary writer: `"main"` or `"configured"`. |
+| `compress.tier2Compressor` | `"main"` | Tier-2 summary writer: `"main"` or `"configured"`. |
+| `compress.tier3Compressor` | `"main"` | Tier-3 summary writer: `"main"` or `"configured"`. |
 | `prompts` | *(kernel defaults)* | Override acp-kernel's 4 load-bearing compression prompt rules (`compressPhilosophy`, `howToCompressRules`, `tier2DistillRules`, `tier3CondenseRules`). Each set field replaces the default verbatim; omitted fields are inherited. Non-string values are dropped. Requires `acknowledgePromptsRisk: true` — otherwise overrides are ignored and defaults are used. |
 | `acknowledgePromptsRisk` | `false` | Safety gate for `prompts` overrides. Set `true` to acknowledge that replacing the tuned compression rules may reduce summary quality (lost paths/signatures/decisions → worse retrieval) and to make overrides take effect. |
 
-> **Only these eleven keys are read from `acp.json`.** Other tuning knobs (`preserveRecentMessages`, `protectedTools`) are code-level and not user-overridable. The three nudge thresholds (`maxContextLimit`, `emergencyThresholdPercent`, `nudgeGrowthTokens`) form a three-tier escalation: growth-driven soft nudges → forced nudges at `maxContextLimit` → emergency truncation at `emergencyThresholdPercent`.
+> **Only documented keys are read from `acp.json`.** Other tuning knobs (`preserveRecentMessages`, `protectedTools`) are code-level and not user-overridable. Compression routing defaults to the main model for every tier.
 
 ### Environment variables
 

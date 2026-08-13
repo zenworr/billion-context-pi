@@ -1,5 +1,8 @@
 import type { ExtensionCommandContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import type { AcpRuntime } from "./runtime.js";
+import type { CompressConfig, CompressionThinkingLevel, CompressionTier, CompressorMode } from "./config.js";
+import { compressionThinkingLevel, compressorModeForTier, parseCompressionModel } from "./config.js";
+import { updateGlobalCompressionConfig } from "./user-config.js";
 import { defaultCountTokens, parseBlockIdArg, collectBlockContent, formatRanges } from "acp-kernel";
 import { getSystemPromptText } from "./compat.js";
 import { getDelegateUsage } from "./delegate-tool.js";
@@ -71,7 +74,142 @@ export function makeCommands(runtime: AcpRuntime): Array<{ name: string; options
         },
       },
     },
+    {
+      name: "acp-model",
+      options: {
+        description: "Select the model used by configured ACP compressors.",
+        handler: async (_args, ctx) => selectCompressionModel(runtime, ctx),
+      },
+    },
+    {
+      name: "acp-settings",
+      options: {
+        description: "Configure ACP compression model routing and thinking level.",
+        handler: async (_args, ctx) => configureCompressionTiers(runtime, ctx),
+      },
+    },
   ];
+}
+
+async function selectCompressionModel(runtime: AcpRuntime, ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("/acp-model requires an interactive UI.", "error");
+    return;
+  }
+  const models = ctx.scopedModels && ctx.scopedModels.length > 0
+    ? ctx.scopedModels.map((scoped) => scoped.model)
+    : ctx.modelRegistry.getAvailable();
+  const ids = [...new Set(models.map((model) => `${model.provider}/${model.id}`))].sort();
+  if (ids.length === 0) {
+    ctx.ui.notify("No authenticated models are available.", "warning");
+    return;
+  }
+  const current = runtime.adapter.compress?.model;
+  const selected = await ctx.ui.select(
+    current ? `ACP compression model (current: ${current})` : "ACP compression model",
+    ids,
+  );
+  if (!selected) return;
+  const selectedModel = models.find((model) => `${model.provider}/${model.id}` === selected);
+  const levels: CompressionThinkingLevel[] = selectedModel ? thinkingLevelsForModel(selectedModel) : ["off"];
+  const currentThinking = compressionThinkingLevel(runtime.adapter);
+  const thinkingLevel = levels.includes(currentThinking)
+    ? currentThinking
+    : levels.includes("medium")
+      ? "medium"
+      : levels[0]!;
+  await persistCompressionPatch(runtime, ctx, { model: selected, thinkingLevel });
+  ctx.ui.notify(`ACP compression model set to ${selected}.`, "info");
+}
+
+async function configureCompressionTiers(runtime: AcpRuntime, ctx: ExtensionCommandContext): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("/acp-settings requires an interactive UI.", "error");
+    return;
+  }
+  while (true) {
+    const rows = ([1, 2, 3] as const).map((tier) =>
+      `Tier-${tier} compressor: ${displayCompressor(runtime, tier)}`,
+    );
+    const thinkingRow = `Configured model thinking: ${compressionThinkingLevel(runtime.adapter)}`;
+    const selected = await ctx.ui.select("ACP compression settings", [...rows, thinkingRow, "Done"]);
+    if (!selected || selected === "Done") return;
+    if (selected === thinkingRow) {
+      const level = await ctx.ui.select("Configured model thinking level", availableThinkingLevels(runtime, ctx));
+      if (level && isCompressionThinkingLevel(level)) {
+        await persistCompressionPatch(runtime, ctx, { thinkingLevel: level });
+      }
+      continue;
+    }
+    const index = rows.indexOf(selected);
+    if (index < 0) return;
+    const tier = (index + 1) as CompressionTier;
+    const modeLabel = await ctx.ui.select(`Tier-${tier} compressor`, ["main model", "configured model"]);
+    if (!modeLabel) continue;
+    const mode: CompressorMode = modeLabel === "configured model" ? "configured" : "main";
+    if (mode === "configured" && !configuredModelAvailable(runtime, ctx)) {
+      ctx.ui.notify("Select an authenticated compression model with /acp-model first.", "warning");
+      continue;
+    }
+    await persistCompressionPatch(runtime, ctx, compressorPatchForTier(tier, mode));
+  }
+}
+
+function displayCompressor(runtime: AcpRuntime, tier: CompressionTier): string {
+  const mode = compressorModeForTier(runtime.adapter, tier);
+  if (mode === "main") return "main model";
+  return `configured model (${runtime.adapter.compress?.model ?? "not selected"})`;
+}
+
+function configuredModelAvailable(runtime: AcpRuntime, ctx: ExtensionCommandContext): boolean {
+  const ref = parseCompressionModel(runtime.adapter.compress?.model);
+  if (!ref) return false;
+  const model = ctx.modelRegistry.find(ref.provider, ref.id);
+  const scoped = !ctx.scopedModels || ctx.scopedModels.length === 0
+    || ctx.scopedModels.some((candidate) => candidate.model.provider === ref.provider && candidate.model.id === ref.id);
+  return model !== undefined && scoped && ctx.modelRegistry.hasConfiguredAuth(model);
+}
+
+function availableThinkingLevels(runtime: AcpRuntime, ctx: ExtensionCommandContext): CompressionThinkingLevel[] {
+  const ref = parseCompressionModel(runtime.adapter.compress?.model);
+  const model = ref ? ctx.modelRegistry.find(ref.provider, ref.id) : undefined;
+  return model ? thinkingLevelsForModel(model) : ["off"];
+}
+
+function thinkingLevelsForModel(model: NonNullable<ExtensionCommandContext["model"]>): CompressionThinkingLevel[] {
+  if (!model.reasoning) return ["off"];
+  const levels: CompressionThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+  if (model.thinkingLevelMap?.xhigh !== undefined && model.thinkingLevelMap.xhigh !== null) levels.push("xhigh");
+  if (model.thinkingLevelMap?.max !== undefined && model.thinkingLevelMap.max !== null) levels.push("max");
+  return levels.filter((level) => model.thinkingLevelMap?.[level] !== null);
+}
+
+function isCompressionThinkingLevel(value: string): value is CompressionThinkingLevel {
+  return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
+}
+
+function compressorPatchForTier(tier: CompressionTier, mode: CompressorMode): Partial<CompressConfig> {
+  if (tier === 1) return { tier1Compressor: mode };
+  if (tier === 2) return { tier2Compressor: mode };
+  return { tier3Compressor: mode };
+}
+
+async function persistCompressionPatch(
+  runtime: AcpRuntime,
+  ctx: ExtensionCommandContext,
+  patch: Partial<CompressConfig>,
+): Promise<void> {
+  try {
+    await updateGlobalCompressionConfig(patch);
+    runtime.setAdapter({
+      ...runtime.adapter,
+      compress: { ...runtime.adapter.compress, ...patch },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Could not save ACP compression settings: ${message}`, "error");
+    throw error;
+  }
 }
 
 function fmtTokens(n: number): string {

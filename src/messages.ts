@@ -1,5 +1,5 @@
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
-import type { CoreMessage } from "acp-kernel";
+import type { CompressionBlock, CoreMessage } from "acp-kernel";
 
 type AgentMessage = SessionMessageEntry["message"];
 
@@ -234,6 +234,64 @@ export function coreOutToAgentMessages(
   }
 
   return out;
+}
+
+export function materializeCompressionAnchors(
+  messages: AgentMessage[],
+  blocks: CompressionBlock[],
+  toolName: string,
+): AgentMessage[] {
+  const activeByCallId = new Map<string, CompressionBlock[]>();
+  for (const block of blocks) {
+    if (!block.active || !block.compressCallId) continue;
+    const group = activeByCallId.get(block.compressCallId) ?? [];
+    group.push(block);
+    activeByCallId.set(block.compressCallId, group);
+  }
+  if (activeByCallId.size === 0) return messages;
+  return messages.map((message) => {
+    const value = message as AnyMessage;
+    if (value.role === "assistant" && Array.isArray(value.content)) {
+      const content = value.content.map((item) => {
+        const block = item as { type?: string; name?: string; id?: string; arguments?: unknown };
+        const active = block.type === "toolCall" && block.name === toolName && block.id
+          ? activeByCallId.get(block.id)
+          : undefined;
+        if (!active) return item;
+        const originalArguments = block.arguments && typeof block.arguments === "object" && !Array.isArray(block.arguments)
+          ? block.arguments as Record<string, unknown>
+          : {};
+        return {
+          ...block,
+          arguments: {
+            ...originalArguments,
+            content: active.map((source) => ({
+              startId: source.startRef,
+              endId: source.endRef,
+              summary: source.summary,
+              ...(source.topic ? { topic: source.topic } : {}),
+            })),
+          },
+        };
+      });
+      return { ...(message as object), content } as AgentMessage;
+    }
+    if (value.role === "toolResult" && value.toolName === toolName && value.toolCallId && activeByCallId.has(value.toolCallId)) {
+      const active = activeByCallId.get(value.toolCallId)!;
+      const originalText = extractText(value.content);
+      const provenance = active.flatMap((block) => {
+        const prefix = `Generated summary for ${block.blockId} (`;
+        const line = originalText.split("\n").find((candidate) => candidate.startsWith(prefix));
+        return line ? [line.replace(/:$/, "")] : [];
+      });
+      const text = ["ACP summary materialized in the paired protected compress call.", ...provenance].join("\n");
+      return {
+        ...(message as object),
+        content: [{ type: "text", text }],
+      } as AgentMessage;
+    }
+    return message;
+  });
 }
 
 function reconstructToolCallMessage(

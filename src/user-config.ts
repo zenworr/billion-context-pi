@@ -33,7 +33,11 @@ export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
       const raw = await fs.readFile(file, "utf8");
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object") {
-        Object.assign(merged, pickKnown(parsed));
+        const known = pickKnown(parsed as Record<string, unknown>);
+        const previousCompress = validCompressConfig(merged.compress);
+        Object.assign(merged, known);
+        const nextCompress = validCompressConfig(known.compress);
+        if (previousCompress || nextCompress) merged.compress = { ...previousCompress, ...nextCompress };
         debug.event("config-loaded", { file });
       }
     } catch (e) {
@@ -44,6 +48,38 @@ export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
     }
   }
   return merged;
+}
+
+/** Persist compression UI settings in the global ACP config without disturbing
+ * unrelated or future config keys. Returns the path written. */
+export async function updateGlobalCompressionConfig(patch: Partial<CompressConfig>): Promise<string> {
+  const dir = join(homedir(), CONFIG_DIR_NAME);
+  const file = join(dir, "acp.json");
+  let root: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(file, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`${file} must contain a JSON object.`);
+    }
+    root = { ...parsed as Record<string, unknown> };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const existing = root.compress;
+  const compress = existing && typeof existing === "object" && !Array.isArray(existing)
+    ? existing as Record<string, unknown>
+    : {};
+  root.compress = { ...compress, ...patch };
+  await fs.mkdir(dir, { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(root, null, 2)}\n`, "utf8");
+  await fs.rename(temporary, file);
+  return file;
+}
+function validCompressConfig(value: unknown): CompressConfig | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as CompressConfig
+    : undefined;
 }
 
 function join(... parts: string[]): string {
@@ -68,9 +104,14 @@ function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
 /** Merge user config onto an adapter config: user config wins for the keys it
  *  sets. Used at session_start to apply runtime-discovered config. */
 export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): AdapterConfig {
+  const compress = {
+    ...validCompressConfig(adapter.compress),
+    ...validCompressConfig(user.compress),
+  };
   return {
     ...adapter,
     ...user,
+    compress: Object.keys(compress).length > 0 ? compress : undefined,
     coreOverrides: adapter.coreOverrides,
     protectedTools: adapter.protectedTools,
     preserveRecentMessages: adapter.preserveRecentMessages,

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { loadUserConfig, applyUserConfig } from "../src/user-config.js";
+import { loadUserConfig, applyUserConfig, updateGlobalCompressionConfig } from "../src/user-config.js";
 import type { AdapterConfig } from "../src/config.js";
 
 const CONFIG_DIR_NAME = ".pi";
@@ -94,11 +94,12 @@ test("loadUserConfig project config overrides global config", async () => {
   const savedHome = snapshotHome();
   setHome(tmpHome);
   try {
-    await writeConfig(tmpHome, { debug: true, modelContextLimit: 200_000 });
-    await writeConfig(tmpCwd, { debug: false });
+    await writeConfig(tmpHome, { debug: true, modelContextLimit: 200_000, compress: { model: "openai/luna", tier1Compressor: "configured" } });
+    await writeConfig(tmpCwd, { debug: false, compress: { nudgeGrowthTokens: 30_000 } });
     const config = await loadUserConfig(tmpCwd);
     assert.equal(config.debug, false, "project debug overrides global");
     assert.equal(config.modelContextLimit, 200_000, "global modelContextLimit preserved");
+    assert.deepEqual(config.compress, { model: "openai/luna", tier1Compressor: "configured", nudgeGrowthTokens: 30_000 });
   } finally {
     restoreHome(savedHome);
     await fs.rm(tmpCwd, { recursive: true, force: true });
@@ -195,4 +196,25 @@ test("applyUserConfig supports all user config keys", () => {
   assert.equal(result.delegate, false);
   assert.equal(result.toolBashDefaultTimeout, 120);
   assert.equal(result.toolOutputMaxBytes, 100_000);
+});
+
+test("updateGlobalCompressionConfig merges compression settings without dropping other keys", async () => {
+  await writeConfig(hookHome, {
+    debug: true,
+    futureKey: { preserved: true },
+    compress: { nudgeGrowthTokens: 40_000, tier2Compressor: "main" },
+  });
+  const file = await updateGlobalCompressionConfig({
+    model: "openai/gpt-5.6-luna",
+    thinkingLevel: "high",
+    tier1Compressor: "configured",
+  });
+  const persisted = JSON.parse(await fs.readFile(file, "utf8"));
+  assert.equal(persisted.debug, true);
+  assert.deepEqual(persisted.futureKey, { preserved: true });
+  assert.equal(persisted.compress.nudgeGrowthTokens, 40_000);
+  assert.equal(persisted.compress.tier2Compressor, "main");
+  assert.equal(persisted.compress.model, "openai/gpt-5.6-luna");
+  assert.equal(persisted.compress.thinkingLevel, "high");
+  assert.equal(persisted.compress.tier1Compressor, "configured");
 });

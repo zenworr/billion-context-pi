@@ -43,7 +43,12 @@
   "compress": {
     "maxContextLimit": "75%",
     "emergencyThresholdPercent": "95%",
-    "nudgeGrowthTokens": 50000
+    "nudgeGrowthTokens": 50000,
+    "model": "openai/gpt-5.6-luna",
+    "thinkingLevel": "medium",
+    "tier1Compressor": "main",
+    "tier2Compressor": "main",
+    "tier3Compressor": "main"
   }
 }
 ```
@@ -108,6 +113,11 @@
 | `compress.maxContextLimit` | number \| string | `"75%"` | 🟢 ACTIVE | 触发强制压缩 nudge 的上下文阈值。 |
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | 触发紧急截断的上下文阈值。 |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | 软压缩 nudge 的 token 增长步长。 |
+| `compress.model` | string | *(未设置)* | 🟢 ACTIVE | `/acp-model` 选择的 `provider/model-id`。 |
+| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | 已配置模型的思考级别：`"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"` 或 `"max"`。 |
+| `compress.tier1Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 1 摘要模型。 |
+| `compress.tier2Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 2 摘要模型。 |
+| `compress.tier3Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 3 摘要模型。 |
 
 **prompts 键**
 
@@ -222,6 +232,18 @@
 - **默认值：** `50000`
 - **状态：** 🟢 ACTIVE
 - **说明：** 控制**软**压缩 nudge 频率的 token 增长阈值。每当积累约这么多新可压缩内容时，触发一次软 nudge。值越低模型被 nudge 压缩的频率越高；值越低频率越低。此设置只控制*基于增长的* nudge——用量越过 `compress.maxContextLimit` 后，强制 nudge 接管，不受此设置影响。映射到内核设置 `nudge.growthFloor` 和 `nudge.growthCap`。
+
+### 压缩模型路由
+
+先用 `/acp-model` 选择一个已认证模型，再用 `/acp-settings` 设置其思考级别，并分别设置 Tier 1、Tier 2、Tier 3 使用主模型还是已配置模型。两个命令都会将设置保存到全局 `~/.pi/acp.json`；项目级配置可在下次会话启动时覆盖这些值。
+
+- **`compress.model`** — `/acp-model` 选择的 `provider/model-id`，默认未设置。
+- **`compress.thinkingLevel`** — 已配置模型的思考级别，默认 `"medium"`。`/acp-settings` 只显示所选模型支持的级别。
+- **`compress.tier1Compressor`** — `"main"` 或 `"configured"`，默认 `"main"`。
+- **`compress.tier2Compressor`** — `"main"` 或 `"configured"`，默认 `"main"`。
+- **`compress.tier3Compressor`** — `"main"` 或 `"configured"`，默认 `"main"`。
+
+设置为 `"configured"` 时，主代理仍负责决定何时压缩、压缩哪些范围；已配置模型只接收解析后的来源范围。该范围会作为不受信任的 JSON 数据发送，系统策略与其分离；未选择的近期上下文和受保护的工具结果不会被转发。其 token 用量会附加到 `compress` 工具结果。若调用失败，ACP 会显示警告并回退到已认证的主模型。该功能需要 Pi 0.84.1 或更高版本。
 
 ---
 
