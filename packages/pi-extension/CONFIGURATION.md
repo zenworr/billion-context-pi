@@ -147,13 +147,13 @@ All keys below are currently **ACTIVE**.
 
 Configured compression runs in an isolated, no-tools request. Every request is conservatively estimated and split so its input remains below 220,000 tokens and below the selected model's safe input budget. Cross-provider transfer is blocked unless both consent keys are `true`; common secrets and configured secret patterns are redacted before transfer.
 
-Top-level `budget` controls `targetActiveTokens`, context percentages, `outputReserveTokens`, and `safetyMarginTokens`. Host compaction remains the checkpoint and overflow recovery path.
+Top-level `budget` controls `targetActiveTokens`, context percentages, `outputReserveTokens`, and `safetyMarginTokens`. The hard tool gate is derived per active model from the compiled provider projection and these reserves; it is not a fixed 204K threshold. The gate keeps bounded ACP recovery tools available and relaxes after a failed compression. Host compaction remains the checkpoint and overflow recovery path.
 
-Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`). Cleared tool output is retrievable with `acp_artifact`; `pin_context` can temporarily append block, message, or artifact context near the active tail.
+Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`). `safe-only` clears only explicitly unsigned, provider-agnostic plaintext reasoning; opaque, encrypted, signed, or provider-specific reasoning is preserved. Cleared tool output is retrievable with `acp_artifact`; inline retrieval is byte-bounded and supports `offset`/`limit`. Artifacts are limited to 50 MiB each and 500 MiB per session. Orphaned session files are removed at startup or explicitly with `/acp artifacts-cleanup`. `pin_context` is capped at eight pins and a 48K-character total payload.
 
 Top-level `memory.mode` is `"off"`, `"session"`, or `"project"`. Project files are written only after an explicit `/acp promote bN`; `automaticPromotion` must remain `false`.
 
-Top-level `optimization` is opt-in. `automaticDistillation` schedules T2/T3 work only at turn/agent boundaries. `shadowCompaction` validates without committing. `telemetry`, `costAwareRouting`, and `qualityAdaptation` are independent opt-ins; no cost route is required for correctness.
+Top-level `optimization` is opt-in. `automaticDistillation` schedules T2/T3 provider work only at the idle `agent_end` boundary. `shadowCompaction` validates without committing. `telemetry`, `costAwareRouting`, and `qualityAdaptation` are independent opt-ins; no cost route is required for correctness.
 
 ## General
 
@@ -251,7 +251,7 @@ The flow is:
 
 ### Compression model routing
 
-Use `/acp-model` to select an authenticated compression model, then `/acp-settings` to choose its thinking level and the writer independently for Tier 1, Tier 2, and Tier 3. Both commands persist their choices in the global `~/.pi/acp.json`; project-local config can override them on the next session.
+Use `/acp-model` to select an authenticated compression model, then `/acp-settings` to choose its thinking level and the writer independently for Tier 1, Tier 2, and Tier 3. Both commands persist their choices in the current project's `.pi/acp.json`. Edit `~/.pi/acp.json` explicitly only when you want a global default.
 
 - **`compress.model`** — `provider/model-id` selected by `/acp-model`. No default.
 - **`compress.thinkingLevel`** — configured-model thinking level; default `"medium"`. `/acp-settings` offers only levels supported by the selected model.

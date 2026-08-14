@@ -286,9 +286,9 @@ test("configured Tier-1 compressor generates and anchors the summary", async (t)
   );
   const serializedTurn = JSON.stringify(nextTurn);
   assert.match(serializedTurn, /The source established port 4317/);
-  assert.match(serializedTurn, /summary materialized in the paired protected compress call/);
-  assert.match(serializedTurn, /Generated summary for b1 \(Tier 1, openai\/gpt-5.6-luna\)/);
-  assert.equal(serializedTurn.match(/The source established port 4317/g)?.length, 2, "first-class checkpoint plus legacy anchor during migration");
+  assert.equal(serializedTurn.match(/The source established port 4317/g)?.length, 1, "first-class checkpoint is the sole provider-facing summary");
+  assert.doesNotMatch(serializedTurn, /summary materialized in the paired protected compress call/);
+  assert.doesNotMatch(serializedTurn, /Generated summary for b1/);
   assert.doesNotMatch(serializedTurn, /durable decision is to use port 4317/);
 });
 
@@ -348,23 +348,21 @@ test("mixed-tier batch validates all main-model summaries before configured call
     fixture.ctx,
   );
 
-  await assert.rejects(
-    fixture.compress.execute(
-      "mixed-tier-preflight",
-      { content: [
-        { startId: "b1", endId: "b2" },
-        { startId: fixture.thirdRef, endId: fixture.thirdRef },
-      ] },
-      signal,
-      undefined,
-      fixture.ctx,
-    ),
-    /Tier-1 uses the main model; summary is required/,
+  const result = await fixture.compress.execute(
+    "mixed-tier-preflight",
+    { content: [
+      { startId: "b1", endId: "b2" },
+      { startId: fixture.thirdRef, endId: fixture.thirdRef },
+    ] },
+    signal,
+    undefined,
+    fixture.ctx,
   );
+  assert.match(JSON.stringify(result.content), /raw message gaps are not allowed|summary is required/);
   assert.equal(calls, 0);
 });
 
-test("higher-tier compressor receives child summaries and raw messages between them", async (t) => {
+test("higher-tier compressor rejects raw message gaps between child summaries", async (t) => {
   let prompt = "";
   const fixture = await setup(async (_selected, value) => {
     prompt = value;
@@ -390,20 +388,18 @@ test("higher-tier compressor receives child summaries and raw messages between t
     undefined,
     fixture.ctx,
   );
-  await fixture.compress.execute(
+  const result = await fixture.compress.execute(
     "tier-two",
     { content: [{ startId: "b1", endId: "b2" }] },
     signal,
     undefined,
     fixture.ctx,
   );
-
-  assert.match(prompt, /Source: b1 \([\d.]+K?→\d+ tok, \d+x\)/);
-  assert.match(prompt, /Source: b2 \([\d.]+K?→\d+ tok, \d+x\)/);
-  assert.match(prompt, /recent filler three/);
+  assert.match(JSON.stringify(result.content), /raw message gaps are not allowed/);
+  assert.equal(prompt, "", "invalid higher-tier source is rejected before model execution");
 });
 
-test("tier promotion hides inactive generated child anchors", async (t) => {
+test("tier promotion refuses to absorb raw gaps and leaves child anchors active", async (t) => {
   const summaries = [
     "CHILD_ALPHA generated summary preserves the first telemetry decision and exact implementation constraints.",
     "CHILD_BETA generated summary preserves the second implementation outcome and exact constraints.",
@@ -427,16 +423,16 @@ test("tier promotion hides inactive generated child anchors", async (t) => {
 
   const parentArgs = { content: [{ startId: "b1", endId: "b2" }] };
   const parentResult = await fixture.compress.execute("promote-parent", parentArgs, signal, undefined, fixture.ctx);
-  fixture.entries.push(...compressionEntries("promote-parent", parentArgs, parentResult.content));
+  assert.match(JSON.stringify(parentResult.content), /raw message gaps are not allowed/);
 
   const nextTurn = await fixture.contextHandler(
     { type: "context", messages: fixture.entries.flatMap((entry) => entry.type === "message" ? [entry.message] : []) },
     fixture.ctx,
   );
   const serializedTurn = JSON.stringify(nextTurn);
-  assert.doesNotMatch(serializedTurn, /CHILD_ALPHA/);
-  assert.doesNotMatch(serializedTurn, /CHILD_BETA/);
-  assert.equal(serializedTurn.match(/PARENT_DISTILLED/g)?.length, 2, "first-class checkpoint plus legacy anchor during migration");
+  assert.match(serializedTurn, /CHILD_ALPHA/);
+  assert.match(serializedTurn, /CHILD_BETA/);
+  assert.doesNotMatch(serializedTurn, /PARENT_DISTILLED/);
 });
 
 test("partial configured response is rejected, billed, and safely falls back", async (t) => {

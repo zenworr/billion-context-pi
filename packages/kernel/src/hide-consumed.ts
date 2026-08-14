@@ -40,14 +40,12 @@ export function hideConsumedCompressCalls(
     messages: CoreMessage[],
 ): HideConsumedResult {
     const allBlockCallIds = new Set<string>();
-    const activeCallIds = new Set<string>();
     const liveRangeKeysByCallId = new Map<string, Set<string>>();
     const legacyLiveByCallId = new Set<string>();
     for (const block of state.blocks) {
         if (!block.compressCallId) continue;
         allBlockCallIds.add(block.compressCallId);
         if (!block.active) continue;
-        activeCallIds.add(block.compressCallId);
         if (block.startRef === undefined || block.endRef === undefined) {
             legacyLiveByCallId.add(block.compressCallId);
             continue;
@@ -70,7 +68,15 @@ export function hideConsumedCompressCalls(
         }
     }
 
-    const keepCallIds = new Set([...activeCallIds, ...lastOrphanedCallIds]);
+    // First-class synthetic checkpoint messages are the sole provider-facing
+    // representation of committed compression. Direct unit callers and legacy
+    // projections without those anchors retain live calls for compatibility.
+    const hasSyntheticCheckpoint = messages.some((message) => message.id.startsWith("acp:block:"));
+    const keepCallIds = new Set(lastOrphanedCallIds);
+    if (!hasSyntheticCheckpoint) {
+        for (const callId of liveRangeKeysByCallId.keys()) keepCallIds.add(callId);
+        for (const callId of legacyLiveByCallId) keepCallIds.add(callId);
+    }
 
     const hiddenCallIds = new Set<string>();
     for (const message of messages) {

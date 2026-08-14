@@ -25,7 +25,6 @@ export function defaultConfig(
       enabled: true,
       keepRecentToolUses: 5,
       clearAtLeastTokens: 16000,
-      clearToolInputs: false,
       excludeTools: ["compress", "edit", "write", "memory_write"],
       reasoning: "safe-only",
     },

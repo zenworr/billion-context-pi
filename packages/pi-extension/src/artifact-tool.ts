@@ -4,11 +4,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AcpRuntime } from "./runtime.js";
 import {
-  readArtifact,
+  readArtifactSlice,
   resolveSafeOutputPathReal,
-  writePrivateFile,
+  writeArtifactToFile,
 } from "./artifact-store.js";
 import { debug, logError, logInfo, logThrow } from "./log.js";
+import { forcedCompressionLimit } from "./config.js";
 
 const AUTO_DIR = join(homedir() || tmpdir(), ".cache", "pi", "acp-artifacts");
 const PREVIEW_CHARS = 600;
@@ -16,7 +17,9 @@ const PREVIEW_CHARS = 600;
 const ArtifactParams = Type.Object({
   id: Type.String({ description: 'Artifact id from a cleared result, for example "a12".' }),
   inline: Type.Optional(Type.Boolean({ description: "Return exact artifact text inline. Default: false, which writes a private file." })),
-  toFile: Type.Optional(Type.String({ description: "Write exact artifact text to a path under /tmp, ~/.cache/opencode, or ~/.cache/pi." })),
+  toFile: Type.Optional(Type.String({ description: "Write the complete exact artifact to a path under /tmp, ~/.cache/opencode, or ~/.cache/pi." })),
+  offset: Type.Optional(Type.Integer({ minimum: 0, description: "Inline byte offset. Default: 0." })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200_000, description: "Maximum inline bytes. Default: 64,000; hard maximum: 200,000." })),
 });
 
 type ArtifactArgs = Static<typeof ArtifactParams>;
@@ -62,9 +65,15 @@ async function handleArtifact(
     return `Artifact ${artifactId} not found. Available artifacts: ${available.join(", ") || "(none)"}.`;
   }
 
-  let content: Buffer;
+  const offset = args.offset ?? 0;
+  const contextWindow = runtime.liveContextLimit(ctx);
+  const hardLimit = forcedCompressionLimit(runtime.adapter, contextWindow);
+  const projectedTokens = runtime.projectionFor(ctx.sessionManager.getSessionId())?.estimatedTokens ?? 0;
+  const dynamicInlineBytes = Math.min(200_000, Math.max(4_000, (hardLimit - projectedTokens) * 2));
+  const limit = Math.min(args.limit ?? 64_000, dynamicInlineBytes);
+  let previewContent: Buffer;
   try {
-    content = await readArtifact(record);
+    previewContent = await readArtifactSlice(record, offset, args.inline === true ? limit : PREVIEW_CHARS * 4);
   } catch (error) {
     const next = {
       ...state,
@@ -77,9 +86,10 @@ async function handleArtifact(
   }
 
   if (args.inline === true && !args.toFile) {
-    debug.event("artifact-retrieve", { artifactId, mode: "inline", bytes: record.bytes });
-    logInfo("artifact", { sid: ctx.sessionManager.getSessionId(), event: "retrieve", artifactId, mode: "inline", bytes: record.bytes });
-    return `Artifact ${artifactId} (${record.mime}, ${record.bytes} bytes, sha256 ${record.sha256}) restored inline:\n\n${content.toString("utf8")}`;
+    debug.event("artifact-retrieve", { artifactId, mode: "inline", bytes: record.bytes, offset, limit });
+    logInfo("artifact", { sid: ctx.sessionManager.getSessionId(), event: "retrieve", artifactId, mode: "inline", bytes: record.bytes, offset, limit });
+    const end = Math.min(record.bytes, offset + previewContent.byteLength);
+    return `Artifact ${artifactId} (${record.mime}, ${record.bytes} bytes, sha256 ${record.sha256}) bytes ${offset}-${end} restored inline:\n\n${previewContent.toString("utf8")}${end < record.bytes ? "\n\n[bounded artifact slice; request another offset or use toFile]" : ""}`;
   }
 
   if (args.toFile === undefined && !record.localPath.endsWith(".gz")) {
@@ -90,7 +100,7 @@ async function handleArtifact(
       "Use the read tool to access the exact content.",
       "",
       "Preview:",
-      preview(content.toString("utf8")),
+      preview(previewContent.toString("utf8")),
     ].join("\n");
   }
 
@@ -101,7 +111,7 @@ async function handleArtifact(
     logError("artifact", { sid: ctx.sessionManager.getSessionId(), event: "path-rejected", artifactId, toFile: args.toFile });
     return `Error: toFile path must be under ${tmpdir()}, ~/.cache/opencode, or ~/.cache/pi. Got: ${args.toFile}`;
   }
-  await writePrivateFile(targetPath, content);
+  await writeArtifactToFile(record, targetPath);
 
   debug.event("artifact-retrieve", { artifactId, mode: "file", path: targetPath, bytes: record.bytes });
   logInfo("artifact", { sid: ctx.sessionManager.getSessionId(), event: "retrieve", artifactId, mode: "file", path: targetPath, bytes: record.bytes });
@@ -110,7 +120,7 @@ async function handleArtifact(
     "Use the read tool to access the exact content.",
     "",
     "Preview:",
-    preview(content.toString("utf8")),
+    preview(previewContent.toString("utf8")),
   ].join("\n");
 }
 

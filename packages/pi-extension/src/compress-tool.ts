@@ -207,6 +207,7 @@ async function handleCompress(
         preserve: range.preserve,
         sourceTokens: plannedRange.sourceTokens,
         tier: plannedRange.outputTier,
+        summaryMaxChars: externalSummaryMaxChars,
       });
       resolved.push({
         startId: range.startId,
@@ -214,7 +215,7 @@ async function handleCompress(
         summary: validation.renderedSummary,
         topic: range.topic ?? topLevelTopic,
         manifest,
-        structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, manifest, range.preserve),
+        structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, manifest, range.preserve, plannedRange.outputTier),
         quality: {
           status: validation.status,
           missingRequiredFacts: validation.missingRequiredFacts,
@@ -253,6 +254,7 @@ async function handleCompress(
         preserve: range.preserve,
         sourceTokens: plannedRange.sourceTokens,
         tier,
+        summaryMaxChars: externalSummaryMaxChars,
       });
       const execution = generated.fallbackFrom ? "isolated-main" : "isolated-configured";
       resolved.push({
@@ -262,7 +264,7 @@ async function handleCompress(
         topic: range.topic ?? topLevelTopic,
         generated: { tier, model: generated.model, thinking: generated.thinking, fallbackFrom: generated.fallbackFrom },
         manifest,
-        structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, manifest, range.preserve),
+        structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, manifest, range.preserve, tier),
         quality: {
           status: generated.fallbackFrom ? "fallback" : validation.status,
           missingRequiredFacts: validation.missingRequiredFacts,
@@ -490,13 +492,9 @@ async function generateConfiguredSummary(
   const configured = configuredRef
     ? ctx.modelRegistry.find(configuredRef.provider, configuredRef.id)
     : undefined;
-  const configuredInScope = !configuredRef || !ctx.scopedModels || ctx.scopedModels.length === 0
-    || ctx.scopedModels.some((candidate) => candidate.model.provider === configuredRef.provider && candidate.model.id === configuredRef.id);
-  let failure = configuredRef
-    ? configuredInScope ? "model is unavailable or unauthenticated" : "model is outside the active model scope"
-    : "no model is selected";
+  let failure = configuredRef ? "model is unavailable or unauthenticated" : "no model is selected";
   let failedUsage: CompressionUsage | undefined;
-  if (configured && configuredInScope && ctx.modelRegistry.hasConfiguredAuth(configured)) {
+  if (configured && ctx.modelRegistry.hasConfiguredAuth(configured)) {
     try {
       ensureCompactionTransferAllowed({
         activeProvider: ctx.model?.provider,

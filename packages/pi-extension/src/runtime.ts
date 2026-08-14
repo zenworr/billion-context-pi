@@ -37,7 +37,16 @@ export function isPiHost(sm: ExtensionContext["sessionManager"]): boolean {
 
 export interface ProjectionSnapshot {
   revision: number;
+  graphRevision: number;
+  epoch: number;
+  modelKey: string;
+  contextWindow: number;
   estimatedTokens: number;
+  localTokens: number;
+  originalTokens: number;
+  tokensCleared: number;
+  tokensPruned: number;
+  projectionHash: string;
   sourceMessages: number;
   projectedMessages: number;
   changed: boolean;
@@ -57,6 +66,9 @@ export interface AcpRuntime {
   recordContextTokens(sessionId: string, tokens: number): void;
   observedContextTokens(sessionId: string): number | undefined;
   clearContextTokens(sessionId?: string): void;
+  relaxCompressionGate(sessionId: string, durationMs?: number): void;
+  compressionGateRelaxed(sessionId: string): boolean;
+  metadataTurnsDue(sessionId: string, cadence?: number): number;
   liveContextLimit(ctx: ExtensionContext): number;
   configFor(ctx: ExtensionContext): Config;
   stateFor(ctx: ExtensionContext, liveMessages?: AgentMessage[]): Promise<{ state: CompressionState; coreMessages: ReturnType<typeof entriesToCoreMessages>; entries: SessionEntry[] }>;
@@ -214,6 +226,8 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   const nudgeShownTurns = new Set<string>();
   const projections = new Map<string, ProjectionSnapshot>();
   const observedTokensBySession = new Map<string, number>();
+  const compressionGateRelaxedUntil = new Map<string, number>();
+  const metadataTurns = new Map<string, number>();
 
   async function acquireLock(sid: string): Promise<() => void> {
     const prev = locks.get(sid) ?? Promise.resolve();
@@ -281,8 +295,27 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     },
     observedContextTokens: (sessionId) => observedTokensBySession.get(sessionId),
     clearContextTokens: (sessionId) => {
-      if (sessionId === undefined) observedTokensBySession.clear();
-      else observedTokensBySession.delete(sessionId);
+      if (sessionId === undefined) {
+        observedTokensBySession.clear();
+        projections.clear();
+        compressionGateRelaxedUntil.clear();
+        metadataTurns.clear();
+      } else {
+        observedTokensBySession.delete(sessionId);
+        projections.delete(sessionId);
+        compressionGateRelaxedUntil.delete(sessionId);
+        metadataTurns.delete(sessionId);
+      }
+    },
+    relaxCompressionGate: (sessionId, durationMs = 60_000) => {
+      compressionGateRelaxedUntil.set(sessionId, Date.now() + Math.max(1_000, durationMs));
+    },
+    compressionGateRelaxed: (sessionId) => (compressionGateRelaxedUntil.get(sessionId) ?? 0) > Date.now(),
+    metadataTurnsDue: (sessionId, cadence = 3) => {
+      const turns = (metadataTurns.get(sessionId) ?? 0) + 1;
+      if (turns < cadence) { metadataTurns.set(sessionId, turns); return 0; }
+      metadataTurns.set(sessionId, 0);
+      return turns;
     },
     liveContextLimit,
     configFor,

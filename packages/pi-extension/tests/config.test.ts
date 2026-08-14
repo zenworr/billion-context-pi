@@ -78,7 +78,6 @@ test("resolveConfig supplies and merges deterministic clearing policy", () => {
   assert.equal(defaults.enabled, true);
   assert.equal(defaults.keepRecentToolUses, 5);
   assert.equal(defaults.clearAtLeastTokens, 16_000);
-  assert.equal(defaults.clearToolInputs, false);
   assert.equal(defaults.reasoning, "safe-only");
   assert.deepEqual(defaults.excludeTools, ["compress", "edit", "write", "memory_write"]);
 

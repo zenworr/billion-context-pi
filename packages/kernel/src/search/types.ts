@@ -13,7 +13,7 @@
  */
 
 /** Where a searchable document came from. */
-export type SearchDocKind = "block" | "message" | "artifact";
+export type SearchDocKind = "block" | "message" | "artifact" | "checkpoint";
 
 export type MessageRole = "user" | "assistant" | "tool";
 
@@ -31,6 +31,8 @@ export interface SearchDoc {
     /** Block owning this doc. For blocks: the block itself. For messages: the block
      *  that compressed it (so the model knows which block to decompress for detail). */
     blockId?: string;
+    /** Checkpoint owning this historical message when no block owns it. */
+    checkpointId?: string;
     /** Tier of the owning block (display + grouping). */
     tier?: number;
     /** Approx token size (for "how big is this" display). */
@@ -80,6 +82,8 @@ export interface SearchResult {
     ref: string;
     /** Owning block id (for messages: the block that compressed it). */
     blockId?: string;
+    /** Owning checkpoint id when the message is checkpoint-only. */
+    checkpointId?: string;
     tier: number;
     score: number;
     title: string;
@@ -109,8 +113,10 @@ export interface MessageInput {
     role: MessageRole;
     text: string;
     tokens?: number;
-    /** Block id that compressed this message (undefined if still visible). */
+    /** Block id that compressed this message (undefined if checkpoint-only). */
     blockId?: string;
+    /** Checkpoint id that owns this message when no block does. */
+    checkpointId?: string;
     tier?: number;
 }
 

@@ -32,6 +32,38 @@ function compressionModel() {
   };
 }
 
+test("trusted branch instructions stay in system policy and preserve replace semantics", async () => {
+  let systemPrompt = "";
+  let sourcePayload = "";
+  const ctx = {
+    modelRegistry: {
+      complete: async (_model: unknown, request: { systemPrompt?: string; messages: Array<{ content: Array<{ text: string }> }> }) => {
+        systemPrompt = request.systemPrompt ?? "";
+        sourcePayload = request.messages[0]!.content[0]!.text;
+        return {
+          content: [{ type: "text", text: `Trusted branch summary. ${"detail ".repeat(30)}` }],
+          stopReason: "stop",
+          usage,
+        };
+      },
+    },
+  } as unknown as ExtensionContext;
+  await compressWithModel({
+    ctx,
+    model: compressionModel(),
+    thinkingLevel: "medium",
+    tier: 1,
+    source: "untrusted branch transcript",
+    prompts: defaultPrompts,
+    summaryMaxChars: 20_000,
+    trustedInstructions: "Focus on unresolved branch decisions.",
+    replaceInstructions: true,
+  });
+  assert.match(systemPrompt, /Focus on unresolved branch decisions/);
+  assert.match(systemPrompt, /replaces the standard tier-specific task/);
+  assert.doesNotMatch(sourcePayload, /Focus on unresolved branch decisions/);
+});
+
 test("configured compression splits oversized sources below the 220k input ceiling", async () => {
   const observed: number[] = [];
   const model = compressionModel();

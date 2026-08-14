@@ -1,5 +1,5 @@
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
-import { CLEARED_TOOL_RESULT_MARKER, type CompressionBlock, type CoreMessage } from "acp-kernel";
+import { CLEARED_TOOL_RESULT_MARKER, type CoreMessage } from "acp-kernel";
 
 type AgentMessage = SessionMessageEntry["message"];
 
@@ -74,32 +74,39 @@ function projectMessage(message: AgentMessage, id: string): CoreMessage[] {
     }];
   }
   if (role === "assistant") {
+    const reasoning = reasoningContent(msg.content);
+    const projectedReasoning: CoreMessage[] = reasoning ? [{
+      id: `${id}#reasoning`,
+      role: "assistant",
+      contentType: "reasoning",
+      text: reasoning.text,
+      reasoningKind: reasoning.kind,
+      reasoningSignature: reasoning.signature,
+    }] : [];
     const calls = allToolCalls(msg.content);
     if (calls.length > 0) {
       const textParts = extractText(msg.content);
-      if (calls.length === 1) {
-        const call = calls[0]!;
-        const argStr = stringifyArgs(call.arguments);
-        const text = argStr && textParts ? `${textParts}\n${argStr}` : argStr || textParts;
-        return [{ id, role: "assistant", contentType: "tool-call", toolName: call.name, toolCallId: call.id, text }];
-      }
-      return calls.map((call) => {
+      const projectedText: CoreMessage[] = textParts.trim()
+        ? [{ id: `${id}#text`, role: "assistant", contentType: "text", text: textParts }]
+        : [];
+      const projectedCalls = calls.map((call) => {
         const argStr = stringifyArgs(call.arguments);
         return {
-          id: `${id}#${call.id}`,
+          id: calls.length === 1 && !reasoning && projectedText.length === 0 ? id : `${id}#${call.id}`,
           role: "assistant" as const,
           contentType: "tool-call" as const,
           toolName: call.name,
           toolCallId: call.id,
-          text: argStr || textParts,
+          text: argStr,
         };
       });
+      return [...projectedReasoning, ...projectedText, ...projectedCalls];
     }
     const text = extractText(msg.content);
-    // Drop thinking-only turns: empty assistant text makes OpenAI-compatible
-    // providers (e.g. GLM) return 400 (no body), which Pi misreads as overflow.
-    if (!text.trim()) return [];
-    return [{ id, role: "assistant", contentType: "text", text }];
+    const projectedText: CoreMessage[] = text.trim()
+      ? [{ id, role: "assistant", contentType: "text", text }]
+      : [];
+    return [...projectedReasoning, ...projectedText];
   }
   const customText = extractText(msg.content) || fallbackText(msg);
   return customText.length > 0
@@ -202,6 +209,25 @@ export function matchesStoredText(stored: string, visible: string): boolean {
   return prefix.length > 0 && suffix.length > 0 && stored.startsWith(prefix) && stored.endsWith(suffix);
 }
 
+function reasoningContent(content: unknown): { text: string; kind: "plaintext-provider-agnostic" | "encrypted" | "provider-specific"; signature?: string } | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const blocks = content.flatMap((item) => {
+    const block = item as { type?: string; thinking?: string; thinkingSignature?: string; redacted?: boolean };
+    return block.type === "thinking" && (block.thinking || block.thinkingSignature)
+      ? [block]
+      : [];
+  });
+  if (blocks.length === 0) return undefined;
+  const signature = blocks.map((block) => block.thinkingSignature).filter((value): value is string => Boolean(value)).join("\n") || undefined;
+  const text = blocks.map((block) => block.thinking).filter(Boolean).join("\n") || "[opaque provider reasoning]";
+  const redacted = blocks.some((block) => block.redacted === true);
+  return {
+    text,
+    kind: redacted ? "encrypted" : signature ? "provider-specific" : "plaintext-provider-agnostic",
+    signature,
+  };
+}
+
 function allToolCalls(content: unknown): { name: string; id: string; arguments?: unknown }[] {
   if (!Array.isArray(content)) return [];
   const calls: { name: string; id: string; arguments?: unknown }[] = [];
@@ -225,102 +251,55 @@ export function coreOutToAgentMessages(
   originalById: Map<string, AgentMessage>,
 ): AgentMessage[] {
   const out: AgentMessage[] = [];
-  const emittedSplit = new Set<string>();
+  const emittedOriginals = new Set<string>();
 
   for (const core of coreOut) {
     const hashIdx = core.id.indexOf("#");
-    if (hashIdx < 0) {
-      const original = originalById.get(core.id);
-      if (original) {
-        out.push(patchRefTag(original, core));
-      } else if (core.role === "system" && core.contentType === "text" && core.text) {
-        out.push({
-          role: "custom",
-          customType: core.id.startsWith("acp:block:") ? "acp-block-checkpoint" : "acp-host-checkpoint",
-          content: core.text,
-          display: false,
-          timestamp: 0,
-        } as AgentMessage);
-      }
+    const baseId = hashIdx < 0 ? core.id : core.id.substring(0, hashIdx);
+    const original = originalById.get(baseId);
+    if (original) {
+      if (emittedOriginals.has(baseId)) continue;
+      emittedOriginals.add(baseId);
+      const group = coreOut.filter((candidate) => candidate.id === baseId || candidate.id.startsWith(`${baseId}#`));
+      out.push(reconstructProjectedMessage(original, baseId, group));
       continue;
     }
-
-    const baseId = core.id.substring(0, hashIdx);
-    if (emittedSplit.has(baseId)) continue;
-    emittedSplit.add(baseId);
-
-    const original = originalById.get(baseId);
-    if (!original) continue;
-
-    const survivingCallIds = new Set(
-      coreOut
-        .filter((c) => c.id.startsWith(`${baseId}#`) && !c.id.startsWith("acp:block:"))
-        .map((c) => c.toolCallId)
-        .filter((id): id is string => !!id),
-    );
-
-    out.push(reconstructToolCallMessage(original, core, survivingCallIds));
+    if (hashIdx < 0 && core.role === "system" && core.contentType === "text" && core.text) {
+      out.push({
+        role: "custom",
+        customType: core.id.startsWith("acp:block:") ? "acp-block-checkpoint" : "acp-host-checkpoint",
+        content: core.text,
+        display: false,
+        timestamp: 0,
+      } as AgentMessage);
+    }
   }
 
   return out;
 }
 
-export function materializeCompressionAnchors(
-  messages: AgentMessage[],
-  blocks: CompressionBlock[],
-  toolName: string,
-): AgentMessage[] {
-  const activeByCallId = new Map<string, CompressionBlock[]>();
-  for (const block of blocks) {
-    if (!block.active || !block.compressCallId) continue;
-    const group = activeByCallId.get(block.compressCallId) ?? [];
-    group.push(block);
-    activeByCallId.set(block.compressCallId, group);
+function reconstructProjectedMessage(original: AgentMessage, baseId: string, group: CoreMessage[]): AgentMessage {
+  const value = original as AnyMessage;
+  const firstCore = group[0]!;
+  const survivingCallIds = new Set(group.map((core) => core.toolCallId).filter((id): id is string => Boolean(id)));
+  if (value.role !== "assistant" || !Array.isArray(value.content)) {
+    return group.length > 1 || firstCore.id.includes("#")
+      ? reconstructToolCallMessage(original, firstCore, survivingCallIds)
+      : patchRefTag(original, firstCore);
   }
-  if (activeByCallId.size === 0) return messages;
-  return messages.map((message) => {
-    const value = message as AnyMessage;
-    if (value.role === "assistant" && Array.isArray(value.content)) {
-      const content = value.content.map((item) => {
-        const block = item as { type?: string; name?: string; id?: string; arguments?: unknown };
-        const active = block.type === "toolCall" && block.name === toolName && block.id
-          ? activeByCallId.get(block.id)
-          : undefined;
-        if (!active) return item;
-        const originalArguments = block.arguments && typeof block.arguments === "object" && !Array.isArray(block.arguments)
-          ? block.arguments as Record<string, unknown>
-          : {};
-        return {
-          ...block,
-          arguments: {
-            ...originalArguments,
-            content: active.map((source) => ({
-              startId: source.startRef,
-              endId: source.endRef,
-              summary: source.summary,
-              ...(source.topic ? { topic: source.topic } : {}),
-            })),
-          },
-        };
-      });
-      return { ...(message as object), content } as AgentMessage;
-    }
-    if (value.role === "toolResult" && value.toolName === toolName && value.toolCallId && activeByCallId.has(value.toolCallId)) {
-      const active = activeByCallId.get(value.toolCallId)!;
-      const originalText = extractText(value.content);
-      const provenance = active.flatMap((block) => {
-        const prefix = `Generated summary for ${block.blockId} (`;
-        const line = originalText.split("\n").find((candidate) => candidate.startsWith(prefix));
-        return line ? [line.replace(/:$/, "")] : [];
-      });
-      const text = ["ACP summary materialized in the paired protected compress call.", ...provenance].join("\n");
-      return {
-        ...(message as object),
-        content: [{ type: "text", text }],
-      } as AgentMessage;
-    }
-    return message;
+
+  const reasoning = group.find((core) => core.contentType === "reasoning");
+  const reasoningCleared = reasoning?.text?.includes("[ACP cleared historical plaintext reasoning]") === true;
+  const keepText = group.some((core) => core.contentType === "text");
+  const content = value.content.filter((item) => {
+    const block = item as { type?: string; id?: string };
+    if (block.type === "thinking") return Boolean(reasoning && !reasoningCleared);
+    if (block.type === "toolCall") return survivingCallIds.has(block.id ?? "");
+    if (block.type === "text") return keepText;
+    return true;
   });
+  if (reasoningCleared) content.unshift({ type: "text", text: reasoning!.text });
+  return { ...(original as object), content } as AgentMessage;
 }
 
 function reconstructToolCallMessage(
@@ -376,10 +355,15 @@ function patchRefTag(original: AgentMessage, core: CoreMessage): AgentMessage {
   const tag = match ? match[0] : null;
   if (!tag) return original;
   const base = original as AnyMessage;
-  // Skip tag injection for assistant messages — the model sees tags on its own
-  // previous responses and echoes them, causing visible tag fragments in the terminal.
-  // The model can still reference assistant messages by inferring refs from context.
-  if (base.role === "assistant") return original;
+  // Preserve Pi/provider reasoning blocks exactly. If safe-only T0 explicitly
+  // cleared a plaintext reasoning-only message, replace it with the kernel's
+  // marker; never modify signed/redacted/provider-specific reasoning.
+  if (base.role === "assistant") {
+    if (core.contentType === "reasoning" && core.text?.includes("[ACP cleared historical plaintext reasoning]")) {
+      return { ...(original as object), content: [{ type: "text", text: core.text }] } as AgentMessage;
+    }
+    return original;
+  }
   // Honor kernel body mutations (emergency truncation of large tool-results,
   // future rewrites): if core.text's body differs from the original text,
   // rebuild from the kernel body — otherwise truncation never reaches the model.

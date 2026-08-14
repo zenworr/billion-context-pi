@@ -69,7 +69,7 @@ export class SessionStateStore {
     const file = stateFileFor(sessionFile);
     const key = cacheKey(sessionFile, sessionId);
     const cached = this.cache.get(key);
-    if (cached) return cached.state;
+    if (cached) return structuredClone(cached.state);
 
     let state = createInitialState(sessionId);
     let liveRefOrigins: LiveRefOrigin[] = [];
@@ -111,8 +111,8 @@ export class SessionStateStore {
       }
     }
 
-    this.cache.set(key, { state, liveRefOrigins });
-    return state;
+    this.cache.set(key, { state: structuredClone(state), liveRefOrigins });
+    return structuredClone(state);
   }
 
   async save(
@@ -121,7 +121,7 @@ export class SessionStateStore {
     sessionId: string,
   ): Promise<CompressionState> {
     const file = stateFileFor(sessionFile);
-    if (!file) return state;
+    if (!file) return structuredClone(state);
     const key = cacheKey(sessionFile, sessionId);
     const slot = this.cache.get(key);
     if (slot && state.revision !== slot.state.revision) {
@@ -130,26 +130,32 @@ export class SessionStateStore {
       );
     }
 
-    try {
-      const disk = JSON.parse(await fs.readFile(file, "utf8")) as { schemaVersion?: unknown; revision?: unknown };
-      if (typeof disk.schemaVersion === "number" && disk.schemaVersion > 2) {
-        throw new FutureSchemaError(`ACP state schema ${disk.schemaVersion} is newer than supported schema 2; refusing overwrite.`);
-      }
-      if (typeof disk.revision === "number" && disk.revision !== state.revision) {
-        throw new Error(`ACP on-disk state revision conflict: planned ${state.revision}, current ${disk.revision}.`);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    const persisted = migrateState(
-      { ...state, revision: state.revision + 1 },
-      sessionId,
-    );
+    const graphChanged = slot ? graphSignature(slot.state) !== graphSignature(state) : true;
+    const metadataChanged = slot ? metadataSignature(slot.state) !== metadataSignature(state) : true;
+    const preparedState = slot ? {
+      ...state,
+      graphRevision: slot.state.graphRevision + (graphChanged ? 1 : 0),
+      metadataRevision: slot.state.metadataRevision + (metadataChanged ? 1 : 0),
+    } : state;
     const liveRefOrigins = slot?.liveRefOrigins ?? [];
-    await persistStateFile(file, persisted, liveRefOrigins);
-    this.cache.set(key, { state: persisted, liveRefOrigins });
-    return persisted;
+    const persisted = await withStateFileLock(file, async () => {
+      try {
+        const disk = JSON.parse(await fs.readFile(file, "utf8")) as { schemaVersion?: unknown; revision?: unknown };
+        if (typeof disk.schemaVersion === "number" && disk.schemaVersion > 2) {
+          throw new FutureSchemaError(`ACP state schema ${disk.schemaVersion} is newer than supported schema 2; refusing overwrite.`);
+        }
+        if (typeof disk.revision === "number" && disk.revision !== preparedState.revision) {
+          throw new Error(`ACP on-disk state revision conflict: planned ${preparedState.revision}, current ${disk.revision}.`);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const next = migrateState({ ...preparedState, revision: preparedState.revision + 1 }, sessionId);
+      await persistStateFile(file, next, liveRefOrigins);
+      return next;
+    });
+    this.cache.set(key, { state: structuredClone(persisted), liveRefOrigins });
+    return structuredClone(persisted);
   }
 
   getLiveRefOrigins(sessionFile: string | undefined, sessionId: string): LiveRefOrigin[] {
@@ -248,6 +254,8 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
 
   return {
     schemaVersion: 2,
+    graphRevision: numberValue(parsed.graphRevision, numberValue(parsed.revision, fresh.graphRevision)),
+    metadataRevision: numberValue(parsed.metadataRevision, 0),
     revision: numberValue(parsed.revision, fresh.revision),
     sessionId: stringValue(parsed.sessionId, sessionId),
     currentEpoch: numberValue(parsed.currentEpoch, fresh.currentEpoch),
@@ -269,6 +277,7 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
     policyState: {
       nudgeBaselines: numberRecord(policy.nudgeBaselines),
       lastActionAt: numberRecord(policy.lastActionAt),
+      recentRetrievals: numberRecord(policy.recentRetrievals),
       tokenCalibration: Object.fromEntries(
         Object.entries(calibration).flatMap(([key, value]) => {
           if (!value || typeof value !== "object") return [];
@@ -276,6 +285,13 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
           return [[key, {
             samples: numberValue(item.samples, 0),
             ratio: numberValue(item.ratio, 1),
+            verified: item.verified === true,
+            anchorProviderTokens: numberValue(item.anchorProviderTokens, numberValue(item.lastProviderTokens, 0)),
+            anchorLocalTokens: numberValue(item.anchorLocalTokens, numberValue(item.lastEstimatedTokens, 0)),
+            anchorEpoch: numberValue(item.anchorEpoch, numberValue(parsed.currentEpoch, 0)),
+            fixedOverheadTokens: numberValue(item.fixedOverheadTokens, 0),
+            candidateRatio: optionalNumber(item.candidateRatio),
+            candidateSamples: optionalNumber(item.candidateSamples),
             lastProviderTokens: numberValue(item.lastProviderTokens, 0),
             lastEstimatedTokens: numberValue(item.lastEstimatedTokens, 0),
             updatedAt: numberValue(item.updatedAt, 0),
@@ -356,6 +372,52 @@ function migrateBlock(value: unknown, currentEpoch: number): CompressionBlock {
     endRef: optionalString(block.endRef),
     supersededBy: optionalString(block.supersededBy),
   };
+}
+
+function graphSignature(state: CompressionState): string {
+  return JSON.stringify({
+    blocks: state.blocks.map(({ survivedCount: _survivedCount, ...block }) => block),
+    checkpoints: state.checkpoints,
+    artifacts: state.artifacts,
+    pins: state.pins,
+    currentEpoch: state.currentEpoch,
+    messageRefs: state.messageRefs,
+  });
+}
+
+function metadataSignature(state: CompressionState): string {
+  return JSON.stringify({
+    nudge: state.nudge,
+    policyState: state.policyState,
+    stats: state.stats,
+    tokenSnapshots: state.tokenSnapshots,
+    survivedCount: state.blocks.map((block) => [block.blockId, block.survivedCount]),
+  });
+}
+
+async function withStateFileLock<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  const lockFile = `${file}.lock`;
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 100; attempt++) {
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      handle = await fs.open(lockFile, "wx", STATE_MODE);
+      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      await handle.sync();
+      return await operation();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const stat = await fs.stat(lockFile);
+        if (Date.now() - stat.mtimeMs > 30_000) await fs.rm(lockFile, { force: true });
+      } catch { /* lock owner released between checks */ }
+      await new Promise((resolve) => setTimeout(resolve, 20 + attempt * 2));
+    } finally {
+      await handle?.close().catch(() => undefined);
+      if (handle) await fs.rm(lockFile, { force: true }).catch(() => undefined);
+    }
+  }
+  throw new Error(`Timed out acquiring ACP state lock ${lockFile}.`);
 }
 
 async function persistStateFile(

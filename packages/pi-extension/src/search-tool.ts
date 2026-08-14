@@ -4,12 +4,13 @@ import { searchBlocks, type SearchDocKind, type SearchResult } from "acp-kernel"
 import type { AcpRuntime } from "./runtime.js";
 import { buildSearchDocs } from "./search-index.js";
 import { logThrow } from "./log.js";
+import { recordRecentRetrievals } from "./retrieval-tracking.js";
 
 const SearchParams = Type.Object({
     query: Type.String({ description: "Keywords, path, symbol, or exact error text to locate in compressed history." }),
-    limit: Type.Optional(Type.Number({ description: "Max results (default 10)." })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Max results (default 10, hard maximum 20)." })),
     kinds: Type.Optional(Type.Array(Type.Union([
-        Type.Literal("block"), Type.Literal("message"), Type.Literal("artifact"),
+        Type.Literal("block"), Type.Literal("message"), Type.Literal("artifact"), Type.Literal("checkpoint"),
     ]), { description: "Optional source filters: block, message, artifact." })),
     tiers: Type.Optional(Type.Array(Type.Number(), { description: "Optional compression-tier filters for blocks and messages." })),
     roles: Type.Optional(Type.Array(Type.Union([
@@ -51,8 +52,9 @@ async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: Extensio
     const msgCount = docs.filter((d) => d.kind === "message").length;
     const blockCount = docs.filter((d) => d.kind === "block").length;
     const artifactCount = docs.filter((d) => d.kind === "artifact").length;
+    const checkpointCount = docs.filter((d) => d.kind === "checkpoint").length;
     const results = searchBlocks(docs, args.query, {
-        limit: args.limit,
+        limit: Math.min(20, Math.max(1, args.limit ?? 10)),
         kinds: args.kinds as SearchDocKind[] | undefined,
         tiers: args.tiers,
         roles: args.roles,
@@ -63,7 +65,8 @@ async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: Extensio
         return `No matches for "${args.query}" across ${blocks} block(s) and ${msgCount} historical message(s).`;
     }
 
-    const lines = [`Found ${results.length} match(es) for "${args.query}" (searched ${blockCount} blocks + ${msgCount} messages + ${artifactCount} artifacts):`];
+    await recordRecentRetrievals(runtime, ctx, results.map((result) => result.blockId ?? result.ref));
+    const lines = [`Found ${results.length} match(es) for "${args.query}" (searched ${blockCount} blocks + ${checkpointCount} checkpoints + ${msgCount} messages + ${artifactCount} artifacts):`];
     for (const r of results) lines.push("", formatResult(r));
     return lines.join("\n");
 }
@@ -80,15 +83,17 @@ function formatResult(r: SearchResult): string {
 
     const header = `${meta}  "${truncate(r.title, 50)}"`;
 
-    const decompressHint = r.kind === "block"
+    const decompressHint = r.kind === "block" || r.kind === "checkpoint"
         ? `→ decompress({ blockId: "${r.ref}" })`
         : r.kind === "artifact"
           ? `→ acp_artifact({ id: "${r.ref}" })`
           : r.blockId
             ? `→ decompress({ blockId: "${r.blockId}" })  (block containing message ${r.ref})`
-            : `(message ${r.ref} is still visible in context)`;
+            : r.checkpointId
+              ? `→ decompress({ blockId: "${r.ref}" })  (message owned by checkpoint ${r.checkpointId})`
+              : `(message ${r.ref} is still visible in context)`;
 
-    return `${header}\n  ${r.preview}\n  ${decompressHint}`;
+    return `${header}\n  ${truncate(r.preview, 2_000)}\n  ${decompressHint}`;
 }
 
 function truncate(s: string, n: number): string {

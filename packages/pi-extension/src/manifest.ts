@@ -126,6 +126,7 @@ export function validateAndRepairSummary(input: {
   preserve?: string[];
   sourceTokens: number;
   tier: 1 | 2 | 3;
+  summaryMaxChars?: number;
 }): ManifestValidation {
   const summary = input.summary.trim();
   const contradiction = findSummaryContradiction(summary, input.manifest.semanticFacts);
@@ -148,6 +149,9 @@ export function validateAndRepairSummary(input: {
     ...missingSemantic.map((fact) => fact.rendered),
     ...missingExact,
   ]);
+  if (input.summaryMaxChars !== undefined && renderedSummary.length > input.summaryMaxChars) {
+    throw new Error(`Validated summary is ${renderedSummary.length} characters after required-fact repair; limit is ${input.summaryMaxChars}. Split the source range or increase summaryMaxChars.`);
+  }
   const summaryTokens = Math.max(1, Math.ceil(renderedSummary.length / 4));
   const compressionRatio = input.sourceTokens > 0 ? summaryTokens / input.sourceTokens : 1;
   if (input.sourceTokens >= 500 && compressionRatio >= 0.9) {
@@ -167,8 +171,9 @@ export function structuredSummaryFromRendered(
   renderedSummary: string,
   manifest: CompressionManifest,
   preserve: string[] = [],
+  tier: 1 | 2 | 3 = 1,
 ): StructuredSummary {
-  const source = manifest.semanticFacts ?? emptySemanticFacts();
+  const source = semanticFactsForTier(manifest.semanticFacts ?? emptySemanticFacts(), tier);
   const renderedSegments = splitText(renderedSummary).map((text) => ({
     text,
     sourceRefs: [],
@@ -527,31 +532,61 @@ function relatedAssertions(left: PolarityAssertion, right: PolarityAssertion): b
   return overlap >= Math.max(1, Math.ceil(Math.min(leftTokens.length, rightTokens.length) * 0.5));
 }
 
-function requiredSemanticFacts(semantic: ManifestSemanticFacts | undefined, _tier: 1 | 2 | 3): RequiredSemanticFact[] {
+function semanticFactsForTier(semantic: ManifestSemanticFacts, tier: 1 | 2 | 3): ManifestSemanticFacts {
+  if (tier === 1) return semantic;
+  const durableDecision = (decision: ManifestDecision): boolean =>
+    DURABLE_SEMANTIC_RE.test(`${decision.decision} ${decision.rationale ?? ""}`);
+  if (tier === 2) {
+    return {
+      ...emptySemanticFacts(),
+      requirements: semantic.requirements,
+      decisions: semantic.decisions,
+      active: semantic.active,
+      blocked: semantic.blocked,
+      openQuestions: semantic.openQuestions,
+      nextSteps: semantic.nextSteps,
+      contradictions: semantic.contradictions,
+    };
+  }
+  return {
+    ...emptySemanticFacts(),
+    requirements: semantic.requirements,
+    decisions: semantic.decisions.filter(durableDecision),
+    blocked: semantic.blocked,
+    openQuestions: semantic.openQuestions,
+    nextSteps: semantic.nextSteps,
+    contradictions: semantic.contradictions,
+  };
+}
+
+const DURABLE_SEMANTIC_RE = /\b(must|never|required|requirement|constraint|decision|because|rationale|block(?:ed|er)?|unresolved|security|compatib|invariant|do not|cannot|shall)\b/i;
+
+function requiredSemanticFacts(semantic: ManifestSemanticFacts | undefined, tier: 1 | 2 | 3): RequiredSemanticFact[] {
   if (!semantic) return [];
+  const selected = semanticFactsForTier(semantic, tier);
   const facts: RequiredSemanticFact[] = [];
   const add = (label: string, fact: ManifestFact): void => {
     facts.push({ rendered: `${label}: ${fact.text}`, parts: [fact.text] });
   };
-  semantic.objectives
-    .filter((objective) => !semantic.requirements.some((requirement) => sameText(requirement.text, objective.text)))
+  selected.objectives
+    .filter((objective) => !selected.requirements.some((requirement) => sameText(requirement.text, objective.text)))
     .forEach((fact) => add("Objective", fact));
-  semantic.requirements.forEach((fact) => add("Requirement", fact));
-  semantic.files.filter((file) => file.status !== "read").forEach((file) => {
+  selected.requirements.forEach((fact) => add("Requirement", fact));
+  selected.files.filter((file) => file.status !== "read").forEach((file) => {
     facts.push({ rendered: `Modified file (${file.status}): ${file.path}`, parts: [file.path] });
   });
-  semantic.completed.forEach((fact) => add("Completed work", fact));
-  semantic.active.forEach((fact) => add("Active work", fact));
-  semantic.blocked.forEach((fact) => add("Blocked", fact));
-  semantic.openQuestions.forEach((fact) => add("Open question", fact));
-  semantic.nextSteps.forEach((fact) => add("Next step", fact));
-  semantic.decisions.forEach((decision) => facts.push({
+  selected.completed.forEach((fact) => add("Completed work", fact));
+  selected.active.forEach((fact) => add("Active work", fact));
+  selected.blocked.forEach((fact) => add("Blocked", fact));
+  selected.openQuestions.forEach((fact) => add("Open question", fact));
+  selected.nextSteps.forEach((fact) => add("Next step", fact));
+  selected.decisions.forEach((decision) => facts.push({
     rendered: decision.rationale
       ? `Decision: ${decision.decision} — rationale: ${decision.rationale}`
       : `Decision: ${decision.decision}`,
     parts: decision.rationale ? [decision.decision, decision.rationale] : [decision.decision],
   }));
-  semantic.contradictions.forEach((contradiction) => facts.push({
+  selected.contradictions.forEach((contradiction) => facts.push({
     rendered: `Contradiction: ${contradiction.left} <> ${contradiction.right}`,
     parts: [contradiction.left, contradiction.right],
   }));
@@ -572,10 +607,8 @@ function requiredFacts(
         ...manifest.errorStrings,
         ...manifest.numbersAndIds,
       ]
-    : tier === 2
-      ? [...preserve, ...manifest.paths, ...manifest.errorStrings]
-      : preserve;
-  return unique(exact).filter((value) => value.length > 1).slice(0, 100);
+    : preserve;
+  return unique(exact).filter((value) => value.length > 1);
 }
 
 function emptySemanticFacts(): ManifestSemanticFacts {

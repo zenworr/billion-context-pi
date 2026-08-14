@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { estimateTokens, lastUserMessageId } from "../src/tokens.js";
+import { createInitialState } from "acp-kernel";
+import { calibratedTokenEstimate, estimateTokens, lastUserMessageId, updateTokenCalibration } from "../src/tokens.js";
 
 test("estimateTokens matches kernel defaultCountTokens (CJK 1:1 + chars/4)", () => {
   const msgs = [
@@ -36,6 +37,31 @@ test("estimateTokens skips covered (already-compressed) message ids", () => {
   const covered = new Set(["m3"]);
   // m1 (4) + skip m3 (covered) = 4
   assert.equal(estimateTokens(msgs, covered), 4);
+});
+
+test("calibration uses two consistent anchored deltas and fixed overhead", () => {
+  const state = createInitialState("calibration");
+  const key = "openai/model";
+  const anchor = updateTokenCalibration(state, key, 10_000, 17_000, 0, 1)!;
+  assert.equal(anchor.verified, false);
+  const first = updateTokenCalibration(state, key, 20_000, 32_000, 0, 2)!;
+  assert.equal(first.verified, false, "one density delta is insufficient");
+  const second = updateTokenCalibration(state, key, 30_000, 47_000, 0, 3)!;
+  assert.equal(second.verified, true);
+  assert.equal(second.ratio, 1.5);
+  assert.equal(second.fixedOverheadTokens, 2_000);
+  assert.equal(calibratedTokenEstimate(40_000, state, key), 62_000);
+});
+
+test("calibration resets across checkpoint epochs and rejects mismatched counters", () => {
+  const state = createInitialState("calibration-reset");
+  const key = "openai/model";
+  updateTokenCalibration(state, key, 10_000, 12_000, 0, 1);
+  updateTokenCalibration(state, key, 20_000, 24_000, 0, 2);
+  const reset = updateTokenCalibration(state, key, 5_000, 7_000, 1, 3)!;
+  assert.equal(reset.verified, false);
+  assert.equal(reset.anchorEpoch, 1);
+  assert.equal(reset.samples, 0);
 });
 
 test("lastUserMessageId returns the id of the last user-role entry", () => {

@@ -88,7 +88,7 @@ function assistantThinkingAndText(thinking: string, text: string): object {
   };
 }
 
-test("entriesToCoreMessages drops thinking-only assistant turns (no empty assistant text → no provider 400)", () => {
+test("entriesToCoreMessages preserves thinking-only assistant turns as explicit reasoning", () => {
   const entries: SessionEntry[] = [
     msgEntry("a", user("before")),
     msgEntry("b", assistantThinkingOnly("internal reasoning, no output") as object),
@@ -96,23 +96,92 @@ test("entriesToCoreMessages drops thinking-only assistant turns (no empty assist
   ];
   const core = entriesToCoreMessages(entries);
 
-  assert.deepEqual(core.map((m) => m.id), ["a", "c"], "thinking-only assistant dropped, not emitted as empty text");
-  assert.ok(
-    !core.some((m) => m.role === "assistant" && (!m.text || !m.text.trim())),
-    "no empty-text assistant message in output",
-  );
+  assert.deepEqual(core.map((m) => m.id), ["a", "b#reasoning", "c"]);
+  assert.equal(core[1]!.contentType, "reasoning");
+  assert.equal(core[1]!.reasoningKind, "plaintext-provider-agnostic");
+  assert.match(core[1]!.text ?? "", /internal reasoning/);
 });
 
-test("entriesToCoreMessages keeps assistant turn that has thinking AND text (text extracted, thinking ignored)", () => {
+test("entriesToCoreMessages preserves assistant reasoning alongside visible text", () => {
   const entries: SessionEntry[] = [
     msgEntry("a", assistantThinkingAndText("private reasoning", "visible answer") as object),
   ];
   const core = entriesToCoreMessages(entries);
 
-  assert.equal(core.length, 1);
-  assert.equal(core[0]!.role, "assistant");
-  assert.equal(core[0]!.contentType, "text");
-  assert.equal(core[0]!.text, "visible answer", "text kept, thinking block not inlined");
+  assert.equal(core.length, 2);
+  assert.equal(core[0]!.id, "a#reasoning");
+  assert.equal(core[0]!.contentType, "reasoning");
+  assert.match(core[0]!.text ?? "", /private reasoning/);
+  assert.equal(core[1]!.role, "assistant");
+  assert.equal(core[1]!.contentType, "text");
+  assert.equal(core[1]!.text, "visible answer");
+});
+
+test("entriesToCoreMessages preserves assistant reasoning alongside tool calls", () => {
+  const entries: SessionEntry[] = [msgEntry("a", {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "tool reasoning", thinkingSignature: "sig" },
+      { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/tmp/x" } },
+    ],
+    timestamp: Date.now(),
+  } as object)];
+  const core = entriesToCoreMessages(entries);
+  assert.deepEqual(core.map((message) => message.id), ["a#reasoning", "a#call-1"]);
+  assert.equal(core[0]!.reasoningSignature, "sig");
+  assert.equal(core[1]!.toolCallId, "call-1");
+});
+
+test("assistant prose alongside a tool call is independently projected and preserved", () => {
+  const entry = msgEntry("a", {
+    role: "assistant",
+    content: [
+      { type: "text", text: "Decision: keep the validated migration path." },
+      { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/tmp/x" } },
+    ],
+    timestamp: Date.now(),
+  } as object);
+  const core = entriesToCoreMessages([entry]);
+  assert.deepEqual(core.map((message) => message.id), ["a#text", "a#call-1"]);
+  assert.match(core[0]!.text ?? "", /validated migration/);
+  assert.match(core[1]!.text ?? "", /\/tmp\/x/);
+  const rebuilt = coreOutToAgentMessages(core, new Map([["a", entry.message]]));
+  assert.equal(rebuilt.length, 1);
+  assert.equal((rebuilt[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "text").length, 1);
+  assert.equal((rebuilt[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "toolCall").length, 1);
+  const withoutProse = coreOutToAgentMessages(core.filter((message) => message.contentType !== "text"), new Map([["a", entry.message]]));
+  assert.equal((withoutProse[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "text").length, 0);
+  assert.equal((withoutProse[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "toolCall").length, 1);
+});
+
+test("reasoning and text round-trip once, and removed reasoning is not reintroduced", () => {
+  const entry = msgEntry("a", assistantThinkingAndText("private reasoning", "visible answer") as object);
+  const core = entriesToCoreMessages([entry]);
+  const originals = new Map([["a", entry.message]]);
+  const rebuilt = coreOutToAgentMessages(core, originals);
+  assert.equal(rebuilt.length, 1);
+  assert.deepEqual((rebuilt[0] as { content: unknown[] }).content, [
+    { type: "thinking", thinking: "private reasoning" },
+    { type: "text", text: "visible answer" },
+  ]);
+
+  const withoutReasoning = coreOutToAgentMessages(core.filter((message) => message.contentType !== "reasoning"), originals);
+  assert.deepEqual((withoutReasoning[0] as { content: unknown[] }).content, [{ type: "text", text: "visible answer" }]);
+});
+
+test("reasoning and tool calls round-trip as one assistant message", () => {
+  const entry = msgEntry("a", {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "tool reasoning", thinkingSignature: "sig" },
+      { type: "toolCall", id: "call-1", name: "read", arguments: { path: "/tmp/x" } },
+    ],
+    timestamp: Date.now(),
+  } as object);
+  const rebuilt = coreOutToAgentMessages(entriesToCoreMessages([entry]), new Map([["a", entry.message]]));
+  assert.equal(rebuilt.length, 1);
+  assert.equal((rebuilt[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "thinking").length, 1);
+  assert.equal((rebuilt[0] as { content: Array<{ type?: string }> }).content.filter((block) => block.type === "toolCall").length, 1);
 });
 
 test("entriesToCoreMessages drops assistant turn whose text is whitespace-only", () => {
@@ -403,7 +472,8 @@ test("coreOutToAgentMessages reconstructs parallel tool-call assistant message f
 
   const tag = acpRef("m00003");
   const coreOut: CoreMessage[] = [
-    { id: "entry1#call_a", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_a", text: tag + "\nRunning multiple tools\n{}" },
+    { id: "entry1#text", role: "assistant", contentType: "text", text: "Running multiple tools" },
+    { id: "entry1#call_a", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call_a", text: tag + "\n{}" },
     { id: "entry1#call_b", role: "assistant", contentType: "tool-call", toolName: "write", toolCallId: "call_b", text: tag + "\n{}" },
     { id: "entry1#call_c", role: "assistant", contentType: "tool-call", toolName: "list", toolCallId: "call_c", text: tag + "\n{}" },
   ];

@@ -2,12 +2,13 @@ import type { ExtensionCommandContext, RegisteredCommand } from "@earendil-works
 import type { AcpRuntime } from "./runtime.js";
 import type { CompressConfig, CompressionThinkingLevel, CompressionTier, CompressorMode } from "./config.js";
 import { compressionThinkingLevel, compressorModeForTier, parseCompressionModel } from "./config.js";
-import { updateGlobalCompressionConfig } from "./user-config.js";
+import { updateProjectCompressionConfig } from "./user-config.js";
 import { defaultCountTokens, parseBlockIdArg, collectBlockContent, formatRanges } from "acp-kernel";
 import { getSystemPromptText } from "./compat.js";
 import { getDelegateUsage } from "./delegate-tool.js";
 import { formatCompactTokens } from "./footer-status.js";
 import { promoteBlock } from "./project-memory.js";
+import { cleanupArtifactStore } from "./artifact-store.js";
 
 declare const CURRENT_VERSION: string;
 
@@ -25,6 +26,14 @@ export function makeCommands(runtime: AcpRuntime): Array<{ name: string; options
             if (!ref) { ctx.ui.notify("Usage: /acp promote <blockId>", "error"); return; }
             try { ctx.ui.notify(await promoteBlock(runtime, ctx, ref)); }
             catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
+            return;
+          }
+          if (subcommand === "artifacts-cleanup") {
+            try {
+              const { state } = await runtime.stateFor(ctx);
+              const cleaned = await cleanupArtifactStore(state, ctx.sessionManager.getSessionId());
+              ctx.ui.notify(`Artifact cleanup removed ${cleaned.removed} orphaned files (${cleaned.reclaimedBytes} bytes).`);
+            } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
             return;
           }
           ctx.ui.notify(await statusReport(runtime, ctx));
@@ -106,9 +115,7 @@ async function selectCompressionModel(runtime: AcpRuntime, ctx: ExtensionCommand
     ctx.ui.notify("/acp-model requires an interactive UI.", "error");
     return;
   }
-  const models = ctx.scopedModels && ctx.scopedModels.length > 0
-    ? ctx.scopedModels.map((scoped) => scoped.model)
-    : ctx.modelRegistry.getAvailable();
+  const models = ctx.modelRegistry.getAvailable();
   const ids = [...new Set(models.map((model) => `${model.provider}/${model.id}`))].sort();
   if (ids.length === 0) {
     ctx.ui.notify("No authenticated models are available.", "warning");
@@ -175,9 +182,7 @@ function configuredModelAvailable(runtime: AcpRuntime, ctx: ExtensionCommandCont
   const ref = parseCompressionModel(runtime.adapter.compress?.model);
   if (!ref) return false;
   const model = ctx.modelRegistry.find(ref.provider, ref.id);
-  const scoped = !ctx.scopedModels || ctx.scopedModels.length === 0
-    || ctx.scopedModels.some((candidate) => candidate.model.provider === ref.provider && candidate.model.id === ref.id);
-  return model !== undefined && scoped && ctx.modelRegistry.hasConfiguredAuth(model);
+  return model !== undefined && ctx.modelRegistry.hasConfiguredAuth(model);
 }
 
 function availableThinkingLevels(runtime: AcpRuntime, ctx: ExtensionCommandContext): CompressionThinkingLevel[] {
@@ -210,7 +215,7 @@ async function persistCompressionPatch(
   patch: Partial<CompressConfig>,
 ): Promise<void> {
   try {
-    await updateGlobalCompressionConfig(patch);
+    await updateProjectCompressionConfig(ctx.cwd, patch);
     runtime.setAdapter({
       ...runtime.adapter,
       compress: { ...runtime.adapter.compress, ...patch },

@@ -6,6 +6,7 @@ import { estimateTokens, collectCoveredMessageIds } from "./tokens.js";
 import { logThrow } from "./log.js";
 import { getDelegateUsage } from "./delegate-tool.js";
 import { resolveDelegate } from "./config.js";
+import { artifactStoreBytes } from "./artifact-store.js";
 
 const StatusParams = Type.Object({
   scope: Type.Optional(Type.Union([Type.Literal("compressed"), Type.Literal("uncompressed")], { description: '"compressed" = drill into blocks; "uncompressed" = show visible messages/ranges. Default: overview.' })),
@@ -79,6 +80,12 @@ async function handleStatus(args: StatusArgs, runtime: AcpRuntime, ctx: Extensio
   const protectedRanges = nudge?.protectedRanges ?? [];
 
   const extra: string[] = [];
+  const sessionArtifactBytes = turn.state.artifacts.filter((artifact) => artifact.retrievable).reduce((sum, artifact) => sum + artifact.bytes, 0);
+  const globalArtifactBytes = await artifactStoreBytes().catch(() => undefined);
+  const readyArtifacts = turn.state.artifacts.filter((artifact) => artifact.retrievable).length;
+  const unavailableArtifacts = turn.state.artifacts.length - readyArtifacts;
+  extra.push("");
+  extra.push(`Artifacts: ${readyArtifacts} ready, ${unavailableArtifacts} unavailable; session ${formatStorage(sessionArtifactBytes)}/${formatStorage(runtime.adapter.artifacts?.maxSessionBytes ?? 500 * 1024 * 1024)}; global ${globalArtifactBytes === undefined ? "unavailable" : `${formatStorage(globalArtifactBytes)}/${formatStorage(runtime.adapter.artifacts?.maxGlobalBytes ?? 2 * 1024 * 1024 * 1024)}`}; lifecycle ${runtime.adapter.artifacts?.lifecycle ?? "retain"}.`);
   if (nudge) {
     extra.push("");
     extra.push(
@@ -109,4 +116,11 @@ async function handleStatus(args: StatusArgs, runtime: AcpRuntime, ctx: Extensio
     extra.push("Delegate usage: none this session.");
   }
   return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
+}
+
+function formatStorage(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
 }

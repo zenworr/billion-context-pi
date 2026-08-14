@@ -1,7 +1,7 @@
 {
     "name": "nudge-triggered",
     "description": "Nudge-triggered compression: the model emits growth text across turns until billion-context-pi's context-usage nudge is injected, then the fake LLM detects the nudge and compresses. A low modelContextLimit makes the nudge fire quickly. Validates the nudge detection + baseline-recording path.",
-    "acpConfig": { "modelContextLimit": 1500 },
+    "acpConfig": { "modelContextLimit": 500 },
     "turns": [
         {
             "respond": "nudge-compress",
@@ -25,6 +25,14 @@
             "growthText": "Continuing to generate pipeline design content to fill the context window. The batch layer complements the stream layer: a nightly Spark job at src/batch/nightly.ts:40 recomputes the last 24 hours from the raw events table to correct any drift in the real-time aggregates, writing corrections to the batch_corrections table. The reconciliation merge at src/batch/reconcile.ts:28 applies batch values where they disagree with stream values, logging every override. Schemas evolve via the schema registry with backward-compatible Avro reads (src/schema/evolve.ts:22); a breaking change requires a new topic. Replay support lets us re-process the last 7 days from the raw topic into a repaired consumer (src/ops/replay.ts:35) while normal ingestion continues. Data quality SLAs (completeness >99.9%, freshness <60s) are monitored by the great_expectations suite at tests/data-quality/ and the results feed the deploy gate (src/deploy/dq-gate.ts:30). This is more pipeline design content being generated to exercise the context window and trigger the compression nudge so we can validate the nudge pipeline end to end.",
             "topic": "Batch & Replay Layer",
             "summary": "## Batch & Replay\nNightly Spark src/batch/nightly.ts:40 recompute 24h → batch_corrections. Reconcile merge src/batch/reconcile.ts:28 (log overrides). Schema evolve backward-compat src/schema/evolve.ts:22 (breaking=new topic). Replay last 7d src/ops/replay.ts:35. DQ SLAs completeness>99.9%/freshness<60s via great_expectations tests/data-quality/, gate src/deploy/dq-gate.ts:30.",
+            "range": "all"
+        },
+        {
+            "respond": "nudge-compress",
+            "userText": "Add the final operational details and consolidate now.",
+            "growthText": "Final operational details: blue-green deployment uses shadow consumers and compares aggregate checksums before traffic cutover. Incident recovery restores the last durable stream checkpoint, replays the raw topic from its stored offsets, and validates completeness before reopening writes. Operators follow the runbook at docs/pipeline-recovery.md and record every replay window and schema version in the incident timeline. This final growth turn intentionally crosses the configured active-context threshold so the ACP nudge and compression path can be verified deterministically.",
+            "topic": "Pipeline Operations",
+            "summary": "## Pipeline Operations\nBlue-green shadow consumers verify checksums before cutover. Recovery restores checkpoint, replays stored offsets, validates completeness, and follows docs/pipeline-recovery.md with replay/schema audit records.",
             "range": "all"
         },
         {

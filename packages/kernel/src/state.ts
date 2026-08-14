@@ -3,6 +3,8 @@ import type { CompressionBlock, CompressionState } from "./types.js";
 export function createInitialState(sessionId = ""): CompressionState {
   return {
     schemaVersion: 2,
+    graphRevision: 0,
+    metadataRevision: 0,
     revision: 0,
     sessionId,
     currentEpoch: 0,
@@ -22,6 +24,7 @@ export function createInitialState(sessionId = ""): CompressionState {
     policyState: {
       nudgeBaselines: {},
       lastActionAt: {},
+      recentRetrievals: {},
       tokenCalibration: {},
     },
     stats: {

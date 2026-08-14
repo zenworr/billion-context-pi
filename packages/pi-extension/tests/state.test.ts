@@ -95,7 +95,28 @@ test("load merges forward-compat: missing fields filled from fresh state", async
   await rm(dir, { recursive: true, force: true });
 });
 
- test("corrupt sidecars are quarantined and replaced with fresh in-memory state", async () => {
+test("inter-process lock serializes competing stores and rejects the stale writer", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "session.json");
+  const storeA = new SessionStateStore();
+  const storeB = new SessionStateStore();
+  await storeA.save(createInitialState("sid"), file, "sid");
+  const proposalA = await storeA.load(file, "sid");
+  const proposalB = await storeB.load(file, "sid");
+  proposalA.nextBlockId = 10;
+  proposalB.nextBlockId = 20;
+  const results = await Promise.allSettled([
+    storeA.save(proposalA, file, "sid"),
+    storeB.save(proposalB, file, "sid"),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  const loaded = await new SessionStateStore().load(file, "sid");
+  assert.ok(loaded.nextBlockId === 10 || loaded.nextBlockId === 20);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("corrupt sidecars are quarantined and replaced with fresh in-memory state", async () => {
   const dir = await tempDir();
   const file = path.join(dir, "session.json");
   await writeFile(`${file}.acp.json`, "{not-json", "utf8");

@@ -3,7 +3,7 @@ import {
   type ExtensionAPI,
   type ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_TOOL_BASH_TIMEOUT, DEFAULT_TOOL_OUTPUT_MAX_BYTES } from "./config.js";
+import { DEFAULT_TOOL_BASH_TIMEOUT, DEFAULT_TOOL_OUTPUT_MAX_BYTES, forcedCompressionLimit } from "./config.js";
 import { debug, logInfo, logWarn } from "./log.js";
 import { spoolArtifact } from "./artifact-store.js";
 import type { AcpRuntime } from "./runtime.js";
@@ -18,14 +18,14 @@ export function isBashToolResult(e: ToolResultEvent): e is BashToolResultEvent {
 
 type ContentPart = ToolResultEvent["content"][number];
 
-export const FORCED_COMPRESSION_TOKEN_LIMIT = 204_000;
+const RECOVERY_TOOLS = new Set(["compress", "acp_status", "search_context", "decompress", "acp_artifact"]);
 
-export function forcedCompressionReason(tokens: number): string {
-  return `⚠️ Context limit reached — compress now. ACP measured ${Math.round(tokens).toLocaleString("en-US")} tokens (hard limit: ${FORCED_COMPRESSION_TOKEN_LIMIT.toLocaleString("en-US")}). The compress tool is the only tool allowed until context usage is below the limit.`;
+export function forcedCompressionReason(tokens: number, limit: number): string {
+  return `⚠️ Context limit reached — compress now, or use a bounded ACP recovery tool. ACP's current compiled projection is ${Math.round(tokens).toLocaleString("en-US")} tokens (active-model hard limit: ${Math.round(limit).toLocaleString("en-US")}). Only compression and bounded ACP recovery tools are allowed until the projection is below the limit.`;
 }
 
-export function shouldBlockToolForCompression(toolName: string, tokens: number | undefined): boolean {
-  return toolName !== "compress" && tokens !== undefined && tokens >= FORCED_COMPRESSION_TOKEN_LIMIT;
+export function shouldBlockToolForCompression(toolName: string, tokens: number | undefined, limit: number): boolean {
+  return !RECOVERY_TOOLS.has(toolName) && tokens !== undefined && tokens >= limit;
 }
 
 export function resolveBashTimeout(
@@ -76,7 +76,13 @@ export function appendTimeoutNotice(
   content: ToolResultEvent["content"],
   secs: number,
 ): ToolResultEvent["content"] {
-  const notice = buildTimeoutNotice(secs);
+  return appendTextNotice(content, buildTimeoutNotice(secs));
+}
+
+function appendTextNotice(
+  content: ToolResultEvent["content"],
+  notice: string,
+): ToolResultEvent["content"] {
   const next = [...content];
   for (let i = next.length - 1; i >= 0; i--) {
     const part = next[i];
@@ -123,17 +129,19 @@ function formatBytes(n: number): string {
 export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void {
   pi.on("tool_call", (event, ctx) => {
     const sid = ctx.sessionManager.getSessionId();
-    const liveTokens = ctx.getContextUsage?.()?.tokens;
-    const observedTokens = runtime.observedContextTokens(sid);
-    // A fresh host value replaces the pre-call estimate. This lets the gate
-    // clear after compression instead of keeping a stale high-water mark.
-    const tokens = typeof liveTokens === "number" && Number.isFinite(liveTokens)
-      ? liveTokens
-      : observedTokens;
-    if (tokens !== undefined && shouldBlockToolForCompression(event.toolName, tokens)) {
-      const reason = forcedCompressionReason(tokens);
-      debug.event("guardrail-forced-compression", { sid, toolName: event.toolName, tokens, limit: FORCED_COMPRESSION_TOKEN_LIMIT });
-      logWarn("guardrail", { event: "forced-compression", sid, toolName: event.toolName, tokens, limit: FORCED_COMPRESSION_TOKEN_LIMIT });
+    const projection = runtime.projectionFor(sid);
+    const contextWindow = runtime.liveContextLimit(ctx);
+    const modelKey = `${ctx.model?.provider ?? "unknown"}/${ctx.model?.id ?? "unknown"}`;
+    const fresh = projection
+      && projection.modelKey === modelKey
+      && projection.contextWindow === contextWindow
+      && Date.now() - projection.recordedAt < 10 * 60_000;
+    const tokens = fresh ? projection.estimatedTokens : undefined;
+    const limit = forcedCompressionLimit(runtime.adapter, contextWindow);
+    if (!runtime.compressionGateRelaxed(sid) && shouldBlockToolForCompression(event.toolName, tokens, limit)) {
+      const reason = forcedCompressionReason(tokens!, limit);
+      debug.event("guardrail-forced-compression", { sid, toolName: event.toolName, tokens, limit, projectionHash: projection?.projectionHash });
+      logWarn("guardrail", { event: "forced-compression", sid, toolName: event.toolName, tokens, limit });
       return { block: true, reason };
     }
 
@@ -147,11 +155,18 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
 
   pi.on("tool_result", async (event, ctx) => {
     const isBash = isBashToolResult(event);
+    if (event.toolName === "compress" && event.isError) runtime.relaxCompressionGate(ctx.sessionManager.getSessionId());
     const fullPath = isBash ? event.details?.fullOutputPath : undefined;
     const timeoutSecs =
       isBash && event.isError ? detectBashTimeout(event.content) : undefined;
+    const max = runtime.adapter.toolOutputMaxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
+    const textParts = fullPath ? [] : toolResultTextParts(event.content);
+    const willCapNonBash = !isBash && max > 0
+      && Buffer.byteLength(textParts.join("\n"), "utf8") > max;
 
     const sid = ctx.sessionManager.getSessionId();
+    let spoolFailure: string | undefined;
+    let readyArtifactId: string | undefined;
     const release = await runtime.acquireLock(sid);
     try {
       const { state } = await runtime.stateFor(ctx);
@@ -160,9 +175,17 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
         sourceMessageId: `pending:${event.toolCallId}`,
         toolCallId: event.toolCallId,
         toolName: event.toolName,
-        text: toolResultText(event.content),
+        textParts: fullPath ? undefined : textParts,
         bashFullOutputPath: fullPath,
+        force: willCapNonBash,
+        maxArtifactBytes: runtime.adapter.artifacts?.maxArtifactBytes,
+        maxSessionBytes: runtime.adapter.artifacts?.maxSessionBytes,
+        maxGlobalBytes: runtime.adapter.artifacts?.maxGlobalBytes,
       });
+      if (spooled) {
+        if (spooled.record.retrievable) readyArtifactId = spooled.record.id;
+        else spoolFailure = spooled.record.error ?? "artifact is unavailable";
+      }
       if (spooled && spooled.state !== state) {
         await runtime.save(spooled.state, ctx);
         debug.event("artifact-spooled", {
@@ -182,26 +205,37 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
         });
       }
     } catch (error) {
-      if (!isBashToolResult(event)) return;
+      spoolFailure = error instanceof Error ? error.message : String(error);
       logWarn("artifact", {
         sid,
         event: "spool-failed",
         toolName: event.toolName,
-        error: error instanceof Error ? error.message : String(error),
+        error: spoolFailure,
       });
     } finally {
       release();
     }
 
     let modified: ToolResultEvent["content"] | undefined;
-    const max = runtime.adapter.toolOutputMaxBytes;
-    if (max !== undefined && max > 0) {
+    if (max > 0) {
       const next = capToolOutput(event.content, max, fullPath);
       if (next) {
         modified = next;
         debug.event("guardrail-output-cap", { max, hadPath: !!fullPath });
         logWarn("guardrail", { event: "output-cap", max, hadPath: !!fullPath });
       }
+    }
+
+    if (spoolFailure && !isBash) {
+      modified = appendTextNotice(
+        modified ?? event.content,
+        `[ACP guardrail: durable artifact storage failed (${spoolFailure}); output was explicitly capped and the full non-Bash result is unavailable. Retry with narrower output or free artifact quota.]`,
+      );
+    } else if (modified && readyArtifactId && !isBash) {
+      modified = appendTextNotice(
+        modified,
+        `[ACP artifact: full exact output is available as ${readyArtifactId}. Retrieve it with acp_artifact({ id: "${readyArtifactId}" }).]`,
+      );
     }
 
     if (timeoutSecs !== undefined) {
@@ -214,8 +248,8 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
   });
 }
 
-function toolResultText(content: ToolResultEvent["content"]): string {
+function toolResultTextParts(content: ToolResultEvent["content"]): string[] {
   return content.flatMap((part) => part.type === "text"
     ? [(part as { text: string }).text]
-    : []).join("\n");
+    : []);
 }

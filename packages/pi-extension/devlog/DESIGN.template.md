@@ -37,7 +37,7 @@
 
 - **Backward compatibility**:
 - **Performance**:
-- **Cross-platform** (Node >=20; Linux / macOS / Windows):
+- **Cross-platform** (Node >=22.19.0; Linux / macOS / Windows):
 
 ## 7. Open Questions
 

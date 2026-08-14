@@ -47,6 +47,7 @@ export function messageDocs(msgs: MessageInput[]): SearchDoc[] {
         title: `${m.role}: ${m.text.slice(0, 60)}`,
         role: m.role,
         blockId: m.blockId,
+        checkpointId: m.checkpointId,
         tier: m.tier,
         tokens: m.tokens,
     }));
@@ -115,6 +116,7 @@ function runSearch(
                     kind: doc.kind,
                     ref: doc.ref,
                     blockId: doc.blockId,
+                    checkpointId: doc.checkpointId,
                     tier: doc.tier ?? 1,
                     score: s.score,
                     title: doc.title,

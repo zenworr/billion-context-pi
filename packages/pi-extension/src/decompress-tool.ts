@@ -7,6 +7,7 @@ import { entriesToCoreMessages } from "./messages.js";
 import { join } from "node:path";
 import { resolveSafeOutputPathReal, writePrivateFile } from "./artifact-store.js";
 import { tmpdir, homedir } from "node:os";
+import { recordRecentRetrievals } from "./retrieval-tracking.js";
 
 /** Directory for auto-generated decompress output files. */
 const AUTO_DIR = join(homedir() || tmpdir(), ".cache", "pi", "acp-decompress");
@@ -47,6 +48,7 @@ export function makeDecompressTool(runtime: AcpRuntime): ToolDefinition<typeof D
       let result: string;
       try {
         result = await handleDecompress(params as DecompressArgs, runtime, ctx);
+        if (!result.startsWith("Error:")) await recordRecentRetrievals(runtime, ctx, [(params as DecompressArgs).blockId]);
       } catch (e) {
         logThrow("decompress", e, { sid: ctx.sessionManager.getSessionId(), blockId: (params as DecompressArgs).blockId });
         throw e;
@@ -131,13 +133,13 @@ function resolveBlockMessages(
  *  so it defaults to inline. Oversized messages still go to a file. */
 async function handleMessageRef(
   ref: string,
-  ownerBlockId: string,
+  ownerId: string,
   args: DecompressArgs,
   ctx: ExtensionContext,
 ): Promise<string> {
   const found = findMessageContent(ref, ctx);
   if (!found || !found.text) {
-    return `Message ${ref} (in block ${ownerBlockId}) has no restorable text content in the session log.`;
+    return `Message ${ref} (owned by ${ownerId}) has no restorable text content in the session log.`;
   }
   const { text, role } = found;
 
@@ -146,9 +148,9 @@ async function handleMessageRef(
   const wantFile = args.toFile !== undefined || args.inline === false || text.length >= MESSAGE_INLINE_THRESHOLD;
 
   if (!wantFile) {
-    debug.event("decompress-message", { ref, ownerBlockId, mode: "inline", chars: text.length });
-    logInfo("decompress", { sid: ctx.sessionManager.getSessionId(), event: "message", mode: "inline", ref, ownerBlockId, chars: text.length });
-    return `Message ${ref} (${role}, block ${ownerBlockId}, ${text.length} chars) restored inline:\n\n${text}`;
+    debug.event("decompress-message", { ref, ownerId, mode: "inline", chars: text.length });
+    logInfo("decompress", { sid: ctx.sessionManager.getSessionId(), event: "message", mode: "inline", ref, ownerId, chars: text.length });
+    return `Message ${ref} (${role}, owner ${ownerId}, ${text.length} chars) restored inline:\n\n${text}`;
   }
 
   const targetPath = await resolveToFilePath(args.toFile ?? autoFilePath(`msg-${ref}`));
@@ -159,11 +161,11 @@ async function handleMessageRef(
 
   await writePrivateFile(targetPath, Buffer.from(text, "utf8"));
 
-  debug.event("decompress-message", { ref, ownerBlockId, mode: "file", path: targetPath, chars: text.length });
-  logInfo("decompress", { sid: ctx.sessionManager.getSessionId(), event: "message", mode: "file", ref, ownerBlockId, path: targetPath, chars: text.length });
+  debug.event("decompress-message", { ref, ownerId, mode: "file", path: targetPath, chars: text.length });
+  logInfo("decompress", { sid: ctx.sessionManager.getSessionId(), event: "message", mode: "file", ref, ownerId, path: targetPath, chars: text.length });
 
   return [
-    `Message ${ref} (${role}, block ${ownerBlockId}, ${text.length} chars) written to ${targetPath}.`,
+    `Message ${ref} (${role}, owner ${ownerId}, ${text.length} chars) written to ${targetPath}.`,
     "Block stays compressed — context unchanged. Use the read tool to access the content.",
     "", "Preview:", headPreview(text),
   ].join("\n");
@@ -173,6 +175,32 @@ async function handleDecompress(args: DecompressArgs, runtime: AcpRuntime, ctx: 
   const { state, coreMessages } = await runtime.stateFor(ctx);
   const arg = args.blockId.trim();
 
+  const checkpoint = state.checkpoints.find((item) => item.id === arg);
+  if (checkpoint) {
+    const header = [
+      `Checkpoint ${checkpoint.id} (epoch ${checkpoint.epoch})`,
+      `Provider/model: ${checkpoint.provider ?? "unknown"}/${checkpoint.model ?? "unknown"}`,
+      `Covered messages: ${checkpoint.sourceMessageIds.join(", ") || "(none)"}`,
+      `Covered blocks: ${checkpoint.sourceBlockIds.join(", ") || "(none)"}`,
+      "",
+      checkpoint.summary,
+    ].join("\n");
+    let text = header;
+    if (args.full === true) {
+      const covered = new Set(checkpoint.sourceMessageIds.map((id) => id.split("#", 1)[0]!));
+      const source = checkpoint.sourceMessageIds.flatMap((id) => {
+        const entry = ctx.sessionManager.getEntry(id.split("#", 1)[0]!);
+        return entry ? entriesToCoreMessages([entry]).filter((message) => covered.has(message.id.split("#", 1)[0]!)) : [];
+      });
+      text = `${header}\n\n[Exact covered source messages]\n${source.map((message) => `[${message.id}] ${message.role}/${message.contentType}\n${message.text ?? ""}`).join("\n\n")}`;
+    }
+    if (args.inline === true && !args.toFile && text.length < MESSAGE_INLINE_THRESHOLD) return text;
+    const targetPath = await resolveToFilePath(args.toFile ?? autoFilePath(checkpoint.id));
+    if (typeof targetPath === "object" && "error" in targetPath) return targetPath.error;
+    await writePrivateFile(targetPath, Buffer.from(text, "utf8"));
+    return `Checkpoint ${checkpoint.id} written to ${targetPath}. Use the read tool to access it.\n\nPreview:\n${headPreview(text)}`;
+  }
+
   // Resolve what `arg` refers to. Check message-ref FIRST (data-driven: a ref
   // exists in some block's effectiveMessageIds). This must precede block-id
   // parsing because pure-digit hex refs (e.g. 51102431) would otherwise be
@@ -181,10 +209,14 @@ async function handleDecompress(args: DecompressArgs, runtime: AcpRuntime, ctx: 
   if (owner) {
     return handleMessageRef(arg, owner.blockId, args, ctx);
   }
+  const checkpointOwner = state.checkpoints.find((item) => item.sourceMessageIds.some((id) => id.split("#", 1)[0] === arg.split("#", 1)[0]));
+  if (checkpointOwner) {
+    return handleMessageRef(arg, checkpointOwner.id, args, ctx);
+  }
 
   // Otherwise treat as a block id.
   const blockId = parseBlockIdArg(arg);
-  if (!blockId) return `Invalid blockId: ${args.blockId}. Expected format like "b5", "5", or a message ref (UUID) from search_context results.`;
+  if (!blockId) return `Invalid blockId: ${args.blockId}. Expected a block (b5), checkpoint (c2), or message ref from search_context results.`;
   const block = state.blocks.find((b) => b.blockId === blockId);
   if (!block) {
     const active = state.blocks.filter((b) => b.active).map((b) => b.blockId).join(", ");
@@ -202,7 +234,7 @@ async function handleDecompress(args: DecompressArgs, runtime: AcpRuntime, ctx: 
 
   // inline mode: return content directly. Model explicitly accepts the context
   // cost (e.g. small restorations or when it must reason over exact text).
-  if (args.inline === true && !args.toFile) {
+  if (args.inline === true && !args.toFile && text.length < MESSAGE_INLINE_THRESHOLD) {
     debug.event("decompress", { blockId, full, count, mode: "inline" });
     logInfo("decompress", { sid: ctx.sessionManager.getSessionId(), event: "block", mode: "inline", blockId, full, count });
     return `Restored block ${blockId} (${count} item${count === 1 ? "" : "s"}) inline:\n\n${text}`;

@@ -15,6 +15,23 @@ function manifest(messages: CoreMessage[]) {
   );
 }
 
+test("semantic validation does not truncate retention after 100 required facts", () => {
+  const requirements = Array.from({ length: 150 }, (_, index) => `Requirement: Preserve durable fact ${index}.`).join("\n");
+  const source = manifest([{ id: "user-many", role: "user", contentType: "text", text: requirements }]);
+  const validation = validateAndRepairSummary({
+    summary: "Durable requirements were captured.", manifest: source, sourceTokens: 5_000, tier: 1,
+  });
+  assert.match(validation.renderedSummary, /Preserve durable fact 149\./);
+  assert.ok(validation.missingRequiredFacts.length >= 150);
+});
+
+test("post-repair size is enforced before commit", () => {
+  const source = manifest([{ id: "user-large", role: "user", contentType: "text", text: "Requirement: " + "x".repeat(500) + "." }]);
+  assert.throws(() => validateAndRepairSummary({
+    summary: "Short.", manifest: source, sourceTokens: 500, tier: 1, summaryMaxChars: 100,
+  }), /after required-fact repair; limit is 100/);
+});
+
 test("semantic validation repairs an omitted user requirement before commit", () => {
   const source = manifest([{
     id: "user-1",

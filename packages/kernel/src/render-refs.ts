@@ -50,6 +50,7 @@ function renderMessage(
   map: MessageRefMap,
   countTokens: (text: string) => number,
   strategy: RenderStrategy,
+  tokenSnapshots: Record<string, number>,
 ): CoreMessage {
   const ref = refForRaw(map, message.id);
   if (!ref || ref === BLOCKED_REF) return message;
@@ -69,7 +70,7 @@ function renderMessage(
   );
   const cleanText = (message.text || "").replace(ownTagRe, "");
 
-  const tokens = countTokens(cleanText);
+  const tokens = tokenSnapshots[message.id] ?? countTokens(cleanText);
   const type = classifyType(message);
   const prefix = acpTag(ref, tokens, type) + "\n";
 
@@ -86,7 +87,7 @@ export function renderVisibleRefs(
 ): CoreMessage[] {
   const map = state.messageRefs;
   return messages.map((message) =>
-    renderMessage(message, map, countTokens, strategy),
+    renderMessage(message, map, countTokens, strategy, state.tokenSnapshots ?? {}),
   );
 }
 

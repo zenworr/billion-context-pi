@@ -71,18 +71,18 @@ test("tier-3 distillation: text contains tier header", () => {
   assert.ok(result.text.includes("Condense"), "should mention condensation");
 });
 
-test("tier-2 distillation: guidance warns raw messages in span are absorbed", () => {
+test("tier-2 distillation: guidance prohibits raw gaps", () => {
   const result = renderNudgeText(makeDecision({ tier: 2 }));
-  assert.ok(result.text.includes("raw"), "should mention raw messages in span");
-  assert.ok(result.text.includes("absorbed"), "should state raw messages are absorbed into the tier-2 block");
-  assert.ok(result.text.includes("HOW TO COMPRESS"), "should direct raw messages to HOW TO COMPRESS rules");
+  assert.ok(result.text.includes("Raw"), "should mention raw messages in span");
+  assert.ok(result.text.includes("prohibited"), "should reject raw gaps in a tier-2 range");
+  assert.ok(result.text.includes("separately"), "should direct raw gaps to separate tier-1 compression");
 });
 
-test("tier-3 condensation: guidance warns raw messages in span are absorbed", () => {
+test("tier-3 condensation: guidance prohibits raw gaps", () => {
   const result = renderNudgeText(makeDecision({ tier: 3 }));
-  assert.ok(result.text.includes("raw"), "should mention raw messages in span");
-  assert.ok(result.text.includes("absorbed"), "should state raw messages are absorbed into the tier-3 block");
-  assert.ok(result.text.includes("HOW TO COMPRESS"), "should direct raw messages to HOW TO COMPRESS rules");
+  assert.ok(result.text.includes("Raw"), "should mention raw messages in span");
+  assert.ok(result.text.includes("prohibited"), "should reject raw gaps in a tier-3 range");
+  assert.ok(result.text.includes("separately"), "should direct raw gaps to separate tier-1 compression");
 });
 
 test("both modes include compressible ranges", () => {

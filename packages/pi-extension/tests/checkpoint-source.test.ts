@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionBeforeCompactEvent, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
-import { compileCheckpointSource } from "../src/checkpoint-source.js";
+import { compileBranchSource, compileCheckpointSource } from "../src/checkpoint-source.js";
 
 function entry(id: string, text: string): SessionMessageEntry {
   return {
@@ -26,6 +26,17 @@ function preparation(messages: SessionMessageEntry["message"][]): SessionBeforeC
     settings: { reserveTokens: 16_384, keepRecentTokens: 20_000 },
   };
 }
+
+test("branch compiler includes current project instructions without treating them as transcript coverage", () => {
+  const source = compileBranchSource(
+    [entry("branch-entry", "branch work")],
+    { "branch-entry": "m00001" },
+    "Constraint: Keep branch summaries local.",
+  );
+  assert.match(source.source, /Current project instructions/);
+  assert.match(source.source, /Keep branch summaries local/);
+  assert.deepEqual(source.sourceMessageIds, ["branch-entry"]);
+});
 
 test("checkpoint compiler retains exact old-prefix facts outside the raw tail", () => {
   const old = entry("old-entry", "Requirement: preserve exact path src/old-critical.ts.");

@@ -18,9 +18,13 @@
     "test": "npm test -w acp-kernel && npm run build -w acp-kernel && npm test -w billion-context-pi",
     "e2e": "npm run e2e -w billion-context-pi",
     "eval": "node evals/replay/launcher.mjs",
-    "verify": "npm run typecheck && npm test && npm run build && npm run eval"
+    "verify": "npm run typecheck && npm test && npm run build && npm run eval && npm run pack:smoke",
+    "pack:smoke": "node scripts/pack-smoke.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

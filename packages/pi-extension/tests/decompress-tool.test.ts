@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rm, readFile, mkdtemp } from "node:fs/promises";
+import { rm, readFile, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInitialState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
 
 function captureApi() {
@@ -29,6 +30,13 @@ async function cleanState(sessionFile: string) {
   await rm(`${sessionFile}.acp.json`, { force: true });
 }
 
+async function restoredText(resultText: string): Promise<string> {
+  if (resultText.includes("inline:")) return resultText;
+  const file = resultText.match(/written to (.+)\.\n/)?.[1];
+  assert.ok(file, "file fallback reports its path");
+  return readFile(file, "utf8");
+}
+
 function fakeCtx(entries: any[], stateFile: string) {
   return {
     mode: "rpc",
@@ -53,6 +61,29 @@ function fakeCtxFullTree(allEntries: any[], activeEntries: any[], stateFile: str
   ctx.sessionManager.getEntry = (id: string) => allEntries.find((e: any) => e.id === id);
   return ctx;
 }
+
+test("checkpoint-owned messages are directly retrievable by exact projected id", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-checkpoint-message-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateFile = join(dir, "session.jsonl");
+  const entry = userMsg("checkpoint-entry", "Exact checkpoint-owned detail.");
+  const state = createInitialState("test-session");
+  state.checkpoints.push({
+    id: "c1", epoch: 1, summary: "checkpoint", sourceBlockIds: [], sourceMessageIds: ["checkpoint-entry"],
+    tokensBefore: 1000, createdAt: Date.now(), coverageVersion: 1, coverageComplete: true,
+  });
+  state.nextCheckpointId = 2;
+  await writeFile(`${stateFile}.acp.json`, JSON.stringify(state), "utf8");
+  const { api } = captureApi();
+  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  const ctx = fakeCtx([entry], stateFile) as any;
+  ctx.sessionManager.getEntries = () => [entry];
+  ctx.sessionManager.getEntry = (id: string) => id === entry.id ? entry : undefined;
+  const tool = api.tools.find((candidate) => candidate.name === "decompress")!;
+  const result = await tool.execute("checkpoint-message", { blockId: "checkpoint-entry" }, undefined, undefined, ctx);
+  assert.match(result.content[0].text, /Exact checkpoint-owned detail/);
+  assert.match(result.content[0].text, /owner c1/);
+});
 
 // Shared setup: assign refs + compress m00001 into block b1, return the tool
 // handles + ctx so each test can drive the decompress tool.
@@ -102,14 +133,12 @@ test("decompress default writes content to an auto-generated file (no context bl
     `inline content must NOT be the full restored text (result was ${text.length} chars)`);
 });
 
-test("decompress inline:true returns the full content in the tool result", async () => {
+test("decompress inline:true falls back to a private file above the safe inline limit", async () => {
   const { decompressTool, ctx } = await setupWithCompressedBlock();
   const res = await decompressTool.execute("tc3", { blockId: "b1", inline: true }, undefined, undefined, ctx);
-  const text = (res.content[0] as any).text as string;
-
-  assert.match(text, /inline:/, "result signals inline mode");
-  assert.ok(text.includes("This is a detailed message that needs to be compressed."),
-    "full restored content present in the tool result");
+  const resultText = (res.content[0] as any).text as string;
+  assert.match(resultText, /written to/, "oversized inline request falls back to file");
+  assert.match(await restoredText(resultText), /This is a detailed message that needs to be compressed/);
 });
 
 test("decompress toFile writes to the specified path", async () => {
@@ -146,7 +175,7 @@ test("decompress keeps the block active after a file-mode call", async () => {
 
 test("decompress restores a block's original text via getEntry fallback after tree navigation (undo)", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-undo.session.json";
   await cleanState(stateFile);
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
@@ -176,8 +205,7 @@ test("decompress restores a block's original text via getEntry fallback after tr
   const res = await decompressTool.execute("tc2", { blockId: "b1", inline: true }, undefined, undefined, undoCtx);
   const text = (res.content[0] as any).text as string;
 
-  assert.match(text, /inline:/, "result signals inline mode");
-  assert.ok(text.includes("This is a detailed message that needs to be compressed."),
+  assert.ok((await restoredText(text)).includes("This is a detailed message that needs to be compressed."),
     "fallback restored the original text from the full session tree");
 });
 
@@ -212,7 +240,7 @@ test("decompress keeps the degraded message when the ref is gone from both branc
 
 test("decompress restores multi tool-call assistant messages (refs carry # suffix) after undo", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-tools.session.json";
   await cleanState(stateFile);
   const filler = (n: string) => `filler ${n} `.repeat(400);
@@ -252,13 +280,14 @@ test("decompress restores multi tool-call assistant messages (refs carry # suffi
   const res = await decompressTool.execute("tc2", { blockId: "b1", inline: true }, undefined, undefined, undoCtx);
   const text = (res.content[0] as any).text as string;
 
-  assert.ok(text.includes("read") && text.includes("bash"),
+  const restored = await restoredText(text);
+  assert.ok(restored.includes("read") && restored.includes("bash"),
     "both multi tool-call CoreMessages restored via base-id normalization");
 });
 
 test("decompress survives repeated compress → navigate → decompress cycles (state not lost)", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-cycles.session.json";
   await cleanState(stateFile);
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
@@ -280,7 +309,7 @@ test("decompress survives repeated compress → navigate → decompress cycles (
 
   let active = allEntries.filter((e) => e.id !== "e1");
   let res = await decompressTool.execute("tc2", { blockId: "b1", inline: true }, undefined, undefined, fakeCtxFullTree(allEntries, active, stateFile));
-  assert.ok(((res.content[0] as any).text as string).includes("This is a detailed message"),
+  assert.ok((await restoredText((res.content[0] as any).text as string)).includes("This is a detailed message"),
     "cycle 1: fallback restored the original text after undo");
 
   // Cycle 2: navigate BACK (redo) so everything is active again, compress a
@@ -291,6 +320,6 @@ test("decompress survives repeated compress → navigate → decompress cycles (
 
   active = allEntries.filter((e) => e.id !== "e2");
   res = await decompressTool.execute("tc4", { blockId: "b2", inline: true }, undefined, undefined, fakeCtxFullTree(allEntries, active, stateFile));
-  assert.ok(((res.content[0] as any).text as string).includes("filler two"),
+  assert.ok((await restoredText((res.content[0] as any).text as string)).includes("filler two"),
     "cycle 2: newly compressed block also restores after navigate-away");
 });

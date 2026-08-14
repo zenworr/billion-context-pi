@@ -174,10 +174,27 @@ export function createCore(ports: Ports = {}): CompressionCore {
         }
         const sourceBlockIds = [...resolved.nestedBlockIds];
         const isBlockBoundary = resolved.boundaryKind === "block";
+        const sourceTiers = new Set(sourceBlockIds
+          .map((id) => blockById(input.state, id))
+          .filter((block): block is CompressionBlock => block?.active === true)
+          .map((block) => block.tier));
+        if (isBlockBoundary && sourceTiers.size > 1) {
+          errors.push(rangeError(request, `Higher-tier ranges must contain exactly one source tier; found tiers ${[...sourceTiers].sort().join(", ")}.`));
+          continue;
+        }
         const targetTier = resolveTargetTier(input.state, sourceBlockIds, isBlockBoundary);
         const outputTier = isBlockBoundary
           ? Math.min(3, targetTier + 1) as CompressionTier
           : 1;
+        if (outputTier > 1) {
+          const blockCoverage = new Set(sourceBlockIds.flatMap((id) => blockById(input.state, id)?.effectiveMessageIds ?? []));
+          const rawGaps = sourceMessageIds.filter((id) => !blockCoverage.has(id));
+          if (rawGaps.length > 0) {
+            const refs = rawGaps.map((id) => input.state.messageRefs.byRaw[id] ?? id);
+            errors.push(rangeError(request, `Tier-${outputTier} ranges may contain only contiguous active tier-${targetTier} blocks; raw message gaps are not allowed (${refs.join(", ")}). Compress the raw gaps to tier 1 first.`));
+            continue;
+          }
+        }
         const ordered = sourceIds
           .map((id) => ({ id, index: indexById.get(id) ?? Number.MAX_SAFE_INTEGER }))
           .sort((left, right) => left.index - right.index);
@@ -457,9 +474,22 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const strategy: RenderStrategy = input.renderTags ?? "all";
     const nodes = buildNodes(strategy);
     const result = runPipeline(nodes, initial, ctx);
+    const originalTokens = input.messages.reduce((sum, message) => sum + countTokens(message.text ?? ""), 0);
+    const projectedTokens = result.messages.reduce((sum, message) => sum + countTokens(message.text ?? ""), 0);
+    const tokensCleared = result.effects.clearing?.savedTokens ?? 0;
+    const beforeShape = input.messages.map(projectionIdentity).join("\n");
+    const afterShape = result.messages.map(projectionIdentity).join("\n");
     return {
       messages: result.messages,
       state: result.state,
+      projection: {
+        originalTokens,
+        projectedTokens,
+        tokensCleared,
+        tokensPruned: Math.max(0, originalTokens - projectedTokens - tokensCleared),
+        contentChanged: beforeShape !== afterShape,
+        projectionHash: sha256(afterShape),
+      },
       nudge: result.effects.nudge,
       clearing: result.effects.clearing,
     };
@@ -765,6 +795,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   }
 
   const isBlockBoundary = resolved.boundaryKind === "block";
+  const nestedTiers = new Set(
+    resolved.nestedBlockIds
+      .map((id) => blockById(input.state, id))
+      .filter((block): block is CompressionBlock => block?.active === true)
+      .map((block) => block.tier),
+  );
+  if (isBlockBoundary && nestedTiers.size > 1) {
+    throw new Error(`Higher-tier ranges must contain exactly one source tier; found tiers ${[...nestedTiers].sort().join(", ")}. Select a contiguous run of same-tier active blocks.`);
+  }
   const targetTier = resolveTargetTier(
     input.state,
     resolved.nestedBlockIds,
@@ -851,6 +890,13 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     );
   }
 
+  if (outputTier > 1) {
+    const tierRawGapIds = directMessageIds;
+    if (tierRawGapIds.length > 0) {
+      const refs = tierRawGapIds.map((id) => input.state.messageRefs.byRaw[id] ?? id);
+      throw new Error(`Tier-${outputTier} ranges may contain only contiguous active tier-${targetTier} blocks; raw message gaps are not allowed (${refs.join(", ")}). Compress the raw gaps to tier 1 first.`);
+    }
+  }
   validateCompressionRange(input, filteredIds, consumedBlockIds.length);
 
   let compressedTokens = 0;
@@ -1293,6 +1339,7 @@ function cloneState(state: CompressionState): CompressionState {
     policyState: {
       nudgeBaselines: { ...(state.policyState?.nudgeBaselines ?? {}) },
       lastActionAt: { ...(state.policyState?.lastActionAt ?? {}) },
+      recentRetrievals: { ...(state.policyState?.recentRetrievals ?? {}) },
       tokenCalibration: Object.fromEntries(
         Object.entries(state.policyState?.tokenCalibration ?? {}).map(([key, value]) => [key, { ...value }]),
       ),
@@ -1341,6 +1388,17 @@ function serializeSourceForHash(
     }),
   };
   return JSON.stringify(source);
+}
+
+function projectionIdentity(message: CoreMessage): string {
+  return JSON.stringify({
+    id: message.id,
+    role: message.role,
+    contentType: message.contentType,
+    text: message.text ?? "",
+    toolCallId: message.toolCallId,
+    toolName: message.toolName,
+  });
 }
 
 function sha256(value: string): string {

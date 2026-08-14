@@ -187,6 +187,8 @@ export interface NudgeState {
 
 export interface ArtifactRecord {
   id: string;
+  status?: "pending" | "ready" | "unavailable";
+  error?: string;
   sha256: string;
   sourceMessageId: string;
   toolCallId?: string;
@@ -210,6 +212,12 @@ export interface CheckpointRecord {
   createdAt: number;
   provider?: string;
   model?: string;
+  provenance?: BlockGenerationMetadata;
+  sourceHash?: string;
+  /** Versioned exact-source ownership. Missing on migrated records means incomplete. */
+  coverageVersion?: 1;
+  coverageComplete?: boolean;
+  validationStatus?: "passed" | "repaired" | "fallback" | "unverified";
 }
 
 export interface PinRecord {
@@ -221,8 +229,16 @@ export interface PinRecord {
 }
 
 export interface TokenCalibrationState {
+  /** Number of mutually consistent delta samples. Density is trusted at >=2. */
   samples: number;
   ratio: number;
+  verified: boolean;
+  anchorProviderTokens: number;
+  anchorLocalTokens: number;
+  anchorEpoch: number;
+  fixedOverheadTokens: number;
+  candidateRatio?: number;
+  candidateSamples?: number;
   lastProviderTokens: number;
   lastEstimatedTokens: number;
   updatedAt: number;
@@ -240,6 +256,11 @@ export interface CompressionStats {
 
 export interface CompressionState {
   schemaVersion: 2;
+  /** Projection graph revision: blocks/checkpoints/artifacts/coverage only. */
+  graphRevision: number;
+  /** Metadata revision: telemetry, cadence, calibration, and display state. */
+  metadataRevision: number;
+  /** Persistence transaction revision. */
   revision: number;
   sessionId: string;
   currentEpoch: number;
@@ -253,6 +274,7 @@ export interface CompressionState {
   policyState: {
     nudgeBaselines: Record<string, number>;
     lastActionAt: Record<string, number>;
+    recentRetrievals: Record<string, number>;
     tokenCalibration: Record<string, TokenCalibrationState>;
   };
   stats: CompressionStats;
@@ -294,7 +316,6 @@ export interface ClearingConfig {
   enabled: boolean;
   keepRecentToolUses: number;
   clearAtLeastTokens: number;
-  clearToolInputs: boolean;
   excludeTools: string[];
   reasoning: ReasoningClearingPolicy;
 }
@@ -477,9 +498,19 @@ export interface ApplyCompressionResult {
   };
 }
 
+export interface ProjectionEffect {
+  originalTokens: number;
+  projectedTokens: number;
+  tokensCleared: number;
+  tokensPruned: number;
+  contentChanged: boolean;
+  projectionHash: string;
+}
+
 export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;
+  projection: ProjectionEffect;
   nudge?: NudgeDecision;
   clearing?: {
     clearedCount: number;

@@ -9,7 +9,7 @@ export default defineConfig({
   entry: ["src/index.ts"],
   format: ["esm"],
   target: "es2022",
-  dts: false,
+  dts: { resolve: ["acp-kernel"] },
   sourcemap: true,
   clean: true,
   define: {
@@ -20,5 +20,5 @@ export default defineConfig({
     "@earendil-works/pi-ai",
     "@earendil-works/pi-agent-core",
   ],
-  noExternal: ["typebox"],
+  noExternal: ["typebox", "acp-kernel"],
 });

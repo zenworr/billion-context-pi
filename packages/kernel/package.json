@@ -1,17 +1,19 @@
 {
     "name": "acp-kernel",
     "version": "0.0.23",
+    "private": true,
     "description": "Framework-agnostic context-compression engine (model-driven, 3-tier LSM). Pure core: no host dependency.",
     "license": "MIT",
-    "author": "ranxianglei",
+    "author": "zenworr",
     "type": "module",
-    "homepage": "https://github.com/ranxianglei/acp-kernel#readme",
+    "homepage": "https://github.com/zenworr/billion-context-pi/tree/master/packages/kernel#readme",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/ranxianglei/acp-kernel.git"
+        "url": "git+https://github.com/zenworr/billion-context-pi.git",
+        "directory": "packages/kernel"
     },
     "bugs": {
-        "url": "https://github.com/ranxianglei/acp-kernel/issues"
+        "url": "https://github.com/zenworr/billion-context-pi/issues"
     },
     "keywords": [
         "acp",
@@ -55,6 +57,6 @@
         "typescript": "^5.6.0"
     },
     "engines": {
-        "node": ">=20"
+        "node": ">=22.19.0"
     }
 }

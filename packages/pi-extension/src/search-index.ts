@@ -26,6 +26,9 @@ function buildCoveredRefs(state: CompressionState): Set<string> {
     for (const b of state.blocks) {
         for (const id of b.effectiveMessageIds) s.add(id);
     }
+    for (const checkpoint of state.checkpoints) {
+        for (const id of checkpoint.sourceMessageIds) s.add(id);
+    }
     return s;
 }
 
@@ -41,6 +44,10 @@ function buildMessageOwnerMap(state: CompressionState): Map<string, string> {
         for (const id of block.effectiveMessageIds) m.set(id, block.blockId);
     }
     return m;
+}
+
+function rawMessageId(id: string): string {
+    return id.split("#", 1)[0]!;
 }
 
 function estimateTokens(text: string): number {
@@ -63,6 +70,10 @@ export function buildSearchDocs(ctx: ExtensionContext, state: CompressionState):
     const allEntries: SessionEntry[] = sm.getEntries();
     const covered = buildCoveredRefs(state);
     const ownerMap = buildMessageOwnerMap(state);
+    const checkpointOwnerMap = new Map<string, string>();
+    for (const checkpoint of state.checkpoints) {
+        for (const id of checkpoint.sourceMessageIds) checkpointOwnerMap.set(rawMessageId(id), checkpoint.id);
+    }
 
     const blockTier = new Map<string, number>();
     for (const b of state.blocks) blockTier.set(b.blockId, b.tier ?? 1);
@@ -78,16 +89,18 @@ export function buildSearchDocs(ctx: ExtensionContext, state: CompressionState):
             if (!cm.id) continue;
             // Only include messages that were compressed into a block.
             // Still-live messages are visible to the model — no need to search them.
-            if (!covered.has(cm.id)) continue;
+            if (!covered.has(cm.id) && !covered.has(rawMessageId(cm.id))) continue;
             const text = cm.text ?? "";
             if (!text || text.length < 2) continue;
-            const ownerBlock = ownerMap.get(cm.id);
+            const ownerBlock = ownerMap.get(cm.id) ?? ownerMap.get(rawMessageId(cm.id));
+            const checkpointId = ownerBlock ? undefined : checkpointOwnerMap.get(rawMessageId(cm.id));
             msgs.push({
                 ref: cm.id,
                 role,
                 text,
                 tokens: estimateTokens(text),
                 blockId: ownerBlock,
+                checkpointId,
                 tier: ownerBlock ? blockTier.get(ownerBlock) : undefined,
             });
         }
@@ -99,5 +112,12 @@ export function buildSearchDocs(ctx: ExtensionContext, state: CompressionState):
         text: [artifact.toolName, artifact.sourceMessageId, artifact.toolCallId, artifact.localPath, artifact.sha256].filter(Boolean).join(" "),
         tokens: artifact.estimatedTokens,
     })));
-    return [...blockDocs(state), ...messageDocs(msgs), ...artifacts];
+    const checkpoints: SearchDoc[] = state.checkpoints.map((checkpoint) => ({
+        kind: "checkpoint",
+        ref: checkpoint.id,
+        title: `Checkpoint epoch ${checkpoint.epoch}`,
+        text: [checkpoint.summary, ...checkpoint.sourceMessageIds].join("\n"),
+        tokens: estimateTokens(checkpoint.summary),
+    }));
+    return [...blockDocs(state), ...checkpoints, ...messageDocs(msgs), ...artifacts];
 }

@@ -69,6 +69,17 @@ export interface BudgetConfig {
   safetyMarginTokens?: number;
 }
 
+export interface ArtifactConfig {
+  /** Maximum bytes for one durable artifact. Default: 50 MiB. */
+  maxArtifactBytes?: number;
+  /** Maximum durable artifact bytes per session. Default: 500 MiB. */
+  maxSessionBytes?: number;
+  /** Maximum durable bytes across all ACP artifact sessions. Default: 2 GiB. */
+  maxGlobalBytes?: number;
+  /** Lifecycle policy is explicit; ACP never age-deletes artifacts by default. */
+  lifecycle?: "retain" | "session";
+}
+
 export interface MemoryConfig {
   /** Durable memory policy. Default: session. */
   mode?: "off" | "session" | "project";
@@ -79,7 +90,7 @@ export interface MemoryConfig {
 }
 
 export interface OptimizationConfig {
-  /** Enable automatic configured T2/T3 jobs at turn_end and agent_end. Default: false. */
+  /** Enable automatic configured T2/T3 jobs at agent_end. Default: false. */
   automaticDistillation?: boolean;
   /** Generate and validate automatic summaries but never commit them. Default: false. */
   shadowCompaction?: boolean;
@@ -87,6 +98,8 @@ export interface OptimizationConfig {
   minimumBlocks?: number;
   /** Minimum child-summary tokens required for an automatic distillation. Default: 12000. */
   minimumSourceTokens?: number;
+  /** Minimum completed turns a child block must survive. Default: 3. */
+  minimumSurvivalTurns?: number;
   /** Maximum stale-source replans for one boundary event. Default: 1. */
   maxReplans?: number;
   /** Enable in-memory usage, savings, and latency telemetry. Default: false. */
@@ -147,6 +160,8 @@ export interface AdapterConfig {
   compress?: CompressConfig;
   /** Optional project memory. Project writes require mode=project and an explicit promote command. */
   memory?: MemoryConfig;
+  /** Durable artifact limits and lifecycle. */
+  artifacts?: ArtifactConfig;
   /** Optional Phase-7 background optimization. All active behavior defaults off. */
   optimization?: OptimizationConfig;
   /** Legacy flat alias for `delegate.displayUsage`. Kept for backward
@@ -181,6 +196,19 @@ export function safeResumeThreshold(adapter: AdapterConfig, contextWindow: numbe
   const reserve = adapter.budget?.outputReserveTokens ?? DEFAULT_OUTPUT_RESERVE_TOKENS;
   const margin = adapter.budget?.safetyMarginTokens ?? DEFAULT_SAFETY_MARGIN_TOKENS;
   return Math.max(0, Math.min(contextWindow - reserve - margin, effectiveActiveTarget(adapter, contextWindow) + reserve));
+}
+
+/** Hard tool gate for the active model. It is derived from current budget policy. */
+export function forcedCompressionLimit(adapter: AdapterConfig, contextWindow: number): number {
+  const reserve = adapter.budget?.outputReserveTokens ?? DEFAULT_OUTPUT_RESERVE_TOKENS;
+  const margin = adapter.budget?.safetyMarginTokens ?? DEFAULT_SAFETY_MARGIN_TOKENS;
+  const hardPercent = adapter.budget?.hardContextPercent ?? 0.75;
+  const emergencyPercent = adapter.budget?.emergencyContextPercent ?? 0.95;
+  return Math.max(1, Math.floor(Math.min(
+    contextWindow - reserve - margin,
+    contextWindow * hardPercent,
+    contextWindow * emergencyPercent,
+  )));
 }
 
 /** Resolve delegate config from the adapter, handling the boolean shorthand

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { loadUserConfig, applyUserConfig, updateGlobalCompressionConfig } from "../src/user-config.js";
+import { loadUserConfig, applyUserConfig, updateGlobalCompressionConfig, updateProjectCompressionConfig } from "../src/user-config.js";
 import type { AdapterConfig } from "../src/config.js";
 
 const CONFIG_DIR_NAME = ".pi";
@@ -138,6 +138,21 @@ test("loadUserConfig and applyUserConfig preserve validated budget and memory se
   }
 });
 
+test("loadUserConfig preserves validated artifact quotas and lifecycle", async () => {
+  const tmpDir = path.join(os.tmpdir(), `acp-test-artifacts-${Date.now()}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  await writeConfig(tmpDir, {
+    artifacts: { maxArtifactBytes: 1_000, maxSessionBytes: 2_000, maxGlobalBytes: 3_000, lifecycle: "session", unsafe: true },
+  });
+  try {
+    const loaded = await loadUserConfig(tmpDir);
+    const applied = applyUserConfig({}, loaded);
+    assert.deepEqual(applied.artifacts, { maxArtifactBytes: 1_000, maxSessionBytes: 2_000, maxGlobalBytes: 3_000, lifecycle: "session" });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("loadUserConfig ignores unknown keys", async () => {
   const tmpDir = path.join(os.tmpdir(), `acp-test-unknown-${Date.now()}`);
   await fs.mkdir(tmpDir, { recursive: true });
@@ -239,6 +254,23 @@ test("applyUserConfig supports all user config keys", () => {
   assert.equal(result.delegate, false);
   assert.equal(result.toolBashDefaultTimeout, 120);
   assert.equal(result.toolOutputMaxBytes, 100_000);
+});
+
+test("project model updates stay project-local and do not mutate global configuration", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "acp-config-scope-"));
+  const home = path.join(dir, "home");
+  const project = path.join(dir, "project");
+  await fs.mkdir(home, { recursive: true });
+  await fs.mkdir(project, { recursive: true });
+  const globalFile = path.join(home, ".pi", "acp.json");
+  await fs.mkdir(path.join(home, ".pi"), { recursive: true });
+  await fs.writeFile(globalFile, JSON.stringify({ compress: { model: "global/model" } }), "utf8");
+  const before = await fs.readFile(globalFile, "utf8");
+  const projectFile = await updateProjectCompressionConfig(project, { model: "project/model" });
+  assert.equal(projectFile, path.join(project, ".pi", "acp.json"));
+  assert.equal(await fs.readFile(globalFile, "utf8"), before);
+  assert.match(await fs.readFile(projectFile, "utf8"), /project\/model/);
+  await fs.rm(dir, { recursive: true, force: true });
 });
 
 test("updateGlobalCompressionConfig merges compression settings without dropping other keys", async () => {

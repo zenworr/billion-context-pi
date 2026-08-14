@@ -6,7 +6,6 @@ import {
   detectBashTimeout,
   appendTimeoutNotice,
   forcedCompressionReason,
-  FORCED_COMPRESSION_TOKEN_LIMIT,
   isBashToolResult,
   shouldBlockToolForCompression,
 } from "../src/tool-guardrails.js";
@@ -15,19 +14,21 @@ import type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
 type Content = ToolResultEvent["content"];
 const text = (t: string): Content => [{ type: "text", text: t }];
 
-test("forced compression blocks every tool except compress at 204k tokens", () => {
-  assert.equal(shouldBlockToolForCompression("read", FORCED_COMPRESSION_TOKEN_LIMIT - 1), false);
-  assert.equal(shouldBlockToolForCompression("read", FORCED_COMPRESSION_TOKEN_LIMIT), true);
-  assert.equal(shouldBlockToolForCompression("bash", FORCED_COMPRESSION_TOKEN_LIMIT + 50_000), true);
-  assert.equal(shouldBlockToolForCompression("compress", FORCED_COMPRESSION_TOKEN_LIMIT + 50_000), false);
-  assert.equal(shouldBlockToolForCompression("read", undefined), false);
+test("forced compression blocks every tool except bounded ACP recovery tools at the active-model limit", () => {
+  const limit = 204_000;
+  assert.equal(shouldBlockToolForCompression("read", limit - 1, limit), false);
+  assert.equal(shouldBlockToolForCompression("read", limit, limit), true);
+  assert.equal(shouldBlockToolForCompression("bash", limit + 50_000, limit), true);
+  assert.equal(shouldBlockToolForCompression("compress", limit + 50_000, limit), false);
+  assert.equal(shouldBlockToolForCompression("acp_artifact", limit + 50_000, limit), false);
+  assert.equal(shouldBlockToolForCompression("read", undefined, limit), false);
 });
 
-test("forced compression reason is actionable and identifies the only allowed tool", () => {
-  const reason = forcedCompressionReason(204_321);
+test("forced compression reason is actionable and identifies bounded recovery tools", () => {
+  const reason = forcedCompressionReason(204_321, 204_000);
   assert.match(reason, /Context limit reached — compress now/);
   assert.match(reason, /204,321 tokens/);
-  assert.match(reason, /compress tool is the only tool allowed/);
+  assert.match(reason, /bounded ACP recovery tools/);
 });
 
 test("resolveBashTimeout returns undefined when the model already set a timeout", () => {
@@ -47,6 +48,14 @@ test("resolveBashTimeout returns undefined when the default is disabled (0 / neg
 
 test("resolveBashTimeout falls back to the 60s built-in default when default is undefined", () => {
   assert.equal(resolveBashTimeout({}, undefined), 60);
+});
+
+test("capToolOutput uses the bounded default when maxBytes is omitted", () => {
+  const output = "x".repeat(1_100_000);
+  const capped = capToolOutput(text(output), undefined);
+  assert.ok(capped);
+  assert.ok(Buffer.byteLength(capped.map((part) => part.type === "text" ? part.text : "").join(""), "utf8") < 1_100_000);
+  assert.match(capped.map((part) => part.type === "text" ? part.text : "").join("\n"), /output capped/);
 });
 
 test("capToolOutput leaves small output untouched (returns undefined)", () => {

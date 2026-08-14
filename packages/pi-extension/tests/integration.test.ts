@@ -59,25 +59,32 @@ test("factory registers ACP tools and 6 flat commands", () => {
   assert.ok(handlers.has("before_agent_start"), "system-prompt wired");
 });
 
-test("remaining tool budget text uses the 204k hard gate", () => {
-  assert.equal(remainingToolBudgetText(152_000), "Remaining context budget until tool block: 52k");
-  assert.equal(remainingToolBudgetText(203_600), "Remaining context budget until tool block: 0k");
-  assert.equal(remainingToolBudgetText(220_000), "Remaining context budget until tool block: 0k");
+test("remaining tool budget text uses the active-model hard gate", () => {
+  assert.equal(remainingToolBudgetText(152_000, 204_000), "Remaining context budget until tool block: 52k");
+  assert.equal(remainingToolBudgetText(203_600, 204_000), "Remaining context budget until tool block: 0k");
+  assert.equal(remainingToolBudgetText(80_000, 96_000), "Remaining context budget until tool block: 16k");
 });
 
-test("tool hook blocks non-compress tools at 204k and permits compress", () => {
+test("tool hook blocks from a current compiled projection and permits bounded recovery", async (t) => {
   const { api, handlers } = captureApi();
-  createAcpExtension()(api as any);
+  createAcpExtension()(api as unknown as ExtensionAPI);
+  const dir = await mkdtemp(join(tmpdir(), "acp-dynamic-guard-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateFile = join(dir, "session.jsonl");
+  const large = "x".repeat(820_000);
+  const persisted = [userMsg("guard-message", large)];
   const ctx = {
-    ...fakeCtx([], "/tmp/nonexistent-pai-acp-guard.session.json"),
-    getContextUsage: () => ({ tokens: 204_000, contextWindow: 272_000, percent: 75 }),
+    ...fakeCtx(persisted, stateFile),
+    model: { provider: "openai", id: "guard-model", contextWindow: 272_000 },
+    getContextUsage: () => ({ tokens: null, contextWindow: 272_000, percent: null }),
   };
+  await handlers.get("context")![0]!({ type: "context", messages: [{ role: "user", content: large, timestamp: 0 }] }, ctx);
   const guard = handlers.get("tool_call")![0]!;
   const blocked = guard({ type: "tool_call", toolCallId: "tc-read", toolName: "read", input: { path: "/tmp/x" } }, ctx);
   assert.equal(blocked.block, true);
-  assert.match(blocked.reason, /compress tool is the only tool allowed/);
-  const allowed = guard({ type: "tool_call", toolCallId: "tc-compress", toolName: "compress", input: { content: [] } }, ctx);
-  assert.equal(allowed, undefined);
+  assert.match(blocked.reason, /bounded ACP recovery tools/);
+  assert.equal(guard({ type: "tool_call", toolCallId: "tc-compress", toolName: "compress", input: { content: [] } }, ctx), undefined);
+  assert.equal(guard({ type: "tool_call", toolCallId: "tc-status", toolName: "acp_status", input: {} }, ctx), undefined);
 });
 
 test("tool results spool before the cap and acp_artifact retrieves exact content", async () => {
@@ -140,7 +147,58 @@ test("tool results spool before the cap and acp_artifact retrieves exact content
   }
 });
 
-test("tool hook does not block below 204k", () => {
+test("capped non-Bash output exposes its durable artifact id", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-nonbash-artifact-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { api, handlers } = captureApi();
+  createAcpExtension({ toolOutputMaxBytes: 200, artifacts: { lifecycle: "session" } })(api as unknown as ExtensionAPI);
+  const ctx = fakeCtx([], join(dir, "session.jsonl"));
+  const result = await handlers.get("tool_result")![0]!({
+    type: "tool_result",
+    toolName: "read",
+    toolCallId: "tc-nonbash-artifact",
+    input: { path: "/tmp/large" },
+    content: [{ type: "text", text: `NONBASH_SENTINEL\n${"moderate exact output\n".repeat(120)}` }],
+    details: undefined,
+    isError: false,
+  }, ctx);
+  assert.match(result.content.map((part: { text?: string }) => part.text ?? "").join("\n"), /acp_artifact\(\{ id: "a1" \}\)/);
+  for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
+});
+
+test("newline-only multipart overflow forces a below-threshold non-Bash artifact", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-multipart-artifact-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { api, handlers } = captureApi();
+  createAcpExtension({ toolOutputMaxBytes: 200, artifacts: { lifecycle: "session" } })(api as unknown as ExtensionAPI);
+  const ctx = fakeCtx([], join(dir, "session.jsonl"));
+  const result = await handlers.get("tool_result")![0]!({
+    type: "tool_result", toolName: "read", toolCallId: "tc-multipart", input: {},
+    content: [{ type: "text", text: "x".repeat(100) }, { type: "text", text: "y".repeat(100) }],
+    details: undefined, isError: false,
+  }, ctx);
+  assert.match(result.content.map((part: { text?: string }) => part.text ?? "").join("\n"), /acp_artifact\(\{ id: "a1" \}\)/);
+  for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
+});
+
+test("capped non-Bash output reports explicit unavailability when artifact quota rejects it", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-artifact-quota-failure-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const { api, handlers } = captureApi();
+  createAcpExtension({ toolOutputMaxBytes: 200, artifacts: { lifecycle: "session", maxArtifactBytes: 100 } })(api as unknown as ExtensionAPI);
+  const ctx = fakeCtx([], join(dir, "session.jsonl"));
+  const result = await handlers.get("tool_result")![0]!({
+    type: "tool_result", toolName: "read", toolCallId: "tc-quota-failure", input: {},
+    content: [{ type: "text", text: "x".repeat(100) }, { type: "text", text: "y".repeat(100) }],
+    details: undefined, isError: false,
+  }, ctx);
+  const visible = result.content.map((part: { text?: string }) => part.text ?? "").join("\n");
+  assert.match(visible, /durable artifact storage failed/);
+  assert.match(visible, /full non-Bash result is unavailable/);
+  for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
+});
+
+test("tool hook does not hard-block from stale host usage without a compiled projection", () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as unknown as ExtensionAPI);
   const ctx = {
@@ -173,14 +231,15 @@ test("host compaction is preserved for manual requests and issue-122 underestima
     hostTokensBefore: 250_000,
     safeThreshold: 234_000,
     calibrationSamples: 2,
+    calibrationVerified: true,
     calibrationUpdatedAt: Date.now(),
   }), true, "a verified, calibrated, material projection reduction can cancel threshold compaction");
 });
 
-test("before_agent_start appends the ACP system prompt", () => {
+test("before_agent_start appends the ACP system prompt", async () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as any);
-  const result = handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {});
+  const result = await handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, { cwd: "/tmp" });
   assert.ok(result.systemPrompt.startsWith("BASE"));
   assert.ok(result.systemPrompt.includes("compress"));
   assert.ok(result.systemPrompt.includes("acp"));
@@ -568,10 +627,10 @@ test("omp rebuilds refs after stale live state before status compression", async
   assert.match(result.content[0].text, /1 block/, result.content[0].text);
 });
 
-test("system prompt sources compression rules from acp-kernel (no hardcoded drift, no markers)", () => {
+test("system prompt sources compression rules from acp-kernel (no hardcoded drift, no markers)", async () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as any);
-  const result = handlers.get("before_agent_start")![0]!({ systemPrompt: "" }, {});
+  const result = await handlers.get("before_agent_start")![0]!({ systemPrompt: "" }, { cwd: "/tmp" });
   const sp = result.systemPrompt;
   // kernel constants inlined (regression guard against reverting to a hardcoded copy)
   assert.ok(sp.includes("Work from summaries, not raw tool outputs"), "kernel COMPRESS_PHILOSOPHY inlined");
@@ -819,10 +878,10 @@ test("omp keeps compression active when persisted and provider tails diverge", a
 });
 
 
-test("delegate:false omits the ACP_DELEGATE NOTIFICATIONS section from the system prompt", () => {
+test("delegate:false omits the ACP_DELEGATE NOTIFICATIONS section from the system prompt", async () => {
   const { api, handlers } = captureApi();
   createAcpExtension({ delegate: false })(api as any);
-  const result = handlers.get("before_agent_start")![0]!({ systemPrompt: "" }, {});
+  const result = await handlers.get("before_agent_start")![0]!({ systemPrompt: "" }, { cwd: "/tmp" });
   assert.ok(!result.systemPrompt.includes("ACP_DELEGATE NOTIFICATIONS"), "delegate section omitted when delegate:false");
   // Core ACP prompt is still present — only the delegate section is dropped.
   assert.ok(result.systemPrompt.includes("ACP TAGS"), "core ACP prompt still present when delegate disabled");

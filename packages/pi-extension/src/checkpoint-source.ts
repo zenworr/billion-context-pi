@@ -25,14 +25,22 @@ export interface CompiledBranchSource {
   sourceMessageIds: string[];
 }
 
-export function compileBranchSource(entries: SessionEntry[], refsByRaw: Record<string, string>): CompiledBranchSource {
-  const messages = entriesToCoreMessages(entries);
+export function compileBranchSource(entries: SessionEntry[], refsByRaw: Record<string, string>, projectContext?: string): CompiledBranchSource {
+  const branchMessages = entriesToCoreMessages(entries);
+  const messages: CoreMessage[] = projectContext
+    ? [{
+        id: "acp:branch-project-context",
+        role: "system",
+        contentType: "text",
+        text: `[Current project instructions]\n${projectContext}`,
+      }, ...branchMessages]
+    : branchMessages;
   const source = serializeCoreMessages(messages, refsByRaw);
   return {
     source,
     messages,
     sourceTokens: defaultCountTokens(source),
-    sourceMessageIds: unique(messages.map((message) => rawMessageId(message.id))),
+    sourceMessageIds: unique(branchMessages.map((message) => rawMessageId(message.id))),
   };
 }
 
@@ -40,6 +48,7 @@ export function compileCheckpointSource(input: {
   preparation: CompactionPreparation;
   branchEntries: SessionEntry[];
   state: CompressionState;
+  includePriorCheckpoint?: boolean;
 }): CompiledCheckpointSource {
   const preparedMessages = matchPreparedMessages(
     [...input.preparation.messagesToSummarize, ...input.preparation.turnPrefixMessages],
@@ -47,12 +56,15 @@ export function compileCheckpointSource(input: {
   );
   const fullManifest = extractCompressionManifest(preparedMessages, refsFor(preparedMessages, input.state.messageRefs.byRaw));
   const rawTail = recentRawTail(preparedMessages, RECENT_CHECKPOINT_RAW_TAIL_TOKENS);
+  const preparedIds = new Set(preparedMessages.map((message) => rawMessageId(message.id)));
   const activeBlocks = input.state.blocks
-    .filter((block) => block.active)
+    .filter((block) => block.active && block.effectiveMessageIds.every((id) => preparedIds.has(rawMessageId(id))))
     .sort((left, right) => left.createdAt - right.createdAt || left.blockId.localeCompare(right.blockId));
-  const priorCheckpoint = input.preparation.previousSummary?.trim()
-    || input.state.checkpoints.at(-1)?.summary.trim()
-    || "";
+  const priorCheckpoint = input.includePriorCheckpoint === false
+    ? ""
+    : input.preparation.previousSummary?.trim()
+      || input.state.checkpoints.at(-1)?.summary.trim()
+      || "";
   const requirements = renderCurrentRequirements(fullManifest);
   const parts: string[] = [];
   if (priorCheckpoint) parts.push(`[Prior checkpoint]\n${priorCheckpoint}`);
@@ -73,10 +85,12 @@ export function compileCheckpointSource(input: {
   }
   const source = parts.join("\n\n");
   const priorRecord = input.state.checkpoints.at(-1);
+  // Coverage is exact: every prepared source message represented by the full
+  // manifest is recorded, not only the recent raw tail. Prior checkpoint
+  // coverage remains reachable through the new checkpoint as well.
   const sourceMessageIds = unique([
     ...(priorCheckpoint && priorRecord ? priorRecord.sourceMessageIds : []),
-    ...activeBlocks.flatMap((block) => block.effectiveMessageIds),
-    ...rawTail.map((message) => rawMessageId(message.id)),
+    ...preparedMessages.map((message) => rawMessageId(message.id)),
   ]);
   return { source, sourceMessageIds, sourceTokens: defaultCountTokens(source) };
 }

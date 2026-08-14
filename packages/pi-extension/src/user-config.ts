@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ClearingConfig, Prompts } from "acp-kernel";
-import type { AdapterConfig, BudgetConfig, CompressConfig, DelegateConfig, MemoryConfig, OptimizationConfig } from "./config.js";
+import type { AdapterConfig, ArtifactConfig, BudgetConfig, CompressConfig, DelegateConfig, MemoryConfig, OptimizationConfig } from "./config.js";
 import { debug, logWarn } from "./log.js";
 
 /** User-facing config keys (subset of AdapterConfig). Loaded from
@@ -20,6 +20,7 @@ export interface UserAcpConfig {
   compress?: CompressConfig;
   budget?: BudgetConfig;
   memory?: MemoryConfig;
+  artifacts?: ArtifactConfig;
   optimization?: OptimizationConfig;
   displayUsage?: "merged" | "separate";
   prompts?: Partial<Prompts>;
@@ -66,10 +67,16 @@ export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
   return merged;
 }
 
-/** Persist compression UI settings in the global ACP config without disturbing
- * unrelated or future config keys. Returns the path written. */
+/** Persist compression settings without disturbing unrelated or future keys. */
 export async function updateGlobalCompressionConfig(patch: Partial<CompressConfig>): Promise<string> {
-  const dir = join(homedir(), CONFIG_DIR_NAME);
+  return updateCompressionConfigAt(join(homedir(), CONFIG_DIR_NAME), patch);
+}
+
+export async function updateProjectCompressionConfig(cwd: string, patch: Partial<CompressConfig>): Promise<string> {
+  return updateCompressionConfigAt(join(cwd, CONFIG_DIR_NAME), patch);
+}
+
+async function updateCompressionConfigAt(dir: string, patch: Partial<CompressConfig>): Promise<string> {
   const file = join(dir, "acp.json");
   let root: Record<string, unknown> = {};
   try {
@@ -111,7 +118,7 @@ function join(... parts: string[]): string {
 const KNOWN = new Set([
   "debug", "autoUpdate", "modelContextLimit",
   "toolBashDefaultTimeout", "toolOutputMaxBytes",
-  "delegate", "clearing", "compress", "budget", "memory", "optimization", "displayUsage",
+  "delegate", "clearing", "compress", "budget", "memory", "artifacts", "optimization", "displayUsage",
   "prompts", "acknowledgePromptsRisk",
 ]);
 
@@ -136,6 +143,7 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
   };
   const budget = { ...validBudgetConfig(adapter.budget), ...validBudgetConfig(user.budget) };
   const memory = { ...validMemoryConfig(adapter.memory), ...validMemoryConfig(user.memory) };
+  const artifacts = { ...validArtifactConfig(adapter.artifacts), ...validArtifactConfig(user.artifacts) };
   const adapterClearing = validClearingConfig(adapter.clearing);
   const userClearing = validClearingConfig(user.clearing);
   const clearing = {
@@ -153,6 +161,7 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
     compress: Object.keys(compress).length > 0 ? compress : undefined,
     budget: Object.keys(budget).length > 0 ? budget : undefined,
     memory: Object.keys(memory).length > 0 ? memory : undefined,
+    artifacts: Object.keys(artifacts).length > 0 ? artifacts : undefined,
     optimization: Object.keys(optimization).length > 0 ? optimization : undefined,
     coreOverrides: adapter.coreOverrides,
     protectedTools: adapter.protectedTools,
@@ -167,6 +176,17 @@ function validBudgetConfig(value: unknown): BudgetConfig | undefined {
   for (const key of ["targetActiveTokens", "targetContextPercent", "hardContextPercent", "emergencyContextPercent", "outputReserveTokens", "safetyMarginTokens"] as const) {
     if (typeof candidate[key] === "number" && Number.isFinite(candidate[key]) && candidate[key] >= 0) result[key] = candidate[key];
   }
+  return result;
+}
+
+function validArtifactConfig(value: unknown): ArtifactConfig | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as Record<string, unknown>;
+  const result: ArtifactConfig = {};
+  for (const key of ["maxArtifactBytes", "maxSessionBytes", "maxGlobalBytes"] as const) {
+    if (typeof candidate[key] === "number" && Number.isFinite(candidate[key]) && candidate[key] > 0) result[key] = candidate[key];
+  }
+  if (candidate.lifecycle === "retain" || candidate.lifecycle === "session") result.lifecycle = candidate.lifecycle;
   return result;
 }
 

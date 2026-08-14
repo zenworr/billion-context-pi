@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Correct package identity and compatibility by bundling the private kernel, requiring Pi `^0.84.1` and Node `>=22.19.0`, and adding a clean packed-consumer smoke test.
+- Replace unsafe absolute-ratio calibration and the fixed 204K gate with verified anchored deltas, per-model compiled-projection budgets, bounded recovery tools, and failed-compression relaxation.
+- Make provider-visible compression single-anchor, require contiguous higher-tier sources, retain semantic requirements at every tier, and record complete checkpoint provenance and retrievable checkpoint sources.
+- Add inter-process sidecar locking, graph/metadata revision separation, survival-based background distillation, a two-attempt rescue ladder, bounded pins/search/decompression, artifact quotas, and streamed artifact storage.
+- Keep project/world freshness out of the stable system prefix, preserve Pi reasoning, and make `/acp-model` and `/acp-settings` project-local.
+
 - Add `/acp-model` and `/acp-settings` for selecting a configured compression model, thinking level, and independent Tier-1/Tier-2/Tier-3 routing.
 - Preserve main-model range selection while configured compressors write validated summaries with visible main-model fallback and nested usage accounting.
 - Convert the project to the `acp-kernel` + `billion-context-pi` workspace while retaining both package names.

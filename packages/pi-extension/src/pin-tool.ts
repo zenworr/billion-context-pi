@@ -2,6 +2,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import type { PinRecord } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
+import { forcedCompressionLimit } from "./config.js";
+
+const MAX_ACTIVE_PINS = 8;
+const MAX_PINNED_CHARS = 48_000;
 
 const pinSchema = Type.Object({
   ref: Type.String({ description: "Block id, message ref, or artifact id to keep in the current working set." }),
@@ -32,7 +36,7 @@ export function registerPinTool(pi: ExtensionAPI, runtime: AcpRuntime): void {
           remainingTurns: turns,
           createdAt: Date.now(),
         };
-        const nextPins = [...state.pins.filter((item) => item.ref !== pin.ref), pin];
+        const nextPins = [...state.pins.filter((item) => item.ref !== pin.ref), pin].slice(-MAX_ACTIVE_PINS);
         await runtime.save({ ...state, pins: nextPins, nextPinId: state.nextPinId + 1 }, ctx);
         return { content: [{ type: "text", text: `Pinned ${params.ref} (${mode}) for ${turns} turn${turns === 1 ? "" : "s"}.` }], details: { pin } };
       } finally { release(); }
@@ -40,23 +44,40 @@ export function registerPinTool(pi: ExtensionAPI, runtime: AcpRuntime): void {
   });
 }
 
-export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"], messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"], ctx: ExtensionContext): string | undefined {
-  void ctx;
+export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"], messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"], ctx: ExtensionContext, runtime: AcpRuntime): string | undefined {
   const messageByRef = new Map(messages.map((message) => [state.messageRefs.byRaw[message.id], message]));
   const parts: string[] = [];
+  const contextWindow = runtime.liveContextLimit(ctx);
+  const hardLimit = forcedCompressionLimit(runtime.adapter, contextWindow);
+  const projectedTokens = runtime.projectionFor(ctx.sessionManager.getSessionId())?.estimatedTokens ?? 0;
+  const budgetChars = Math.max(2_000, (hardLimit - projectedTokens) * 2);
+  let remainingChars = Math.min(MAX_PINNED_CHARS, budgetChars);
   for (const pin of state.pins) {
+    if (remainingChars <= 0) break;
     if (pin.remainingTurns <= 0) continue;
     const kind = resolvePinKind(state, messages, pin.ref);
     if (kind === "block") {
       const block = state.blocks.find((item) => item.blockId === pin.ref);
       if (!block) continue;
-      parts.push(pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n"));
+      const value = pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n");
+      const bounded = value.slice(0, remainingChars);
+      parts.push(`${bounded}${bounded.length < value.length ? `\n[pin truncated; retrieve ${block.blockId} with decompress]` : ""}`);
+      remainingChars -= bounded.length;
     } else if (kind === "message") {
       const message = messageByRef.get(pin.ref);
-      if (message) parts.push(`[${pin.ref}] ${message.text ?? ""}`);
+      if (message) {
+        const value = `[${pin.ref}] ${message.text ?? ""}`;
+        const bounded = value.slice(0, remainingChars);
+        parts.push(`${bounded}${bounded.length < value.length ? `\n[pin truncated; retrieve ${pin.ref} with decompress]` : ""}`);
+        remainingChars -= bounded.length;
+      }
     } else if (kind === "artifact") {
       const artifact = state.artifacts.find((item) => item.id === pin.ref || item.sha256 === pin.ref);
-      if (artifact) parts.push(`[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`);
+      if (artifact) {
+        const value = `[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`;
+        parts.push(value.slice(0, remainingChars));
+        remainingChars -= value.length;
+      }
     }
   }
   if (parts.length === 0) return undefined;

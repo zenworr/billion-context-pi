@@ -8,6 +8,10 @@ export interface CommitCheckpointInput {
   firstKeptEntryId?: string;
   provider?: string;
   model?: string;
+  provenance?: CheckpointRecord["provenance"];
+  sourceHash?: string;
+  coverageComplete?: boolean;
+  validationStatus?: CheckpointRecord["validationStatus"];
   createdAt?: number;
 }
 
@@ -36,6 +40,11 @@ export function commitCheckpointEpoch(state: CompressionState, input: CommitChec
     createdAt,
     provider: input.provider,
     model: input.model,
+    provenance: input.provenance,
+    sourceHash: input.sourceHash,
+    coverageVersion: 1,
+    coverageComplete: input.coverageComplete ?? false,
+    validationStatus: input.validationStatus,
   };
   return {
     checkpoint,

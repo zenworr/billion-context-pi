@@ -139,8 +139,8 @@ export function renderNudgeText(decision: NudgeDecision, prompts: Prompts = defa
         "",
         `[TIER ${decision.tier} ${isT2 ? "DISTILLATION" : "CONDENSATION"} TRIGGER]`,
         isT2
-          ? `Your tier-1 compression summaries have accumulated. Distill them into a single denser tier-2 summary. Use block IDs as boundaries (startId and endId as bN). Any raw (uncompressed) messages sitting between the boundary blocks are absorbed into the tier-2 block as well — apply HOW TO COMPRESS to those raw messages and the TIER 2 distillation rules to the existing summaries, so the whole span is covered and nothing is lost.`
-          : `Your tier-2 compression summaries have accumulated. Condense them further into a tier-3 ultra-condensed summary. Use block IDs as boundaries (startId and endId as bN). Any raw (uncompressed) messages sitting between the boundary blocks are absorbed into the tier-3 block as well — apply HOW TO COMPRESS to those raw messages and the TIER 3 condensation rules to the existing summaries, so the whole span is covered and nothing is lost.`,
+          ? `Your tier-1 compression summaries have accumulated. Distill a contiguous run into one denser tier-2 summary. Use block IDs as boundaries (startId and endId as bN). Higher-tier ranges can contain only contiguous tier-1 blocks. Raw (uncompressed) message gaps are prohibited: compress each raw gap to tier 1 separately before selecting the block run.`
+          : `Your tier-2 compression summaries have accumulated. Condense a contiguous run into one tier-3 ultra-condensed summary. Use block IDs as boundaries (startId and endId as bN). Higher-tier ranges can contain only contiguous tier-2 blocks. Raw (uncompressed) message gaps are prohibited: compress each raw gap to tier 1 separately before selecting the block run.`,
         blockList,
         `Example: compress({ content: [{ startId: "${startId}", endId: "${endId}", summary: "..." }] })`,
         "",
