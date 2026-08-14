@@ -1,0 +1,55 @@
+{
+    "name": "multiple-compressions",
+    "description": "Two independent compress calls across the session, producing 2 blocks. Validates that compressionCount accumulates and a second compression works after the first has already collapsed earlier messages into a block.",
+    "turns": [
+        {
+            "respond": "text",
+            "userText": "Explain the API gateway design.",
+            "text": "The API gateway is the single ingress for all external traffic, built on Envoy. It terminates TLS at src/gateway/tls.ts:18 (certs rotated every 90 days via cert-manager), routes by host and path at src/gateway/routing.ts:24 (virtual hosts defined in deploy/envoy/route-config.yaml), and applies a middleware chain: rate limiting (token bucket 1000 rps per client, src/gateway/ratelimit.ts:30), authentication (JWT validation src/gateway/auth.ts:22, forwarding the x-user-id header downstream), request ID injection (src/gateway/request-id.ts:14), and access logging (src/gateway/access-log.ts:20, JSON to stdout, tailed by Fluent Bit). Load balancing uses round-robin with passive health checks (src/gateway/health.ts:28: 5 consecutive 5xx marks a backend unhealthy for 30s). Retries are configured per-route at deploy/envoy/retry.yaml: idempotent GETs retry twice on 5xx/gateway-error with a 250ms per-attempt timeout. Timeouts: a 30s overall request timeout (src/gateway/timeout.ts:16) and per-backend circuit breakers (max 1024 concurrent connections) at src/gateway/circuit-breaker.ts:22. CORS is configured at src/gateway/cors.ts:18 (allowed origins from config). The gateway publishes metrics (request count, latency histograms, upstream healthy count) at src/gateway/metrics.ts:26, scraped by Prometheus; the SLO is 99.9% availability and p99 < 100ms gateway overhead. WebSockets are supported via tcp proxy at src/gateway/ws-proxy.ts:20 with a 1-hour idle timeout. gRPC transcoding (REST → gRPC) is configured at src/gateway/grpc-transcode.ts:24 using proto annotations."
+        },
+        {
+            "respond": "text",
+            "userText": "Continue with the gateway resilience features.",
+            "text": "Gateway resilience features protect downstream services from overload and partial failures. Bulkheading isolates failure domains: each downstream service gets a dedicated connection pool (src/gateway/bulkhead.ts:30, 512 connections max) so a slow service cannot exhaust connections needed by healthy ones. Load shedding drops low-priority traffic when the gateway is near capacity: a concurrency limiter at src/gateway/shed.ts:28 rejects requests with HTTP 503 + Retry-After once in-flight exceeds 20000, while a priority queue (src/gateway/priority.ts:22) keeps payment and auth requests flowing. Adaptive concurrency control (src/gateway/adaptive.ts:34) uses a gradient algorithm to track the latency limit; when p99 rises above the long-term average it lowers the concurrency ceiling automatically, recovering as latency returns to normal. Outlier detection (src/gateway/outlier.ts:26) ejects backends whose 5xx rate exceeds 5% over a 30s window for 30s. Fail-fast patterns prevent cascading failures: a per-route circuit breaker (src/gateway/circuit-breaker.ts:22) trips after 20% failures and fast-fails for 10s before half-opening a probe. Time-budget decomposition (src/gateway/budget.ts:18) allocates the 30s end-to-end budget across hops so a downstream cannot burn the whole budget. Backpressure propagation from upstream is honored via HTTP 429/503 with Retry-After (src/gateway/backpressure.ts:24). Chaos testing (src/gateway/chaos.ts:30) injects latency and errors in staging to validate these mechanisms weekly. The resilience dashboard (src/gateway/dashboard.ts:40) plots concurrency, shed rate, circuit state, and outlier ejections in real time."
+        },
+        {
+            "respond": "compress",
+            "userText": "Compress the gateway discussion.",
+            "topic": "API Gateway & Resilience",
+            "summary": "## API Gateway (Envoy)\n- TLS src/gateway/tls.ts:18 (cert-manager 90d). Routing src/gateway/routing.ts:24 (deploy/envoy/route-config.yaml). Chain: ratelimit token-bucket 1000rps src/gateway/ratelimit.ts:30; auth JWT src/gateway/auth.ts:22; request-id src/gateway/request-id.ts:14; access-log src/gateway/access-log.ts:20.\n- LB round-robin + passive health src/gateway/health.ts:28 (5x5xx→unhealthy 30s). Retries deploy/envoy/retry.yaml (GET 2x, 250ms). Timeout 30s src/gateway/timeout.ts:16; circuit-breaker 1024 src/gateway/circuit-breaker.ts:22. CORS src/gateway/cors.ts:18. Metrics src/gateway/metrics.ts:26 (99.9%/p99<100ms). WS proxy src/gateway/ws-proxy.ts:20. gRPC transcode src/gateway/grpc-transcode.ts:24.\n\n## Resilience\n- Bulkhead per-service pool 512 src/gateway/bulkhead.ts:30. Shed HTTP503 >20000 inflight src/gateway/shed.ts:28; priority queue src/gateway/priority.ts:22.\n- Adaptive concurrency (gradient) src/gateway/adaptive.ts:34. Outlier 5%/30s→eject 30s src/gateway/outlier.ts:26. Circuit 20%→fail 10s src/gateway/circuit-breaker.ts:22. Time-budget src/gateway/budget.ts:18. Backpressure 429/503 src/gateway/backpressure.ts:24. Chaos staging weekly src/gateway/chaos.ts:30. Dashboard src/gateway/dashboard.ts:40.",
+            "range": "all"
+        },
+        {
+            "respond": "text",
+            "text": "Compressed the gateway discussion into a summary block.",
+            "auto": true
+        },
+        {
+            "respond": "text",
+            "userText": "Now explain the database migration strategy.",
+            "text": "The database migration strategy keeps schema changes safe, reversible, and zero-downtime. Migrations are versioned SQL files under migrations/ numbered sequentially (migrations/0042_rls.sql) and applied by the tool at src/db/migrate.ts:30, which records applied versions in the schema_migrations table. Each migration must be backward and forward compatible: the two-deploy rule means a migration is split across two releases — deploy 1 adds the new column nullable (src/db/patterns/add-column.sql), deploy 2 backfills and adds the NOT NULL constraint (src/db/patterns/backfill.sql). Large table alterations use expand-contract: expand adds the new schema alongside the old (src/db/patterns/expand.sql), the app dual-writes (src/db/dual-write.ts:22), a backfill copies old rows (src/db/backfill.ts:18), reads switch to the new schema, then contract drops the old (src/db/patterns/contract.sql). Adding an index to a large table uses CREATE INDEX CONCURRENTLY (src/db/patterns/cindex.sql) to avoid locking writers; a health check at src/db/index-health.ts:16 aborts if the index build blocks. Foreign-key constraints are added in three steps: add (invalid), validate, rely on (src/db/patterns/fk.sql). Data backfills on huge tables are batched at src/db/batch-backfill.ts:24 (10000 rows per transaction, 100ms sleep between batches) to keep replication lag under 1 second. Rollback safety: every migration has a paired down-migration (migrations/0042_rls.down.sql); destructive operations are gated behind a confirmation prompt at src/db/migrate.ts:88. Shadow migrations (src/db/shadow.ts:30) replay the migration against a restored copy of production and report row-count diffs before the real deploy. The migration CI gate runs the full suite against a throwaway Postgres at src/db/ci-gate.ts:20."
+        },
+        {
+            "respond": "text",
+            "userText": "Continue with rollback and verification.",
+            "text": "Rollback and verification close the migration safety loop. Every deploy records the schema version, enabling a targeted rollback via src/db/rollback.ts:24 which applies down-migrations back to a safe version. Down-migrations are tested in CI by applying up then down then up again and diffing the schema (src/db/ci-gate.ts:20, the round-trip check at src/db/round-trip.ts:16). For data migrations that cannot be reversed (a column drop), the strategy is a delayed cleanup: the column is abandoned (renamed to _deprecated_) for one release (src/db/abandon.ts:18) and only dropped after confirming no reads occur (src/db/usage-probe.ts:22 scans query logs). Verification before cutover: a canary deploy routes 5% of traffic to the new schema (src/db/canary.ts:30) while a consistency checker at src/db/consistency.ts:26 compares old and new read paths; only on zero diffs over 30 minutes does the rollout proceed (src/db/cutover-gate.ts:28). Post-deploy, the data-integrity suite at tests/db-integrity/ runs foreign-key, orphan, and checksum validations (src/db/integrity-check.ts:20). Replication lag is monitored during the deploy (src/db/lag-monitor.ts:18); if it exceeds 5s the deploy pauses. The runbook for a failed migration (docs/runbooks/migration-rollback.md) lists the exact commands. A quarterly game-day exercise rehearses a full rollback under load (src/db/gameday.ts:14)."
+        },
+        {
+            "respond": "compress",
+            "userText": "Compress the migration discussion now.",
+            "topic": "DB Migration Strategy & Rollback",
+            "summary": "## Migrations\n- Versioned migrations/NNNN_*.sql, applied by src/db/migrate.ts:30 (schema_migrations table). Down-migration migrations/0042_rls.down.sql, rollback src/db/rollback.ts:24.\n- Two-deploy rule (add nullable → backfill+NOT NULL) src/db/patterns/{add-column,backfill}.sql. Expand-contract src/db/patterns/{expand,contract}.sql + dual-write src/db/dual-write.ts:22 + backfill src/db/backfill.ts:18.\n- CREATE INDEX CONCURRENTLY src/db/patterns/cindex.sql + health src/db/index-health.ts:16. FK add/validate/rely-on sequence src/db/patterns/fk.sql. Batch backfill 10000/100ms src/db/batch-backfill.ts:24. Destructive gated src/db/migrate.ts:88. Shadow src/db/shadow.ts:30. CI gate src/db/ci-gate.ts:20.\n\n## Rollback/Verification\n- Round-trip up-down-up diff src/db/round-trip.ts:16. Abandon+drop (rename _deprecated_, usage-probe src/db/usage-probe.ts:22) src/db/abandon.ts:18.\n- Canary 5% + consistency checker src/db/canary.ts:30, src/db/consistency.ts:26; cutover gate 30min zero-diff src/db/cutover-gate.ts:28. Integrity tests/db-integrity/, src/db/integrity-check.ts:20. Lag monitor 5s src/db/lag-monitor.ts:18. Runbook docs/runbooks/migration-rollback.md. Gameday src/db/gameday.ts:14.",
+            "range": "all"
+        },
+        {
+            "respond": "text",
+            "text": "Second compression complete. The migration discussion is summarized.",
+            "auto": true
+        }
+    ],
+    "verify": {
+        "blockCount": 2,
+        "activeBlockCount": 1,
+        "compressionCount": 2
+    }
+}

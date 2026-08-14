@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "concurrent-delegate-completion",
+  "description": "Concurrent delegate completions are retained once each even when completion order differs from launch order.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 80, "branch": "main", "provider": "openai", "canonicalMessages": 300 },
+  "events": [
+    { "type": "delegate-completion", "delegateId": "delegate-c", "batch": "batch-1", "retained": true },
+    { "type": "delegate-completion", "delegateId": "delegate-a", "batch": "batch-1", "retained": true },
+    { "type": "delegate-completion", "delegateId": "delegate-b", "batch": "batch-1", "retained": true }
+  ],
+  "assertions": [
+    { "path": "completedDelegates", "op": "eq", "value": 3 },
+    { "path": "reliability.delegateCompletionsRetained", "op": "eq", "value": 3 }
+  ]
+}

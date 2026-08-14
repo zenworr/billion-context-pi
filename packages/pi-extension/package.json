@@ -1,0 +1,68 @@
+{
+  "name": "billion-context-pi",
+  "version": "0.1.37",
+  "description": "One billion, not one million. Model-driven context management for the Pi coding agent.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "homepage": "https://github.com/zenworr/billion-context-pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zenworr/billion-context-pi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zenworr/billion-context-pi/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsup && node scripts/copy-kernel-dts.mjs",
+    "e2e": "node scripts/e2e/run-e2e.mjs"
+  },
+  "keywords": [
+    "pi",
+    "acp",
+    "context",
+    "compression",
+    "context-management",
+    "llm",
+    "pi-package"
+  ],
+  "author": "ranxianglei",
+  "license": "MIT",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@types/node": "^26.1.2",
+    "acp-kernel": "0.0.23",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3"
+  }
+}

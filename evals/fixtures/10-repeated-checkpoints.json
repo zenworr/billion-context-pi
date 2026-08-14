@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "repeated-checkpoints",
+  "description": "Repeated full checkpoints create monotonic epochs, deactivate prior blocks, and retain canonical history.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 70, "branch": "main", "provider": "openai", "canonicalMessages": 5000 },
+  "events": [
+    { "type": "checkpoint", "id": "cp-1", "epochBefore": 0, "epochAfter": 1, "priorBlocksInactive": true, "canonicalHistoryVisible": true },
+    { "type": "checkpoint", "id": "cp-2", "epochBefore": 1, "epochAfter": 2, "priorBlocksInactive": true, "canonicalHistoryVisible": true },
+    { "type": "checkpoint", "id": "cp-3", "epochBefore": 2, "epochAfter": 3, "priorBlocksInactive": true, "canonicalHistoryVisible": true }
+  ],
+  "assertions": [
+    { "path": "epoch", "op": "eq", "value": 3 },
+    { "path": "reliability.checkpoints", "op": "eq", "value": 3 }
+  ]
+}

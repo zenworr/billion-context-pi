@@ -1,7 +1,5 @@
 node_modules/
 dist/
+coverage/
 *.log
 .DS_Store
-*.acp.json
-.pi-subagents/
-tmp-debug.ts

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "baseline-configured-t0",
+  "description": "Configured-model baseline after deterministic T0 clearing.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 20, "branch": "main", "provider": "openai", "canonicalMessages": 1200 },
+  "events": [
+    { "type": "baseline", "name": "configured-t0" },
+    { "type": "turn", "activeInputTokens": 124000, "cachedInputTokens": 100000, "uncachedInputTokens": 24000, "cacheHitRate": 0.81 },
+    { "type": "mutation", "reclaimedTokens": 31000, "cacheHitBefore": 0.81, "cacheHitAfter": 0.68 },
+    { "type": "quality", "constraintsRetained": 4, "constraintsTotal": 4, "exactFactsRetained": 10, "exactFactsTotal": 10, "unresolvedRetained": 2, "unresolvedTotal": 2, "contradictions": 0, "summaries": 1, "retrievalSuccesses": 2, "retrievalAttempts": 2, "continuationSuccesses": 1, "continuationAttempts": 1, "testsCompleted": 1, "testsAttempted": 1, "repeatedRetrievals": 0, "falseConfidence": 0 }
+  ],
+  "assertions": [
+    { "path": "context.tokensReclaimed", "op": "eq", "value": 31000 },
+    { "path": "context.cacheHitAfter", "op": "eq", "value": 0.68 }
+  ]
+}

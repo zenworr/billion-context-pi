@@ -37,17 +37,14 @@ jobs:
         if: steps.check.outputs.is_release == 'true'
         run: npm ci
 
-      - name: Build and test
+      - name: Verify architecture, tests, and builds
         if: steps.check.outputs.is_release == 'true'
-        run: |
-          npm run typecheck
-          npm test
-          npm run build
+        run: npm run verify
 
       - name: Read version
         if: steps.check.outputs.is_release == 'true'
         id: version
-        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+        run: echo "version=$(node -p "require('./packages/pi-extension/package.json').version")" >> $GITHUB_OUTPUT
 
       - name: Check if prerelease
         if: steps.check.outputs.is_release == 'true'
@@ -61,17 +58,29 @@ jobs:
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create tag
+      - name: Verify release version is unused
         if: steps.check.outputs.is_release == 'true'
         run: |
-          git tag "v${{ steps.version.outputs.version }}" || true
-          git push origin "v${{ steps.version.outputs.version }}" || true
+          VERSION="${{ steps.version.outputs.version }}"
+          if npm view "billion-context-pi@${VERSION}" version >/dev/null 2>&1; then
+            echo "billion-context-pi@${VERSION} is already published" >&2
+            exit 1
+          fi
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "tag v${VERSION} already exists" >&2
+            exit 1
+          fi
+          git tag "v${VERSION}"
 
-      - name: Publish
+      - name: Publish extension
         if: steps.check.outputs.is_release == 'true'
-        run: npm publish --tag ${{ steps.pre.outputs.tag }} --access public
+        run: npm publish --workspace billion-context-pi --tag ${{ steps.pre.outputs.tag }} --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Push verified release tag
+        if: steps.check.outputs.is_release == 'true'
+        run: git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Create GitHub Release
         if: steps.check.outputs.is_release == 'true'

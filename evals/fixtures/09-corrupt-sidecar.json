@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "corrupt-sidecar",
+  "description": "A corrupt sidecar is quarantined and rebuilt while canonical JSONL history remains visible.",
+  "mode": "authoritative",
+  "initial": {
+    "contextWindow": 258000,
+    "safeThreshold": 233616,
+    "revision": 0,
+    "branch": "main",
+    "provider": "openai",
+    "canonicalMessages": 1100
+  },
+  "events": [
+    {
+      "type": "sidecar",
+      "status": "corrupt",
+      "action": "quarantine-rebuild",
+      "canonicalHistoryVisible": true
+    },
+    {
+      "type": "sidecar",
+      "status": "missing",
+      "action": "rebuild",
+      "canonicalHistoryVisible": true
+    }
+  ],
+  "assertions": [
+    {
+      "path": "reliability.sidecarRecoveries",
+      "op": "eq",
+      "value": 2
+    }
+  ]
+}

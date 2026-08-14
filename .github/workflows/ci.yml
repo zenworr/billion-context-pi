@@ -22,13 +22,28 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - run: npm run verify
 
   pr-validation:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
-      - run: ./scripts/ci/check-pr.sh "${{ github.head_ref }}" "${{ github.event.pull_request.base.ref }}"
+      - run: ./packages/pi-extension/scripts/ci/check-pr.sh "${{ github.head_ref }}" "${{ github.event.pull_request.base.ref }}"
+
+  live-pi-smoke:
+    name: Live Pi runtime and packed consumer smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Packed clean-install/import/type smoke
+        run: npm run pack:smoke
+      - name: Live Pi fake-provider behavior matrix
+        run: npm run e2e
+      - name: Million-message scalability gate
+        run: npm run scale:history

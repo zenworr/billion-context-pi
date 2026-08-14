@@ -1,0 +1,49 @@
+{
+    "name": "nudge-triggered",
+    "description": "Nudge-triggered compression: the model emits growth text across turns until billion-context-pi's context-usage nudge is injected, then the fake LLM detects the nudge and compresses. A low modelContextLimit makes the nudge fire quickly. Validates the nudge detection + baseline-recording path.",
+    "acpConfig": { "modelContextLimit": 500 },
+    "turns": [
+        {
+            "respond": "nudge-compress",
+            "userText": "Let's work on a long design discussion. Go ahead and start explaining the data ingestion pipeline in detail.",
+            "growthText": "Working on the data ingestion pipeline design. The ingestion service accepts events from upstream producers via a Kafka topic (events-raw, 12 partitions, replication factor 3). The consumer group ingest-workers (8 instances) reads in batches of up to 500 records with a 5-second max poll interval. Each batch is deserialized from Avro at src/ingest/decode.ts:24 against the schema registry (Confluent, cached at src/ingest/schema-cache.ts:16, TTL 10 minutes). Validation runs a JSON-Schema check at src/ingest/validate.ts:30 and a domain-rules check at src/ingest/domain-rules.ts:42; invalid records are diverted to the poison-topic for manual review (src/ingest/poison.ts:18). Valid records are enriched (geo-IP lookup at src/ingest/enrich.ts:28 via MaxMind GeoIP2, user-agent parsing at src/ingest/enrich.ts:60) then written to the events table in a single batched INSERT at src/ingest/persist.ts:34. Idempotency is guaranteed by a deterministic event_id (SHA-256 of producer+seq, src/ingest/id.ts:12) with an ON CONFLICT DO NOTHING clause. Backpressure: if the DB write exceeds 800ms the consumer pauses polling for 2 seconds (src/ingest/backpressure.ts:20). Metrics: ingest_lag, ingest_validation_errors, ingest_persist_latency exported at src/ingest/metrics.ts:24. This is part one of the pipeline design discussion.",
+            "topic": "Data Ingestion Pipeline",
+            "summary": "## Data Ingestion Pipeline\nKafka topic events-raw (12p, rf3) → ingest-workers (8 instances, batch 500, 5s poll). Avro decode src/ingest/decode.ts:24 + schema registry cache src/ingest/schema-cache.ts:16 (10m). Validate JSON-Schema src/ingest/validate.ts:30 + domain src/ingest/domain-rules.ts:42; poison topic src/ingest/poison.ts:18. Enrich geo-IP src/ingest/enrich.ts:28, UA src/ingest/enrich.ts:60. Batched INSERT src/ingest/persist.ts:34, event_id=SHA256(prod+seq) ON CONFLICT DO NOTHING src/ingest/id.ts:12. Backpressure src/ingest/backpressure.ts:20 (DB>800ms→pause 2s). Metrics src/ingest/metrics.ts:24.",
+            "range": "all"
+        },
+        {
+            "respond": "nudge-compress",
+            "userText": "Continue with the stream processing layer.",
+            "growthText": "Continuing the pipeline design with the stream-processing layer. Downstream of ingestion, the stream-processing service consumes the events table's logical replication slot (src/stream/wal.ts:30, pgoutput protocol) and maintains real-time aggregates. Windowed aggregations (1-minute tumbling windows for request counts, 5-minute for revenue) are computed in a rocksdb-backed state store at src/stream/state.ts:28; the state is checkpointed to S3 every 60 seconds (src/stream/checkpoint.ts:42) for exactly-once recovery. Late events (arriving after the window closed) are routed to a side-output for up to 10 minutes then dropped (src/stream/late.ts:18). The join between the events stream and the reference dim_customers table is a lookup join cached for 5 minutes (src/stream/join.ts:52). Watermarks are derived from the event timestamp with a 30-second bounded out-of-orderness (src/stream/watermark.ts:24). The processed aggregates are written to the realtime_dashboard table and also pushed to a WebSocket fan-out at src/stream/ws-push.ts:30 so the UI updates live. Scaling is per-partition: each of the 12 partitions is owned by exactly one worker (cooperative rebalancing src/stream/rebalance.ts:40), and state migration on rebalance restores from the S3 checkpoint. This concludes the stream-processing discussion and continues our pipeline design.",
+            "topic": "Stream Processing Layer",
+            "summary": "## Stream Processing Layer\nLogical-repl WAL slot src/stream/wal.ts:30 → aggregates. 1min/5min tumbling windows in rocksdb state src/stream/state.ts:28; checkpoint S3/60s src/stream/checkpoint.ts:42 (exactly-once). Late events side-output 10min src/stream/late.ts:18. Lookup join dim_customers cached 5min src/stream/join.ts:52. Watermarks 30s out-of-order src/stream/watermark.ts:24. Output realtime_dashboard + WS fan-out src/stream/ws-push.ts:30. 12 partitions, cooperative rebalance src/stream/rebalance.ts:40, state restore from S3.",
+            "range": "all"
+        },
+        {
+            "respond": "nudge-compress",
+            "userText": "Keep going, the context is getting full — wrap up and consolidate.",
+            "growthText": "Continuing to generate pipeline design content to fill the context window. The batch layer complements the stream layer: a nightly Spark job at src/batch/nightly.ts:40 recomputes the last 24 hours from the raw events table to correct any drift in the real-time aggregates, writing corrections to the batch_corrections table. The reconciliation merge at src/batch/reconcile.ts:28 applies batch values where they disagree with stream values, logging every override. Schemas evolve via the schema registry with backward-compatible Avro reads (src/schema/evolve.ts:22); a breaking change requires a new topic. Replay support lets us re-process the last 7 days from the raw topic into a repaired consumer (src/ops/replay.ts:35) while normal ingestion continues. Data quality SLAs (completeness >99.9%, freshness <60s) are monitored by the great_expectations suite at tests/data-quality/ and the results feed the deploy gate (src/deploy/dq-gate.ts:30). This is more pipeline design content being generated to exercise the context window and trigger the compression nudge so we can validate the nudge pipeline end to end.",
+            "topic": "Batch & Replay Layer",
+            "summary": "## Batch & Replay\nNightly Spark src/batch/nightly.ts:40 recompute 24h → batch_corrections. Reconcile merge src/batch/reconcile.ts:28 (log overrides). Schema evolve backward-compat src/schema/evolve.ts:22 (breaking=new topic). Replay last 7d src/ops/replay.ts:35. DQ SLAs completeness>99.9%/freshness<60s via great_expectations tests/data-quality/, gate src/deploy/dq-gate.ts:30.",
+            "range": "all"
+        },
+        {
+            "respond": "nudge-compress",
+            "userText": "Add the final operational details and consolidate now.",
+            "growthText": "Final operational details: blue-green deployment uses shadow consumers and compares aggregate checksums before traffic cutover. Incident recovery restores the last durable stream checkpoint, replays the raw topic from its stored offsets, and validates completeness before reopening writes. Operators follow the runbook at docs/pipeline-recovery.md and record every replay window and schema version in the incident timeline. This final growth turn intentionally crosses the configured active-context threshold so the ACP nudge and compression path can be verified deterministically.",
+            "topic": "Pipeline Operations",
+            "summary": "## Pipeline Operations\nBlue-green shadow consumers verify checksums before cutover. Recovery restores checkpoint, replays stored offsets, validates completeness, and follows docs/pipeline-recovery.md with replay/schema audit records.",
+            "range": "all"
+        },
+        {
+            "respond": "text",
+            "text": "Compression complete. The pipeline design discussion has been consolidated.",
+            "auto": true
+        }
+    ],
+    "verify": {
+        "minBlockCount": 1,
+        "minNudgeCount": 1,
+        "nudgeBaselineSet": true
+    }
+}

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "timeout-abort",
+  "description": "Timeout and AbortSignal cancellation leave compression state unchanged.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 9, "branch": "main", "provider": "openai", "canonicalMessages": 700 },
+  "events": [
+    { "type": "compactor", "outcome": "timeout", "route": "configured", "inputTokens": 51000, "outputTokens": 0, "cachedInputTokens": 0, "latencyMs": 30000, "commit": false },
+    { "type": "compactor", "outcome": "abort", "route": "configured", "inputTokens": 51000, "outputTokens": 0, "cachedInputTokens": 0, "latencyMs": 120, "commit": false }
+  ],
+  "assertions": [
+    { "path": "revision", "op": "eq", "value": 9 },
+    { "path": "reliability.timeoutAbortCommitsPrevented", "op": "eq", "value": 2 }
+  ]
+}

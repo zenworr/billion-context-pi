@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "tool-reasoning-boundaries",
+  "description": "Compression range expansion keeps tool calls/results and reasoning/responses indivisible at both boundaries.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 60, "branch": "main", "provider": "deepseek", "canonicalMessages": 400 },
+  "events": [
+    { "type": "protocol-range", "protocol": "tool", "unitId": "call-left", "unitStart": 9, "unitEnd": 10, "compressedStart": 9, "compressedEnd": 22 },
+    { "type": "protocol-range", "protocol": "tool", "unitId": "call-right", "unitStart": 21, "unitEnd": 22, "compressedStart": 9, "compressedEnd": 22 },
+    { "type": "protocol-range", "protocol": "reasoning", "unitId": "reason-left", "unitStart": 8, "unitEnd": 9, "compressedStart": 8, "compressedEnd": 24 },
+    { "type": "protocol-range", "protocol": "reasoning", "unitId": "reason-right", "unitStart": 23, "unitEnd": 24, "compressedStart": 8, "compressedEnd": 24 }
+  ],
+  "assertions": [
+    { "path": "reliability.protocolPairViolations", "op": "eq", "value": 0 }
+  ]
+}

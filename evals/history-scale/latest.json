@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "generatedAt": "2026-08-14T22:14:46.610Z",
+  "node": "v25.0.0",
+  "platform": "linux/x64",
+  "scenarios": [
+    {
+      "messages": 10000,
+      "assigned": 10000,
+      "nextIndex": 10001,
+      "buildMs": 10.2,
+      "lookupMs": 1.25,
+      "lookupChecksum": 10000,
+      "heapUsedBytes": 9521768,
+      "rssBytes": 103809024
+    },
+    {
+      "messages": 100000,
+      "assigned": 100000,
+      "nextIndex": 100001,
+      "buildMs": 68.07,
+      "lookupMs": 1.64,
+      "lookupChecksum": 10000,
+      "heapUsedBytes": 46762112,
+      "rssBytes": 160677888
+    },
+    {
+      "messages": 1000000,
+      "assigned": 1000000,
+      "nextIndex": 1000001,
+      "buildMs": 882.82,
+      "lookupMs": 3.74,
+      "lookupChecksum": 10000,
+      "heapUsedBytes": 416102752,
+      "rssBytes": 648761344
+    }
+  ]
+}

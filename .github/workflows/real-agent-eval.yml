@@ -1,0 +1,55 @@
+name: Real-agent ACP evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      acting_model_a:
+        description: First acting provider/model
+        required: true
+        default: openai/gpt-4.1
+      acting_model_b:
+        description: Second acting provider/model family
+        required: true
+        default: google/gemini-2.5-pro
+      configured_model:
+        description: Configured compression provider/model
+        required: true
+        default: google/gemini-2.5-pro
+      require_cross_provider:
+        description: Fail unless a real cross-provider route is configured
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ACP_REAL_ACTING_MODEL_A: ${{ inputs.acting_model_a }}
+      ACP_REAL_ACTING_MODEL_B: ${{ inputs.acting_model_b }}
+      ACP_REAL_CONFIGURED_MODEL: ${{ inputs.configured_model }}
+      ACP_REAL_CROSS_PROVIDER_MODEL: ${{ inputs.configured_model }}
+      ACP_REAL_AGENT_REQUIRE_CROSS_PROVIDER: ${{ inputs.require_cross_provider && '1' || '0' }}
+      ACP_AUTO_UPDATE: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run eval:real-agent
+      - name: Upload raw and summarized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-agent-evidence-${{ github.run_id }}
+          path: evals/real-agent/
+          if-no-files-found: error
