@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createAcpExtension, remainingToolBudgetText, shouldCancelHostCompaction } from "../src/index.js";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
 
 // Mock Pi's ExtensionAPI — captures the event handlers the factory registers,
@@ -30,8 +30,9 @@ function captureApi() {
   return { api, handlers };
 }
 
-function fakeCtx(entries: any[], stateFile: string) {
+function fakeCtx(entries: any[], stateFile: string = "/tmp/pai-acp-test.session.json") {
   return {
+    cwd: dirname(stateFile),
     mode: "rpc",
     hasUI: false,
     ui: { notify: () => {}, confirm: async () => true, select: async () => undefined, input: async () => "", setStatus: () => {} },
@@ -71,6 +72,30 @@ test("factory registers ACP tools and 6 flat commands", () => {
   assert.ok(handlers.has("context"), "context event wired");
   assert.ok(handlers.has("session_before_compact"), "compaction-disable wired");
   assert.ok(handlers.has("before_agent_start"), "system-prompt wired");
+});
+
+test("runtime configuration refreshes from immutable startup settings", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-live-config-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const first = join(dir, "first");
+  const second = join(dir, "second");
+  const fs = await import("node:fs/promises");
+  await fs.mkdir(join(first, CONFIG_DIR_NAME), { recursive: true });
+  await fs.mkdir(join(second, CONFIG_DIR_NAME), { recursive: true });
+  await writeFile(join(first, CONFIG_DIR_NAME, "acp.json"), JSON.stringify({ delegate: false }));
+  await writeFile(join(second, CONFIG_DIR_NAME, "acp.json"), JSON.stringify({ delegate: true }));
+
+  const { api, handlers } = captureApi();
+  createAcpExtension({ delegate: true })(api as unknown as ExtensionAPI);
+  const before = handlers.get("before_agent_start")![0]!;
+  const disabled = await before({ systemPrompt: "" }, { cwd: first });
+  const enabled = await before({ systemPrompt: "" }, { cwd: second });
+  assert.doesNotMatch(disabled.systemPrompt, /ACP_DELEGATE NOTIFICATIONS/);
+  assert.match(enabled.systemPrompt, /ACP_DELEGATE NOTIFICATIONS/, "the next project does not inherit the prior project setting");
+
+  await writeFile(join(second, CONFIG_DIR_NAME, "acp.json"), JSON.stringify({ delegate: false }));
+  const revoked = await before({ systemPrompt: "" }, { cwd: second });
+  assert.doesNotMatch(revoked.systemPrompt, /ACP_DELEGATE NOTIFICATIONS/, "changed config is applied before the next request");
 });
 
 test("remaining tool budget text uses the active-model hard gate", () => {

@@ -65,15 +65,18 @@ declare const CURRENT_VERSION: string;
 
 export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactory {
   return (pi: ExtensionAPI) => {
-    const runtime = createRuntime(adapter);
+    // User configuration is always reapplied to this immutable startup base;
+    // never inherit project-local security settings from a prior session.
+    const baseAdapter = applyUserConfig(adapter, {});
+    const runtime = createRuntime(baseAdapter);
     const freshness = new FreshnessTracker();
     wireSurvivalAging(pi, runtime);
     const optimization = wireAutomaticCompaction(pi, runtime);
-    wireCompactionCoordinator(pi, runtime, freshness, optimization);
-    wireSessionLifecycle(pi, runtime, freshness);
-    wireContextTransform(pi, runtime, freshness);
+    wireCompactionCoordinator(pi, runtime, freshness, optimization, baseAdapter);
+    wireSessionLifecycle(pi, runtime, freshness, baseAdapter);
+    wireContextTransform(pi, runtime, freshness, baseAdapter);
     wireToolGuardrails(pi, runtime);
-    wireSystemPrompt(pi, runtime, freshness);
+    wireSystemPrompt(pi, runtime, freshness, baseAdapter);
     pi.registerTool(makeCompressTool(runtime));
     pi.registerTool(makeDecompressTool(runtime));
     pi.registerTool(makeSearchTool(runtime));
@@ -114,7 +117,7 @@ export function shouldCancelHostCompaction(input: {
     && input.hostTokensBefore - projectedTotal >= minimumSavings;
 }
 
-function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, optimization: AutomaticCompactionController): void {
+function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, optimization: AutomaticCompactionController, baseAdapter: AdapterConfig): void {
   const pendingCheckpointSources = new Map<string, {
     transactionId: string;
     sessionId: string;
@@ -124,6 +127,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
     sourceHash: string;
   }>();
   pi.on("session_before_tree", async (event, ctx) => {
+    await reloadRuntimeConfig(runtime, baseAdapter, ctx);
     if (!event.preparation.userWantsSummary || runtime.adapter.compress?.branchSummaryCompressor !== "configured") return;
     const sid = ctx.sessionManager.getSessionId();
     const release = await runtime.acquireLock(sid);
@@ -227,12 +231,21 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
         : pending?.sourceMessageIds ?? [];
       const usage = event.compactionEntry.usage;
       const configured = detailRecord?.source === "hybrid-acp-configured";
+      const reportedSourceHash = typeof detailRecord?.sourceHash === "string" ? detailRecord.sourceHash : undefined;
+      const capturedSourceVerified = configured
+        && reportedTransactionId !== undefined
+        && pending?.transactionId === reportedTransactionId
+        && reportedSourceHash !== undefined
+        && reportedSourceHash === pending.sourceHash;
       const committed = commitCheckpointEpoch(state, {
         summary: event.compactionEntry.summary,
         firstKeptEntryId: event.compactionEntry.firstKeptEntryId,
         entryId: event.compactionEntry.id,
         sourceMessageIds,
-        sourceBlockIds: pending?.sourceBlockIds,
+        // Native Pi compaction does not consume compileCheckpointSource()'s
+        // exact source envelope. Keep its coverage incomplete and leave ACP
+        // blocks active instead of claiming content it may not summarize.
+        sourceBlockIds: capturedSourceVerified ? pending?.sourceBlockIds : [],
         tokensBefore: event.compactionEntry.tokensBefore,
         provider: actualProvider,
         model: actualModel,
@@ -247,8 +260,8 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
           outputTokens: usage?.output,
           cachedInputTokens: usage?.cacheRead,
         } : undefined,
-        sourceHash: typeof detailRecord?.sourceHash === "string" ? detailRecord.sourceHash : pending?.sourceHash,
-        coverageComplete: sourceMessageIds.length > 0 && Boolean(typeof detailRecord?.sourceHash === "string" ? detailRecord.sourceHash : pending?.sourceHash),
+        sourceHash: capturedSourceVerified ? reportedSourceHash : undefined,
+        coverageComplete: capturedSourceVerified && sourceMessageIds.length > 0,
         validationStatus: detailRecord?.validation === "passed" || detailRecord?.validation === "repaired"
           || detailRecord?.validation === "fallback" || detailRecord?.validation === "unverified"
           ? detailRecord.validation
@@ -266,6 +279,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
+    await reloadRuntimeConfig(runtime, baseAdapter, ctx);
     const sid = ctx.sessionManager.getSessionId();
     let checkpointTransactionId: string | undefined;
     const captureRelease = await runtime.acquireLock(sid);
@@ -373,7 +387,19 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
       const suffixTexts: string[] = [];
       const runtimeOverlay = freshness.previewRuntimeOverlay();
       if (runtimeOverlay) suffixTexts.push(runtimeOverlay);
-      const pinnedOverlay = renderPins(turn.state, coreMessages, ctx, runtime, turn.projection.projectedTokens);
+      const pinBudgetSuffixes = [...suffixTexts];
+      if (turn.nudge?.shouldInject) pinBudgetSuffixes.push(extractText(nudgeMessage(
+        turn.nudge, turn.state.blocks.filter((block) => block.active), runtime.prompts, runtime.adapter,
+        hostTokensBefore, forcedCompressionLimit(runtime.adapter, config.modelContextLimit),
+      )));
+      const beforePins = compileFinalRequestProjection({
+        baseLocalTokens: turn.projection.projectedTokens,
+        suffixTexts: pinBudgetSuffixes,
+        state: turn.state,
+        modelKey,
+        baseProjectionHash: turn.projection.projectionHash,
+      }).estimatedTokens;
+      const pinnedOverlay = renderPins(turn.state, coreMessages, ctx, runtime, beforePins);
       if (pinnedOverlay) suffixTexts.push(pinnedOverlay);
       if (turn.nudge?.shouldInject) {
         const nudge = nudgeMessage(
@@ -765,7 +791,19 @@ async function rescueProjectionFits(runtime: AcpRuntime, freshness: FreshnessTra
     const suffixTexts: string[] = [];
     const runtimeOverlay = freshness.previewRuntimeOverlay();
     if (runtimeOverlay) suffixTexts.push(runtimeOverlay);
-    const pins = renderPins(turn.state, coreMessages, ctx, runtime, turn.projection.projectedTokens);
+    const pinBudgetSuffixes = [...suffixTexts];
+    if (turn.nudge?.shouldInject) pinBudgetSuffixes.push(extractText(nudgeMessage(
+      turn.nudge, turn.state.blocks.filter((block) => block.active), runtime.prompts, runtime.adapter,
+      hostTokensBefore, forcedCompressionLimit(runtime.adapter, config.modelContextLimit),
+    )));
+    const beforePins = compileFinalRequestProjection({
+      baseLocalTokens: turn.projection.projectedTokens,
+      suffixTexts: pinBudgetSuffixes,
+      state: turn.state,
+      modelKey,
+      baseProjectionHash: turn.projection.projectionHash,
+    }).estimatedTokens;
+    const pins = renderPins(turn.state, coreMessages, ctx, runtime, beforePins);
     if (pins) suffixTexts.push(pins);
     if (turn.nudge?.shouldInject) suffixTexts.push(extractText(nudgeMessage(
       turn.nudge, turn.state.blocks.filter((block) => block.active), runtime.prompts, runtime.adapter,
@@ -949,7 +987,26 @@ function wireSurvivalAging(pi: ExtensionAPI, runtime: AcpRuntime): void {
   });
 }
 
-function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker): void {
+async function reloadRuntimeConfig(runtime: AcpRuntime, baseAdapter: AdapterConfig, ctx: ExtensionContext): Promise<void> {
+  // ExtensionContext always supplies cwd in Pi/OMP. Minimal test and legacy
+  // compatibility contexts may omit it; retain their explicit adapter rather
+  // than accidentally loading configuration from this process's repository.
+  if (typeof ctx.cwd !== "string" || ctx.cwd.length === 0) return;
+  const user = await loadUserConfig(ctx.cwd);
+  const resolved = applyUserConfig(baseAdapter, user);
+  runtime.setAdapter(resolved);
+  setDelegateDisplayUsage(resolveDelegate(resolved).displayUsage);
+  setDebugEnabled(resolved.debug ?? false);
+  try {
+    runtime.setPrompts(resolvePrompts(resolved.prompts, { acknowledgeRisk: resolved.acknowledgePromptsRisk === true }));
+  } catch (error) {
+    logWarn("config", { event: "prompts-resolve-failed", error: error instanceof Error ? error.message : String(error) });
+    runtime.setPrompts(defaultPrompts);
+  }
+}
+
+function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
+  let delegateToolsRegistered = false;
   pi.on("session_start", async (_event, ctx) => {
     freshness.invalidate();
     try {
@@ -967,25 +1024,23 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
     resetDelegateUsage();
     setDelegateDisplayUsage("separate");
     const sid = ctx.sessionManager.getSessionId();
-    logInfo("session", { event: "start", sid, cwd: ctx.cwd, debug: runtime.adapter.debug ?? null, version: typeof CURRENT_VERSION !== "undefined" ? CURRENT_VERSION : null });
     try {
-      const user = await loadUserConfig(ctx.cwd);
-      runtime.setAdapter(applyUserConfig(runtime.adapter, user));
-      setDelegateDisplayUsage(resolveDelegate(runtime.adapter).displayUsage);
-      if (runtime.adapter.debug !== undefined) setDebugEnabled(runtime.adapter.debug);
+      await reloadRuntimeConfig(runtime, baseAdapter, ctx);
     } catch (e) {
+      // Fail closed to startup defaults if configuration cannot be refreshed.
+      runtime.setAdapter(baseAdapter);
+      runtime.setPrompts(defaultPrompts);
+      setDebugEnabled(baseAdapter.debug ?? false);
+      setDelegateDisplayUsage(resolveDelegate(baseAdapter).displayUsage);
       logThrow("config", e, { sid, phase: "session_start" });
     }
-    try {
-      runtime.setPrompts(resolvePrompts(runtime.adapter.prompts, { acknowledgeRisk: runtime.adapter.acknowledgePromptsRisk === true }));
-    } catch (e) {
-      logWarn("config", { event: "prompts-resolve-failed", error: e instanceof Error ? e.message : String(e) });
-      runtime.setPrompts(defaultPrompts);
-    }
-    if (resolveDelegate(runtime.adapter).enabled) {
-      pi.registerTool(makeDelegateTool(pi));
-      pi.registerTool(makeDelegateWaitTool(pi));
-      pi.registerTool(makeDelegateCancelTool(pi));
+    logInfo("session", { event: "start", sid, cwd: ctx.cwd, debug: runtime.adapter.debug ?? null, version: typeof CURRENT_VERSION !== "undefined" ? CURRENT_VERSION : null });
+    if (resolveDelegate(runtime.adapter).enabled && !delegateToolsRegistered) {
+      const delegateEnabled = () => resolveDelegate(runtime.adapter).enabled;
+      pi.registerTool(makeDelegateTool(pi, delegateEnabled));
+      pi.registerTool(makeDelegateWaitTool(pi, delegateEnabled));
+      pi.registerTool(makeDelegateCancelTool(pi, delegateEnabled));
+      delegateToolsRegistered = true;
       void runSetupAndNotify(ctx.hasUI ? (message) => ctx.ui.notify(message) : undefined);
     }
     void checkForUpdate(runtime.adapter.autoUpdate ?? false, (message) => {
@@ -1021,11 +1076,14 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
 // The core integration: Pi's `context` event fires before every LLM call with the
 // messages about to be sent. We run acp-kernel's processTurn (prune + ref-tag +
 // nudge decision) and return the transformed AgentMessage[].
-function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker): void {
+function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
   pi.on("context", async (event, ctx) => {
     const sid = ctx.sessionManager.getSessionId();
     const release = await runtime.acquireLock(sid);
     try {
+      // Re-read both global and project acp.json before every provider call so
+      // revocations (transfer consent, secrets, clearing) take effect now.
+      await reloadRuntimeConfig(runtime, baseAdapter, ctx);
       const { state, coreMessages, entries } = await runtime.stateFor(ctx, event.messages);
       const workingState = structuredClone(state);
       const config = runtime.configFor(ctx);
@@ -1120,7 +1178,19 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
       rebuilt.push({ role: "user", content: runtimeOverlay, timestamp: Date.now() });
       suffixTexts.push(runtimeOverlay);
     }
-    const pinnedOverlay = renderPins(turn.state, coreMessages, ctx, runtime, turn.projection.projectedTokens);
+    const pinBudgetSuffixes = [...suffixTexts];
+    if (turn.nudge?.shouldInject) pinBudgetSuffixes.push(extractText(nudgeMessage(
+      turn.nudge, turn.state.blocks.filter((block) => block.active), runtime.prompts, runtime.adapter,
+      tokenCount, forcedCompressionLimit(runtime.adapter, config.modelContextLimit),
+    )));
+    const beforePins = compileFinalRequestProjection({
+      baseLocalTokens: turn.projection.projectedTokens,
+      suffixTexts: pinBudgetSuffixes,
+      state: turn.state,
+      modelKey,
+      baseProjectionHash: turn.projection.projectionHash,
+    }).estimatedTokens;
+    const pinnedOverlay = renderPins(turn.state, coreMessages, ctx, runtime, beforePins);
     if (pinnedOverlay) {
       rebuilt.push({ role: "user", content: pinnedOverlay, timestamp: Date.now() });
       suffixTexts.push(pinnedOverlay);
@@ -1211,8 +1281,9 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
   });
 }
 
-function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker): void {
+function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
   pi.on("before_agent_start", async (event, ctx) => {
+    await reloadRuntimeConfig(runtime, baseAdapter, ctx);
     const delegate = runtime.adapter.delegate !== false;
     const acp = buildAcpSystemPrompt(runtime.prompts, runtime.adapter);
     const prompt = delegate ? `${acp}\n${ACP_DELEGATE_PROMPT}` : acp;

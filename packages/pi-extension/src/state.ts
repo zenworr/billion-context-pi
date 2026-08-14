@@ -269,6 +269,11 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
   const stats = objectValue(parsed.stats);
   const policy = objectValue(parsed.policyState);
   const calibration = objectValue(policy.tokenCalibration);
+  const currentEpoch = numberValue(parsed.currentEpoch, fresh.currentEpoch);
+  const checkpoints = Array.isArray(parsed.checkpoints)
+    ? structuredClone(parsed.checkpoints) as CompressionState["checkpoints"]
+    : [];
+  const derivedCheckpointId = checkpoints.filter((checkpoint) => checkpoint.epoch === currentEpoch).at(-1)?.id;
 
   return {
     schemaVersion: 2,
@@ -276,8 +281,8 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
     metadataRevision: numberValue(parsed.metadataRevision, 0),
     revision: numberValue(parsed.revision, fresh.revision),
     sessionId: stringValue(parsed.sessionId, sessionId),
-    currentEpoch: numberValue(parsed.currentEpoch, fresh.currentEpoch),
-    currentCheckpointId: typeof parsed.currentCheckpointId === "string" ? parsed.currentCheckpointId : undefined,
+    currentEpoch,
+    currentCheckpointId: typeof parsed.currentCheckpointId === "string" ? parsed.currentCheckpointId : derivedCheckpointId,
     blocks,
     messageRefs: {
       byRaw: stringRecord(refs.byRaw),
@@ -286,7 +291,7 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
     nextMessageRefId: stringValue(parsed.nextMessageRefId, String(highestHistoricalRef(refs) + 1)),
     tokenSnapshots: numberRecord(parsed.tokenSnapshots),
     artifacts: Array.isArray(parsed.artifacts) ? structuredClone(parsed.artifacts) as CompressionState["artifacts"] : [],
-    checkpoints: Array.isArray(parsed.checkpoints) ? structuredClone(parsed.checkpoints) as CompressionState["checkpoints"] : [],
+    checkpoints,
     pins: Array.isArray(parsed.pins) ? structuredClone(parsed.pins) as CompressionState["pins"] : [],
     nudge: {
       ...fresh.nudge,

@@ -201,9 +201,12 @@ export function reconcileBranchState(
 ): CompressionState {
   const synced = reconcileArtifactSources(syncBlocks(messages, state).state, messages);
   const activeIds = new Set(messages.map((message) => message.id.split("#", 1)[0]!));
+  const hasBranchAnchoredCheckpoints = synced.checkpoints.some((checkpoint) => checkpoint.entryId);
   const activeCheckpoint = synced.checkpoints.filter((checkpoint) => checkpoint.entryId && activeIds.has(checkpoint.entryId)).at(-1);
-  const currentEpoch = activeCheckpoint?.epoch ?? (synced.checkpoints.some((checkpoint) => checkpoint.entryId) ? 0 : synced.currentEpoch);
-  const currentCheckpointId = activeCheckpoint?.id;
+  const currentEpoch = activeCheckpoint?.epoch ?? (hasBranchAnchoredCheckpoints ? 0 : synced.currentEpoch);
+  // Legacy schema-2 checkpoints have no entryId. Preserve the migrated
+  // epoch-local pointer until a branch-anchored checkpoint is available.
+  const currentCheckpointId = activeCheckpoint?.id ?? (hasBranchAnchoredCheckpoints ? undefined : synced.currentCheckpointId);
   return currentEpoch === synced.currentEpoch && currentCheckpointId === synced.currentCheckpointId
     ? synced
     : { ...synced, currentEpoch, currentCheckpointId };

@@ -54,8 +54,13 @@ export function artifactSessionDirectory(sessionId: string, root = artifactStore
 export interface ArtifactCleanupResult { removed: number; reclaimedBytes: number }
 
 export async function removeArtifactSession(sessionId: string, root = artifactStoreRoot()): Promise<void> {
-  await fs.rm(artifactSessionDirectory(sessionId, root), { recursive: true, force: true });
-  await fs.rm(join(root, ".quota-index.json"), { force: true });
+  const release = await acquireArtifactQuotaLock(root);
+  try {
+    await fs.rm(artifactSessionDirectory(sessionId, root), { recursive: true, force: true });
+    await fs.rm(join(root, ".quota-index.json"), { force: true });
+  } finally {
+    await release();
+  }
 }
 
 /** Remove only files not referenced by the current session state. */
@@ -64,34 +69,51 @@ export async function cleanupArtifactStore(
   sessionId: string,
   root = artifactStoreRoot(),
 ): Promise<ArtifactCleanupResult> {
-  const sessionDir = artifactSessionDirectory(sessionId, root);
-  const referenced = new Set(state.artifacts.filter((artifact) => artifact.localPath).map((artifact) => resolve(artifact.localPath)));
-  let entries: import("node:fs").Dirent[];
-  try { entries = await fs.readdir(sessionDir, { withFileTypes: true }); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, reclaimedBytes: 0 };
-    throw error;
+  const release = await acquireArtifactQuotaLock(root);
+  try {
+    const sessionDir = artifactSessionDirectory(sessionId, root);
+    const referenced = new Set(state.artifacts.filter((artifact) => artifact.localPath).map((artifact) => resolve(artifact.localPath)));
+    let entries: import("node:fs").Dirent[];
+    try { entries = await fs.readdir(sessionDir, { withFileTypes: true }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, reclaimedBytes: 0 };
+      throw error;
+    }
+    let removed = 0;
+    let reclaimedBytes = 0;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const path = resolve(sessionDir, entry.name);
+      if (referenced.has(path)) continue;
+      const stat = await fs.stat(path).catch(() => undefined);
+      reclaimedBytes += stat?.size ?? 0;
+      await fs.rm(path, { force: true });
+      removed += 1;
+    }
+    if (removed > 0) await fs.rm(join(root, ".quota-index.json"), { force: true });
+    return { removed, reclaimedBytes };
+  } finally {
+    await release();
   }
-  let removed = 0;
-  let reclaimedBytes = 0;
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const path = resolve(sessionDir, entry.name);
-    if (referenced.has(path)) continue;
-    const stat = await fs.stat(path).catch(() => undefined);
-    reclaimedBytes += stat?.size ?? 0;
-    await fs.rm(path, { force: true });
-    removed += 1;
-  }
-  if (removed > 0) await fs.rm(join(root, ".quota-index.json"), { force: true });
-  return { removed, reclaimedBytes };
 }
 
 export async function artifactStoreBytes(root = artifactStoreRoot()): Promise<number> {
+  const release = await acquireArtifactQuotaLock(root);
+  try {
+    return await artifactStoreBytesUnlocked(root);
+  } finally {
+    await release();
+  }
+}
+
+async function artifactStoreBytesUnlocked(root: string): Promise<number> {
   const indexPath = join(root, ".quota-index.json");
   try {
-    const parsed = JSON.parse(await fs.readFile(indexPath, "utf8")) as { bytes?: unknown };
-    if (typeof parsed.bytes === "number" && Number.isSafeInteger(parsed.bytes) && parsed.bytes >= 0) return parsed.bytes;
+    const parsed = JSON.parse(await fs.readFile(indexPath, "utf8")) as { version?: unknown; bytes?: unknown; pending?: unknown };
+    if (parsed.version === 1 && parsed.pending === undefined
+      && typeof parsed.bytes === "number" && Number.isSafeInteger(parsed.bytes) && parsed.bytes >= 0) return parsed.bytes;
+    // A pending reservation means the previous process stopped between the
+    // atomic quota reservation and commit. Reconcile the bounded gzip tree.
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
   }
@@ -111,12 +133,12 @@ export async function artifactStoreBytes(root = artifactStoreRoot()): Promise<nu
       else if (entry.isFile() && entry.name.endsWith(".gz")) total += await gzipUncompressedBytes(path);
     }
   }
-  await writePrivateFile(indexPath, Buffer.from(`${JSON.stringify({ bytes: total, updatedAt: Date.now() })}\n`));
+  await recordArtifactStoreBytes(root, total);
   return total;
 }
 
-async function recordArtifactStoreBytes(root: string, bytes: number): Promise<void> {
-  await writePrivateFile(join(root, ".quota-index.json"), Buffer.from(`${JSON.stringify({ bytes, updatedAt: Date.now() })}\n`));
+async function recordArtifactStoreBytes(root: string, bytes: number, pending?: { id: string; bytes: number }): Promise<void> {
+  await writePrivateFile(join(root, ".quota-index.json"), Buffer.from(`${JSON.stringify({ version: 1, bytes, updatedAt: Date.now(), ...(pending ? { pending } : {}) })}\n`));
 }
 
 async function gzipUncompressedBytes(file: string): Promise<number> {
@@ -177,7 +199,7 @@ export async function spoolArtifact(
   const sessionBytes = state.artifacts.filter((artifact) => artifact.retrievable).reduce((sum, artifact) => sum + artifact.bytes, 0);
   const releaseQuota = await acquireArtifactQuotaLock(root);
   try {
-  const globalBytes = await artifactStoreBytes(root);
+  const globalBytes = await artifactStoreBytesUnlocked(root);
   const next = structuredClone(state);
   const id = `a${Math.max(1, next.nextArtifactId)}`;
   next.nextArtifactId = Math.max(1, next.nextArtifactId) + 1;
@@ -195,14 +217,26 @@ export async function spoolArtifact(
     return { state: next, record, reusedExistingPath: false };
   }
 
-  // Stream Bash files into private gzip storage; never duplicate a huge output
-  // into a JavaScript string or depend on an ephemeral host path.
-  const stored = reusable
-    ? await storeCompressedFile(root, input.sessionId, reusable.localPath, reusable.bytes)
-    : await storeCompressedParts(root, input.sessionId, storedParts);
+  // Reserve the full logical size atomically before finalizing the gzip blob.
+  // A crash can now only overcount. A later reader sees `pending` and
+  // reconciles the tree; it can never trust an index that omits a new blob.
+  const reservation = { id: randomUUID(), bytes };
+  await recordArtifactStoreBytes(root, globalBytes + bytes, reservation);
+  let stored: Awaited<ReturnType<typeof storeCompressedParts>>;
+  try {
+    // Stream Bash files into private gzip storage; never duplicate a huge
+    // output into a JavaScript string or depend on an ephemeral host path.
+    stored = reusable
+      ? await storeCompressedFile(root, input.sessionId, reusable.localPath, reusable.bytes)
+      : await storeCompressedParts(root, input.sessionId, storedParts);
+  } catch (error) {
+    await recordArtifactStoreBytes(root, globalBytes).catch(() => undefined);
+    throw error;
+  }
   const physicalDelta = stored.reusedExistingPath ? 0 : stored.bytes;
   if (globalBytes + physicalDelta > maxGlobalBytes) {
     if (!stored.reusedExistingPath) await fs.rm(stored.localPath, { force: true });
+    await recordArtifactStoreBytes(root, globalBytes);
     const record: ArtifactRecord = {
       id, status: "unavailable", error: `global artifact quota exceeded (${globalBytes + physicalDelta}/${maxGlobalBytes} bytes)`,
       sha256: stored.sha256, sourceMessageId: input.sourceMessageId, toolCallId: input.toolCallId, toolName: input.toolName,
@@ -237,34 +271,91 @@ export async function spoolArtifact(
 async function acquireArtifactQuotaLock(root: string): Promise<() => Promise<void>> {
   await fs.mkdir(root, { recursive: true, mode: PRIVATE_DIR_MODE });
   const lockPath = join(root, ".quota.lock");
+  const recoveryPath = join(root, ".quota-recovery.lock");
   const owner = `${randomUUID()}:${process.pid}`;
+  const startedAt = Date.now();
   for (;;) {
+    if (await fs.stat(recoveryPath).then(() => true, (error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    })) {
+      if (Date.now() - startedAt > 5_000) throw new Error("Artifact quota recovery lock is unavailable; refusing an unsafe concurrent write.");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+      continue;
+    }
     try {
-      const handle = await fs.open(lockPath, "wx", PRIVATE_FILE_MODE);
-      await handle.writeFile(`${owner}\n${Date.now()}\n`);
-      await handle.sync();
-      return async () => {
-        await handle.close().catch(() => undefined);
-        const current = await fs.readFile(lockPath, "utf8").catch(() => "");
-        if (current.startsWith(`${owner}\n`)) await fs.rm(lockPath, { force: true });
-      };
+      const handle = await createOwnedLock(lockPath, owner);
+      return ownedLockRelease(handle, lockPath, owner);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const stat = await fs.stat(lockPath).catch(() => undefined);
       if (stat && Date.now() - stat.mtimeMs > 10 * 60_000) {
-        const current = await fs.readFile(lockPath, "utf8").catch(() => "");
-        const pid = Number(current.split(":", 2)[1]?.split("\n", 1)[0]);
-        let alive = Number.isSafeInteger(pid) && pid > 0;
-        if (alive) {
-          try { process.kill(pid, 0); } catch { alive = false; }
+        let recoveryHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
+        try {
+          recoveryHandle = await createOwnedLock(recoveryPath, owner);
+        } catch (recoveryError) {
+          if ((recoveryError as NodeJS.ErrnoException).code !== "EEXIST") throw recoveryError;
         }
-        if (!alive) {
-          await fs.rm(lockPath, { force: true });
-          continue;
+        if (recoveryHandle) {
+          const releaseRecovery = ownedLockRelease(recoveryHandle, recoveryPath, owner);
+          try {
+            // Only the recovery-lock owner may remove a dead main owner. All
+            // normal acquirers wait while this guard exists, so a late stale
+            // observer cannot delete a replacement lock.
+            const current = await fs.readFile(lockPath, "utf8").catch(() => "");
+            const currentStat = await fs.stat(lockPath).catch(() => undefined);
+            if (currentStat && Date.now() - currentStat.mtimeMs > 10 * 60_000 && !lockOwnerAlive(current)) {
+              await fs.rm(lockPath, { force: true });
+              try {
+                const handle = await createOwnedLock(lockPath, owner);
+                await releaseRecovery();
+                return ownedLockRelease(handle, lockPath, owner);
+              } catch (replacementError) {
+                if ((replacementError as NodeJS.ErrnoException).code !== "EEXIST") throw replacementError;
+              }
+            }
+          } finally {
+            await releaseRecovery();
+          }
         }
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
+  }
+}
+
+async function createOwnedLock(path: string, owner: string): Promise<Awaited<ReturnType<typeof fs.open>>> {
+  const handle = await fs.open(path, "wx", PRIVATE_FILE_MODE);
+  try {
+    await handle.writeFile(`${owner}\n${Date.now()}\n`);
+    await handle.sync();
+    return handle;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await fs.rm(path, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+function ownedLockRelease(handle: Awaited<ReturnType<typeof fs.open>>, path: string, owner: string): () => Promise<void> {
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    await handle.close().catch(() => undefined);
+    const current = await fs.readFile(path, "utf8").catch(() => "");
+    if (current.startsWith(`${owner}\n`)) await fs.rm(path, { force: true });
+  };
+}
+
+function lockOwnerAlive(content: string): boolean {
+  const pid = Number(content.split(":", 2)[1]?.split("\n", 1)[0]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 

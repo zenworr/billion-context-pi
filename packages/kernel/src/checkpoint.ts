@@ -4,7 +4,7 @@ export interface CommitCheckpointInput {
   summary: string;
   /** Raw message ids actually included in this checkpoint source. */
   sourceMessageIds?: string[];
-  /** ACP blocks captured before Pi mutates the active branch. */
+  /** ACP blocks captured before Pi mutates the active branch. An explicit empty array means no block coverage. */
   sourceBlockIds?: string[];
   tokensBefore?: number;
   firstKeptEntryId?: string;
@@ -30,7 +30,7 @@ export function commitCheckpointEpoch(state: CompressionState, input: CommitChec
   const createdAt = input.createdAt ?? Date.now();
   const sourceIds = new Set<string>(input.sourceMessageIds ?? []);
   const explicitBlockIds = new Set(input.sourceBlockIds ?? []);
-  const subsumedBlocks = explicitBlockIds.size > 0
+  const subsumedBlocks = input.sourceBlockIds !== undefined
     ? state.blocks.filter((block) => explicitBlockIds.has(block.blockId))
     : sourceIds.size === 0
       ? []

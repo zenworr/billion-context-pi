@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInitialState, type CoreMessage } from "acp-kernel";
@@ -177,6 +177,43 @@ test("global quota counts deduplicated physical content once", async () => {
     assert.equal(second?.record.status, "ready");
     assert.equal(second?.reusedExistingPath, true);
     assert.equal(await artifactStoreBytes(dir), bytes);
+  });
+});
+
+test("stale quota-lock recovery serializes concurrent contenders", async () => {
+  await withTempDir(async (dir) => {
+    const lockPath = join(dir, ".quota.lock");
+    await writeFile(lockPath, `stale-owner:999999999\n0\n`);
+    const old = new Date(Date.now() - 11 * 60_000);
+    await utimes(lockPath, old, old);
+    const firstText = `${largeText}first`;
+    const secondText = `${largeText}second`;
+    const [first, second] = await Promise.all([
+      spoolArtifact(createInitialState("lock-a"), { sessionId: "lock-a", sourceMessageId: "m1", toolName: "read", text: firstText }, dir),
+      spoolArtifact(createInitialState("lock-b"), { sessionId: "lock-b", sourceMessageId: "m2", toolName: "read", text: secondText }, dir),
+    ]);
+    assert.equal(first?.record.status, "ready");
+    assert.equal(second?.record.status, "ready");
+    assert.equal(await artifactStoreBytes(dir), Buffer.byteLength(firstText) + Buffer.byteLength(secondText));
+  });
+});
+
+test("pending quota reservation is reconciled after an interrupted transaction", async () => {
+  await withTempDir(async (dir) => {
+    const bytes = Buffer.byteLength(largeText);
+    const result = await spoolArtifact(createInitialState("journal-session"), {
+      sessionId: "journal-session", sourceMessageId: "m1", toolName: "read", text: largeText,
+    }, dir);
+    assert.equal(result?.record.status, "ready");
+    await writeFile(join(dir, ".quota-index.json"), JSON.stringify({
+      version: 1,
+      bytes: 0,
+      pending: { id: "interrupted", bytes },
+    }));
+    assert.equal(await artifactStoreBytes(dir), bytes);
+    const rebuilt = JSON.parse(await readFile(join(dir, ".quota-index.json"), "utf8")) as { version: number; bytes: number; updatedAt: number; pending?: unknown };
+    assert.deepEqual(rebuilt, { version: 1, bytes, updatedAt: rebuilt.updatedAt });
+    assert.equal(rebuilt.pending, undefined);
   });
 });
 

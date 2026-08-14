@@ -5,7 +5,8 @@
 - Harden the second-round architecture: owned-tail runtime and quota locks, fileless transactional state, monotonic wide refs, direct checkpoint ancestry, transactional manual/native checkpoint ownership, turn-based survival, and branch-aware epochs.
 - Protect the first request, current turn, media, pins, reasoning, and complete provider protocol groups; use one final-request projection for status, hard gating, and host-compaction decisions.
 - Reinject changed project instructions byte-for-byte, keep failed compression diagnostics visible, validate nested configuration, and use purpose-specific thinking levels.
-- Add fresh paid-call preflight, configured repair plus authenticated main/host fallback, a total Tier-1 rescue deadline, non-cumulative T2/T3 manifests, one-pass Bash spooling, bounded quota indexing, and no additional output cap after storage failure.
+- Add fresh paid-call preflight, configured repair plus authenticated main/host fallback, a total Tier-1 rescue deadline, non-cumulative T2/T3 manifests, one-pass Bash spooling, bounded crash-reconciled quota reservations, and no additional output cap after storage failure.
+- Reapply security configuration from immutable startup settings before provider requests, preserve legacy checkpoint lineage, keep native fallback coverage incomplete, and reserve runtime/nudge plus full envelope overhead before rendering pins.
 
 - Correct package identity and compatibility by bundling the private kernel, requiring Pi `^0.84.1` and Node `>=22.19.0`, and adding a clean packed-consumer smoke test.
 - Replace unsafe absolute-ratio calibration and the fixed 204K gate with verified anchored deltas, per-model compiled-projection budgets, bounded recovery tools, and failed-compression relaxation.

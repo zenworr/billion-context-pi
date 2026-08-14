@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, makeDelegateTool } from "../src/delegate-tool.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** Minimal ctx mock - buildChildArgs reads ctx.model and sessionManager. */
@@ -14,6 +14,14 @@ function mockCtx(host: "pi" | "omp" = "pi"): ExtensionContext {
 
 const RESTRICTED_ROLES = ["reviewer", "researcher", "planner", "oracle"] as const;
 const ACP_TOOLS = ["compress", "decompress", "search_context", "acp_status", "acp_artifact"];
+
+test("delegate execution is denied after active-project revocation", async () => {
+  const tool = makeDelegateTool({} as any, () => false);
+  await assert.rejects(
+    (tool.execute as any)("call", { agent: "reviewer", task: "test" }, new AbortController().signal, undefined, mockCtx()),
+    /disabled by the active project configuration/,
+  );
+});
 
 test("delegate spawn bypasses the shell for Windows executable paths", () => {
   const options = delegateSpawnOptions("C:\\workspace", { TEST: "1" });

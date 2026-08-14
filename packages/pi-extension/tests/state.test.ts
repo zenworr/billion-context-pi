@@ -73,6 +73,25 @@ test("load merges forward-compat: missing fields filled from fresh state", async
   await rm(dir, { recursive: true, force: true });
 });
 
+test("legacy schema-2 state derives and preserves the epoch checkpoint pointer", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "session.json");
+  await writeFile(`${file}.acp.json`, JSON.stringify({
+    ...createInitialState("sid"),
+    schemaVersion: 2,
+    currentEpoch: 2,
+    currentCheckpointId: undefined,
+    checkpoints: [{
+      id: "cp-legacy", epoch: 2, summary: "legacy", sourceBlockIds: [], sourceMessageIds: ["old"],
+      tokensBefore: 100, createdAt: 1,
+    }],
+  }));
+  const state = await new SessionStateStore().load(file, "sid");
+  assert.equal(state.currentCheckpointId, "cp-legacy");
+  assert.equal(reconcileBranchState(state, []).currentCheckpointId, "cp-legacy");
+  await rm(dir, { recursive: true, force: true });
+});
+
  test("state saves are revision-checked, private, and fail closed", async () => {
   const dir = await tempDir();
   const file = path.join(dir, "session.json");

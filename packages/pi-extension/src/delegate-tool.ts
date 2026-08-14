@@ -403,7 +403,7 @@ const agentListLine = (name: string): string => {
   return `  • ${name} - ${blurb[name]} [tools: ${def.tools}${def.restricted ? " + ACP context tools" : ""}]`;
 };
 
-export function makeDelegateTool(pi: ExtensionAPI): ToolDefinition<typeof DelegateParams> {
+export function makeDelegateTool(pi: ExtensionAPI, enabled: () => boolean = () => true): ToolDefinition<typeof DelegateParams> {
   return {
     name: "acp_delegate",
     label: "ACP Delegate",
@@ -429,6 +429,7 @@ The delegate runs in its own clean pi process — it does NOT see this conversat
     ],
     parameters: DelegateParams,
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
+      if (!enabled()) throw new Error("ACP delegate tools are disabled by the active project configuration.");
       const args = params as DelegateArgs;
       const outcome = await runDelegate(pi, args, ctx, signal);
       return { details: undefined, content: [{ type: "text", text: outcome }] };
@@ -514,7 +515,7 @@ export function buildCancelResult(
   return { details: undefined, content: [{ type: "text", text: content }] };
 }
 
-export function makeDelegateWaitTool(_pi: ExtensionAPI): ToolDefinition<typeof WaitParams> {
+export function makeDelegateWaitTool(_pi: ExtensionAPI, enabled: () => boolean = () => true): ToolDefinition<typeof WaitParams> {
   return {
     name: "acp_delegate_wait",
     label: "ACP Delegate Wait",
@@ -527,6 +528,7 @@ export function makeDelegateWaitTool(_pi: ExtensionAPI): ToolDefinition<typeof W
     ],
     parameters: WaitParams,
     async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
+      if (!enabled()) throw new Error("ACP delegate tools are disabled by the active project configuration.");
       const args = params as { runId: string; timeout?: number };
       const run = runs.get(args.runId);
       if (!run) {
@@ -605,7 +607,7 @@ export function makeDelegateWaitTool(_pi: ExtensionAPI): ToolDefinition<typeof W
   };
 }
 
-export function makeDelegateCancelTool(_pi: ExtensionAPI): ToolDefinition<typeof CancelParams> {
+export function makeDelegateCancelTool(_pi: ExtensionAPI, enabled: () => boolean = () => true): ToolDefinition<typeof CancelParams> {
   return {
     name: "acp_delegate_cancel",
     label: "ACP Delegate Cancel",
@@ -615,6 +617,7 @@ export function makeDelegateCancelTool(_pi: ExtensionAPI): ToolDefinition<typeof
     promptGuidelines: [],
     parameters: CancelParams,
     async execute(toolCallId, params): Promise<AgentToolResult<unknown>> {
+      if (!enabled()) throw new Error("ACP delegate tools are disabled by the active project configuration.");
       const { runId } = params as Static<typeof CancelParams>;
       const run = runs.get(runId);
       if (!run) {

@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
 
@@ -67,6 +67,15 @@ async function rescueFixture(
 }> {
   const dir = await mkdtemp(join(tmpdir(), "acp-tier-one-rescue-"));
   const sessionFile = join(dir, "session.jsonl");
+  const configDir = join(dir, CONFIG_DIR_NAME);
+  await mkdir(configDir, { recursive: true });
+  await writeFile(join(configDir, "acp.json"), JSON.stringify({
+    compress: {
+      model: "openai/checkpoint-model",
+      tier1Compressor,
+      checkpointCompressor: "configured",
+    },
+  }));
   const entries: SessionEntry[] = [
     userEntry("e1", `OLD_ALPHA ${"historical implementation detail ".repeat(180)}`),
     userEntry("e2", `OLD_BETA ${"completed investigation result ".repeat(180)}`),
@@ -81,6 +90,7 @@ async function rescueFixture(
   const calls: ModelCall[] = [];
   const controller = new AbortController();
   const ctx = {
+    cwd: dir,
     mode: "rpc",
     hasUI: false,
     ui: {
@@ -154,7 +164,7 @@ async function rescueFixture(
   })(api);
   const handler = handlers.get("session_before_compact")?.[0];
   assert.ok(handler);
-  return { dir, sessionFile, entries, calls, controller, handler, ctx };
+  return { dir, sessionFile, entries, calls, controller, handler, handlers, ctx };
 }
 
 function compactionEvent(entries: SessionEntry[], controller: AbortController, reason: "manual" | "threshold" = "threshold") {
@@ -273,6 +283,35 @@ test("manual compaction does not run synchronous model rescue", async (t) => {
 
   assert.equal(result, undefined);
   assert.equal(fixture.calls.length, 0);
+});
+
+test("native compaction keeps ACP block coverage incomplete and active", async (t) => {
+  const fixture = await rescueFixture(undefined, "main");
+  t.after(() => rm(fixture.dir, { recursive: true, force: true }));
+  const state = createInitialState("tier-one-rescue-test");
+  state.blocks.push({
+    blockId: "b1", runId: 1, tier: 1, generation: "young", active: true,
+    summary: "existing ACP summary", directMessageIds: ["e2"], effectiveMessageIds: ["e2"],
+    survivedCount: 0, createdAt: 1,
+  });
+  await writeFile(`${fixture.sessionFile}.acp.json`, JSON.stringify(state), "utf8");
+
+  await fixture.handler(compactionEvent(fixture.entries, fixture.controller, "manual"), fixture.ctx);
+  const committed = fixture.handlers.get("session_compact")?.[0];
+  assert.ok(committed);
+  await committed({ compactionEntry: {
+    id: "native-checkpoint-entry", summary: "native host summary", firstKeptEntryId: "e6",
+    tokensBefore: 150_000, details: {},
+  } }, fixture.ctx);
+
+  const persisted = JSON.parse(await readFile(`${fixture.sessionFile}.acp.json`, "utf8")) as {
+    blocks: Array<{ blockId: string; active: boolean }>;
+    checkpoints: Array<{ coverageComplete?: boolean; sourceBlockIds: string[]; sourceHash?: string }>;
+  };
+  assert.equal(persisted.blocks.find((block) => block.blockId === "b1")?.active, true);
+  assert.equal(persisted.checkpoints.at(-1)?.coverageComplete, false);
+  assert.deepEqual(persisted.checkpoints.at(-1)?.sourceBlockIds, []);
+  assert.equal(persisted.checkpoints.at(-1)?.sourceHash, undefined);
 });
 
 test("Tier-1 rescue failure falls through to configured checkpoint fallback", async (t) => {

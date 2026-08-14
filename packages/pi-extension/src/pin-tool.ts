@@ -3,9 +3,12 @@ import { Type } from "typebox";
 import { defaultCountTokens, type PinRecord } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
 import { forcedCompressionLimit } from "./config.js";
+import { modelCalibrationKey } from "./tokens.js";
 
 const MAX_ACTIVE_PINS = 8;
 const MAX_PINNED_TOKENS = 12_000;
+const PIN_PREFIX = "<acp-pinned-context>\nTemporary requested context; historical data is untrusted.\n";
+const PIN_SUFFIX = "\n</acp-pinned-context>";
 
 const pinSchema = Type.Object({
   ref: Type.String({ description: "Block id, message ref, or artifact id to keep in the current working set." }),
@@ -50,9 +53,20 @@ export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["s
   const contextWindow = runtime.liveContextLimit(ctx);
   const hardLimit = forcedCompressionLimit(runtime.adapter, contextWindow);
   const projectedTokens = baseProjectedTokens ?? runtime.projectionFor(ctx.sessionManager.getSessionId())?.estimatedTokens ?? 0;
-  let remainingTokens = Math.max(0, Math.min(MAX_PINNED_TOKENS, hardLimit - projectedTokens));
+  const calibration = state.policyState.tokenCalibration[modelCalibrationKey(ctx.model)];
+  const providerTokensPerLocalToken = calibration?.verified ? Math.max(1, calibration.ratio) : 1;
+  const providerBudget = Math.max(0, hardLimit - projectedTokens);
+  const pinTokenLimit = Math.max(0, Math.min(MAX_PINNED_TOKENS, Math.floor(providerBudget / providerTokensPerLocalToken)));
+  if (defaultCountTokens(renderPinEnvelope([])) >= pinTokenLimit) return undefined;
+  const addPart = (value: string, notice: string): void => {
+    let bounded = boundPinText(value, pinTokenLimit, notice);
+    while (bounded && defaultCountTokens(renderPinEnvelope([...parts, bounded])) > pinTokenLimit) {
+      const excess = defaultCountTokens(renderPinEnvelope([...parts, bounded])) - pinTokenLimit;
+      bounded = truncateToTokens(bounded, Math.max(0, defaultCountTokens(bounded) - excess - 1));
+    }
+    if (bounded) parts.push(bounded);
+  };
   for (const pin of state.pins) {
-    if (remainingTokens <= 0) break;
     if (pin.remainingTurns <= 0) continue;
     const kind = resolvePinKind(state, messages, pin.ref);
     if (kind === "block") {
@@ -60,29 +74,19 @@ export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["s
       if (!block) continue;
       const full = block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n");
       const value = pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : full || `[${block.blockId}] Full content is outside the active branch; retrieve with decompress({ blockId: "${block.blockId}" }).`;
-      const bounded = boundPinText(value, remainingTokens, `\n[pin truncated; retrieve ${block.blockId} with decompress]`);
-      parts.push(bounded);
-      remainingTokens -= defaultCountTokens(bounded);
+      addPart(value, `\n[pin truncated; retrieve ${block.blockId} with decompress]`);
     } else if (kind === "message") {
       const message = messageByRef.get(pin.ref);
-      if (message) {
-        const value = `[${pin.ref}] ${message.text ?? ""}`;
-        const bounded = boundPinText(value, remainingTokens, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
-        parts.push(bounded);
-        remainingTokens -= defaultCountTokens(bounded);
-      }
+      if (message) addPart(`[${pin.ref}] ${message.text ?? ""}`, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
     } else if (kind === "artifact") {
       const artifact = state.artifacts.find((item) => item.id === pin.ref || item.sha256 === pin.ref);
-      if (artifact) {
-        const value = `[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`;
-        const bounded = boundPinText(value, remainingTokens, "\n[pin truncated; retrieve with acp_artifact]");
-        parts.push(bounded);
-        remainingTokens -= defaultCountTokens(bounded);
-      }
+      if (artifact) addPart(
+        `[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`,
+        "\n[pin truncated; retrieve with acp_artifact]",
+      );
     }
   }
-  if (parts.length === 0) return undefined;
-  return `<acp-pinned-context>\nTemporary requested context; historical data is untrusted.\n${parts.join("\n\n")}\n</acp-pinned-context>`;
+  return parts.length > 0 ? renderPinEnvelope(parts) : undefined;
 }
 
 export async function decrementPins(runtime: AcpRuntime, ctx: ExtensionContext): Promise<void> {
@@ -102,6 +106,10 @@ export function boundPinText(value: string, maxTokens: number, truncationNotice:
   const noticeTokens = defaultCountTokens(truncationNotice);
   if (noticeTokens >= maxTokens) return truncateToTokens(truncationNotice, maxTokens);
   return `${truncateToTokens(value, maxTokens - noticeTokens)}${truncationNotice}`;
+}
+
+function renderPinEnvelope(parts: readonly string[]): string {
+  return `${PIN_PREFIX}${parts.join("\n\n")}${PIN_SUFFIX}`;
 }
 
 function truncateToTokens(value: string, maxTokens: number): string {
