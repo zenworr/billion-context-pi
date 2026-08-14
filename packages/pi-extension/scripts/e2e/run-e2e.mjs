@@ -186,6 +186,24 @@ function newestStateFile(sessionDir) {
   return entries[0]?.full || null;
 }
 
+function killProcessTree(child) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", shell: false });
+  } else {
+    try { child.kill("SIGKILL"); } catch { /* already exited */ }
+  }
+}
+
+function removeStaleE2ELocks(root) {
+  if (!fs.existsSync(root)) return;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) removeStaleE2ELocks(full);
+    else if (/\.(?:lock|recovery)$/.test(entry.name)) fs.rmSync(full, { force: true });
+  }
+}
+
 function runPiTurn(piBin, home, sessionDir, userMsg, contFlag, piLogFd) {
   const args = [
     ...piBin.args,
@@ -221,12 +239,27 @@ function runPiTurn(piBin, home, sessionDir, userMsg, contFlag, piLogFd) {
       stdio: ["ignore", "pipe", "pipe"],
       shell: false,
     });
-    child.stdout.pipe(piLogFd);
-    child.stderr.pipe(piLogFd);
-    child.on("error", reject);
-    child.on("exit", (code, signal) => {
-      resolve(code === 0 ? 0 : code ?? 1);
-    });
+    child.stdout.pipe(piLogFd, { end: false });
+    child.stderr.pipe(piLogFd, { end: false });
+    let settled = false;
+    const turnTimeoutMs = Number(process.env.BCP_E2E_TURN_TIMEOUT_MS || 120_000);
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(code);
+    };
+    const timeout = setTimeout(() => {
+      warn(`pi turn exceeded ${turnTimeoutMs}ms; terminating process tree`);
+      killProcessTree(child);
+      setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish(124);
+      }, 5_000);
+    }, turnTimeoutMs);
+    child.on("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.on("exit", (code) => finish(code === 0 ? 0 : code ?? 1));
   });
 }
 
@@ -293,7 +326,13 @@ async function runScenario(scenarioPath, piBin) {
     if (!userMsg) continue;
     turnNo += 1;
     log(`  turn ${turnNo}: ${C.DIM}pi -p${C.RESET} ${contFlag ? "-c" : "(new session)"}`);
-    const code = await runPiTurn(piBin, home, sessionDir, userMsg, contFlag, piLogFd);
+    let code = await runPiTurn(piBin, home, sessionDir, userMsg, contFlag, piLogFd);
+    if (code === 124) {
+      warn(`retrying timed-out turn ${turnNo} once after process-tree cleanup`);
+      removeStaleE2ELocks(sessionDir);
+      removeStaleE2ELocks(home);
+      code = await runPiTurn(piBin, home, sessionDir, userMsg, contFlag, piLogFd);
+    }
     if (code !== 0) {
       failMsg(`pi -p failed on turn ${turnNo} (see ${piLogPath})`);
       failed = true;
