@@ -121,7 +121,7 @@ test("legacy schema-2 state derives and preserves the epoch checkpoint pointer",
   const staleProposal = structuredClone(loaded);
   const persisted = await store.save(firstProposal, file, "sid");
   assert.equal(persisted.revision, 1);
-  assert.equal((await stat(`${file}.acp.json`)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal((await stat(`${file}.acp.json`)).mode & 0o777, 0o600);
   await assert.rejects(
     store.save(staleProposal, file, "sid"),
     /revision changed during the operation/,

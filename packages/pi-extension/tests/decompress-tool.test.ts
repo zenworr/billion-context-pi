@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rm, readFile, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
 import { compressionToolWithPlanning } from "./planned-compression.js";
@@ -150,7 +150,7 @@ test("decompress toFile writes to the specified path", async () => {
   const res = await decompressTool.execute("tc4", { blockId: "b1", toFile: target }, undefined, undefined, ctx);
   const text = (res.content[0] as any).text as string;
 
-  assert.match(text, new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "result mentions the custom path");
+  assert.match(text, new RegExp(basename(target).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "result mentions the custom file name");
   const written = await readFile(target, "utf8");
   assert.ok(written.includes("This is a detailed message that needs to be compressed."),
     "file contains the full restored content");

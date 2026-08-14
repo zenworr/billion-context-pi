@@ -193,7 +193,7 @@ test("tool results spool before the cap and acp_artifact retrieves exact content
     const fileResult = await artifactTool.execute("retrieve-file", { id: "a1", toFile: outputPath }, undefined, undefined, ctx);
     assert.match(fileResult.content[0].text, /written to/);
     assert.equal(await readFile(outputPath, "utf8"), exact);
-    assert.equal((await import("node:fs/promises").then((fs) => fs.stat(outputPath))).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await import("node:fs/promises").then((fs) => fs.stat(outputPath))).mode & 0o777, 0o600);
     const rejected = await artifactTool.execute("retrieve-rejected", { id: "a1", toFile: "/etc/acp-forbidden" }, undefined, undefined, ctx);
     assert.match(rejected.content[0].text, /must be under/);
 

@@ -128,7 +128,7 @@ test("artifact store writes content-addressed gzip files atomically with mode 06
     assert.equal(result.record.bytes, Buffer.byteLength(largeText));
     assert.equal(result.record.createdAt, 123);
     assert.equal(result.record.retrievable, true);
-    assert.equal((await stat(result.record.localPath)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(result.record.localPath)).mode & 0o777, 0o600);
     assert.equal((await readArtifact(result.record)).toString("utf8"), largeText);
     assert.equal(result.state.artifacts.length, 1);
     assert.equal(result.state.stats.rawTokensExternalized, result.record.estimatedTokens);
@@ -236,7 +236,7 @@ test("valid Bash fullOutputPath is copied into the durable private store", async
     assert.match(result.record.localPath ?? "", /\.gz$/);
     assert.equal(result.record.bytes, Buffer.byteLength(largeText));
     assert.equal((await readArtifact(result.record)).toString("utf8"), largeText);
-    assert.equal((await stat(result.record.localPath)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(result.record.localPath)).mode & 0o777, 0o600);
   });
 });
 
@@ -300,7 +300,7 @@ test("private retrieval output uses mode 0600 and safe path restrictions", async
     const target = join(dir, "retrieved.txt");
     await writePrivateFile(target, Buffer.from("exact"));
     assert.equal(await readFile(target, "utf8"), "exact");
-    assert.equal((await stat(target)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") assert.equal((await stat(target)).mode & 0o777, 0o600);
   });
   assert.equal(resolveSafeOutputPath("/etc/acp-artifact.txt"), undefined);
   assert.equal(resolveSafeOutputPath(join(tmpdir(), "acp-artifact.txt")), join(tmpdir(), "acp-artifact.txt"));
