@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "later-extension-context-mutation",
+  "description": "A context mutation from an extension loaded after ACP invalidates the prior projection and triggers recompilation.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 90, "branch": "main", "provider": "openai", "canonicalMessages": 500 },
+  "events": [
+    { "type": "extension-context-mutation", "beforeHash": "projection-a", "mutatedHash": "projection-b", "compiledHash": "projection-b", "recompiles": 1 }
+  ],
+  "assertions": [
+    { "path": "reliability.extensionMutationsRecompiled", "op": "eq", "value": 1 }
+  ]
+}

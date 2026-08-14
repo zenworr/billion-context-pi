@@ -23,7 +23,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Run e2e regression scenarios
-        run: node scripts/e2e/run-e2e.mjs
+        run: npm run e2e
 
   docker:
     runs-on: ubuntu-latest
@@ -31,6 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build e2e image
-        run: docker build -t bcp-e2e -f Dockerfile.e2e .
+        run: docker build -t bcp-e2e -f packages/pi-extension/Dockerfile.e2e .
       - name: Run e2e in container
         run: docker run --rm bcp-e2e

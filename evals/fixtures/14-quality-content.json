@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "content-based-quality",
+  "description": "Quality retention is calculated from deterministic summary text instead of only claimed counters.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 110, "branch": "main", "provider": "openai", "canonicalMessages": 700 },
+  "events": [
+    {
+      "type": "quality-content",
+      "summary": "Goal: preserve the current user request. Constraint: no network. Exact facts: /src/session.ts, CompressionModelError, issue #122. Unresolved: verify checkpoint fallback. Retrieval: session.ts and #122. Continuation and tests passed.",
+      "userConstraints": ["preserve the current user request", "no network"],
+      "exactFacts": ["/src/session.ts", "CompressionModelError", "issue #122"],
+      "unresolvedWork": ["verify checkpoint fallback"],
+      "forbiddenClaims": ["checkpoint fallback is complete"],
+      "retrievalCues": ["session.ts", "#122"],
+      "continuationPass": true,
+      "testsPass": true
+    }
+  ],
+  "assertions": [
+    { "path": "quality.exactUserConstraintRetention", "op": "eq", "value": 1 },
+    { "path": "quality.exactFactRetention", "op": "eq", "value": 1 },
+    { "path": "quality.unresolvedWorkRetention", "op": "eq", "value": 1 }
+  ]
+}

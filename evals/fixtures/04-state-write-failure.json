@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "state-write-failure",
+  "description": "An atomic sidecar write failure rolls back memory state and cannot report success.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 21, "branch": "main", "provider": "openai", "canonicalMessages": 800 },
+  "events": [
+    { "type": "state-write", "success": false, "revisionBefore": 21, "revisionAfter": 21, "successReported": false }
+  ],
+  "assertions": [
+    { "path": "revision", "op": "eq", "value": 21 },
+    { "path": "reliability.stateWriteFailuresRolledBack", "op": "eq", "value": 1 }
+  ]
+}

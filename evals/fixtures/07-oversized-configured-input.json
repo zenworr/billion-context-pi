@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "id": "oversized-configured-input",
+  "description": "A 530K-token configured-model source is map-reduced in requests no larger than 220K tokens.",
+  "mode": "authoritative",
+  "initial": {
+    "contextWindow": 1000000,
+    "safeThreshold": 975616,
+    "revision": 50,
+    "branch": "main",
+    "provider": "openai",
+    "canonicalMessages": 3200
+  },
+  "events": [
+    {
+      "type": "configured-chunk",
+      "job": "oversize-530k",
+      "index": 1,
+      "count": 3,
+      "inputTokens": 219500
+    },
+    {
+      "type": "configured-chunk",
+      "job": "oversize-530k",
+      "index": 2,
+      "count": 3,
+      "inputTokens": 219500
+    },
+    {
+      "type": "configured-chunk",
+      "job": "oversize-530k",
+      "index": 3,
+      "count": 3,
+      "inputTokens": 91000
+    },
+    {
+      "type": "configured-chunk",
+      "job": "oversize-530k-synthesis",
+      "index": 1,
+      "count": 1,
+      "inputTokens": 18000
+    },
+    {
+      "type": "compactor",
+      "outcome": "valid",
+      "route": "configured",
+      "inputTokens": 548000,
+      "outputTokens": 9400,
+      "cachedInputTokens": 0,
+      "latencyMs": 11800,
+      "commit": true
+    },
+    {
+      "type": "state-write",
+      "success": true,
+      "revisionBefore": 50,
+      "revisionAfter": 51,
+      "successReported": true
+    }
+  ],
+  "assertions": [
+    {
+      "path": "reliability.maxConfiguredChunkTokens",
+      "op": "lte",
+      "value": 220000
+    },
+    {
+      "path": "reliability.maxConfiguredChunkTokens",
+      "op": "eq",
+      "value": 219500
+    },
+    {
+      "path": "revision",
+      "op": "eq",
+      "value": 51
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "shadow-mode",
+  "description": "Configured summaries are scored but never replace the main-generated authoritative block in shadow mode.",
+  "mode": "shadow",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 100, "branch": "main", "provider": "openai", "canonicalMessages": 1000 },
+  "events": [
+    { "type": "compactor", "outcome": "valid", "route": "configured", "inputTokens": 76000, "outputTokens": 2400, "cachedInputTokens": 0, "latencyMs": 3100, "commit": false },
+    { "type": "shadow-proposal", "candidateId": "shadow-t3-1", "committed": false, "authoritativeBlockId": "main-b17", "retainedConstraints": 12, "totalConstraints": 12 },
+    { "type": "quality", "constraintsRetained": 0, "constraintsTotal": 0, "exactFactsRetained": 28, "exactFactsTotal": 29, "unresolvedRetained": 6, "unresolvedTotal": 6, "contradictions": 0, "summaries": 1, "retrievalSuccesses": 4, "retrievalAttempts": 4, "continuationSuccesses": 1, "continuationAttempts": 1, "testsCompleted": 1, "testsAttempted": 1, "repeatedRetrievals": 0, "falseConfidence": 0 }
+  ],
+  "assertions": [
+    { "path": "revision", "op": "eq", "value": 100 },
+    { "path": "reliability.shadowCommitsPrevented", "op": "eq", "value": 1 },
+    { "path": "quality.exactUserConstraintRetention", "op": "eq", "value": 1 }
+  ]
+}

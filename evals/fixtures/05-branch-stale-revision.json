@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "branch-switch-stale-revision",
+  "description": "A background proposal from an abandoned branch and old revision is rejected.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 30, "branch": "feature-a", "provider": "openai", "canonicalMessages": 900 },
+  "events": [
+    { "type": "proposal-start", "id": "t2-a", "revision": 30, "sourceHash": "sha-old", "provider": "openai", "branch": "feature-a" },
+    { "type": "branch-switch", "branch": "feature-b", "revision": 31 },
+    { "type": "proposal-complete", "id": "t2-a", "revision": 30, "sourceHash": "sha-old", "provider": "openai", "branch": "feature-a", "commit": false }
+  ],
+  "assertions": [
+    { "path": "branch", "op": "eq", "value": "feature-b" },
+    { "path": "revision", "op": "eq", "value": 31 },
+    { "path": "reliability.staleProposalsRejected", "op": "eq", "value": 1 }
+  ]
+}

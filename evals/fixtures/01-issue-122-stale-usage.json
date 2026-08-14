@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "issue-122-stale-usage",
+  "description": "A stale 203K ACP value cannot cancel host recovery for a 417K pending prompt against a 258K window.",
+  "mode": "authoritative",
+  "initial": {
+    "contextWindow": 258000,
+    "safeThreshold": 233616,
+    "revision": 12,
+    "branch": "main",
+    "provider": "openai",
+    "canonicalMessages": 2400
+  },
+  "events": [
+    {
+      "type": "usage",
+      "providerReported": 203000,
+      "locallyCompiled": 417000,
+      "piEstimate": 417000,
+      "pendingPrompt": 417000
+    },
+    {
+      "type": "host-compaction",
+      "reason": "threshold",
+      "changed": false,
+      "projectedTokens": 203000,
+      "minimumSavings": 12000,
+      "cancel": false
+    }
+  ],
+  "assertions": [
+    {
+      "path": "reliability.hostCheckpointAllowed",
+      "op": "eq",
+      "value": 1
+    },
+    {
+      "path": "reliability.hostCompactionCanceled",
+      "op": "eq",
+      "value": 0
+    }
+  ]
+}

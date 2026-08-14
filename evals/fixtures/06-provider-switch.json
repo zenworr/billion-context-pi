@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "provider-switch",
+  "description": "A model-provider switch invalidates an in-flight provider-bound proposal.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 40, "branch": "main", "provider": "openai", "canonicalMessages": 900 },
+  "events": [
+    { "type": "proposal-start", "id": "t1-provider", "revision": 40, "sourceHash": "sha-provider", "provider": "openai", "branch": "main" },
+    { "type": "provider-switch", "provider": "anthropic", "revision": 41 },
+    { "type": "proposal-complete", "id": "t1-provider", "revision": 40, "sourceHash": "sha-provider", "provider": "openai", "branch": "main", "commit": false }
+  ],
+  "assertions": [
+    { "path": "provider", "op": "eq", "value": "anthropic" },
+    { "path": "reliability.providerSwitchesHandled", "op": "eq", "value": 1 },
+    { "path": "reliability.staleProposalsRejected", "op": "eq", "value": 1 }
+  ]
+}

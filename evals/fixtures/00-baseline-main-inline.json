@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "baseline-main-inline",
+  "description": "Current ACP baseline with a main-model inline summary.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 4, "branch": "main", "provider": "openai", "canonicalMessages": 1200 },
+  "events": [
+    { "type": "baseline", "name": "main-inline" },
+    { "type": "turn", "activeInputTokens": 180000, "cachedInputTokens": 150000, "uncachedInputTokens": 30000, "cacheHitRate": 0.83 },
+    { "type": "compactor", "outcome": "valid", "route": "main", "inputTokens": 90000, "outputTokens": 3200, "cachedInputTokens": 85000, "latencyMs": 4200, "commit": true },
+    { "type": "state-write", "success": true, "revisionBefore": 4, "revisionAfter": 5, "successReported": true },
+    { "type": "quality", "constraintsRetained": 4, "constraintsTotal": 4, "exactFactsRetained": 10, "exactFactsTotal": 10, "unresolvedRetained": 2, "unresolvedTotal": 2, "contradictions": 0, "summaries": 1, "retrievalSuccesses": 2, "retrievalAttempts": 2, "continuationSuccesses": 1, "continuationAttempts": 1, "testsCompleted": 1, "testsAttempted": 1, "repeatedRetrievals": 0, "falseConfidence": 0 }
+  ],
+  "assertions": [
+    { "path": "context.activeInputP50", "op": "eq", "value": 180000 },
+    { "path": "cost.mainCompactionOutputTokens", "op": "eq", "value": 3200 },
+    { "path": "revision", "op": "eq", "value": 5 }
+  ]
+}

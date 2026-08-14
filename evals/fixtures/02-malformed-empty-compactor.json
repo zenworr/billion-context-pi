@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "malformed-empty-compactor",
+  "description": "Malformed and empty compactor responses abort before state commit.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 7, "branch": "main", "provider": "openai", "canonicalMessages": 600 },
+  "events": [
+    { "type": "compactor", "outcome": "malformed", "route": "configured", "inputTokens": 42000, "outputTokens": 18, "cachedInputTokens": 0, "latencyMs": 900, "commit": false },
+    { "type": "compactor", "outcome": "empty", "route": "configured", "inputTokens": 42000, "outputTokens": 0, "cachedInputTokens": 0, "latencyMs": 850, "commit": false }
+  ],
+  "assertions": [
+    { "path": "revision", "op": "eq", "value": 7 },
+    { "path": "reliability.malformedOutputsRejected", "op": "eq", "value": 2 }
+  ]
+}

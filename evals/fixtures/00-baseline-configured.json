@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "baseline-configured-t1-t2-t3",
+  "description": "Configured-model baseline for Tier 1, Tier 2, and Tier 3 compaction.",
+  "mode": "authoritative",
+  "initial": { "contextWindow": 258000, "safeThreshold": 233616, "revision": 10, "branch": "main", "provider": "openai", "canonicalMessages": 1200 },
+  "events": [
+    { "type": "baseline", "name": "configured" },
+    { "type": "turn", "activeInputTokens": 155000, "cachedInputTokens": 110000, "uncachedInputTokens": 45000, "cacheHitRate": 0.71 },
+    { "type": "compactor", "outcome": "valid", "route": "configured", "inputTokens": 88000, "outputTokens": 2800, "cachedInputTokens": 0, "latencyMs": 3600, "commit": true },
+    { "type": "state-write", "success": true, "revisionBefore": 10, "revisionAfter": 11, "successReported": true },
+    { "type": "compactor", "outcome": "valid", "route": "configured", "inputTokens": 18000, "outputTokens": 900, "cachedInputTokens": 0, "latencyMs": 1400, "commit": true },
+    { "type": "state-write", "success": true, "revisionBefore": 11, "revisionAfter": 12, "successReported": true },
+    { "type": "compactor", "outcome": "valid", "route": "configured", "inputTokens": 7000, "outputTokens": 260, "cachedInputTokens": 0, "latencyMs": 800, "commit": true },
+    { "type": "state-write", "success": true, "revisionBefore": 12, "revisionAfter": 13, "successReported": true },
+    { "type": "quality", "constraintsRetained": 4, "constraintsTotal": 4, "exactFactsRetained": 9, "exactFactsTotal": 10, "unresolvedRetained": 2, "unresolvedTotal": 2, "contradictions": 0, "summaries": 3, "retrievalSuccesses": 2, "retrievalAttempts": 2, "continuationSuccesses": 1, "continuationAttempts": 1, "testsCompleted": 1, "testsAttempted": 1, "repeatedRetrievals": 0, "falseConfidence": 0 }
+  ],
+  "assertions": [
+    { "path": "cost.configuredInputTokens", "op": "eq", "value": 113000 },
+    { "path": "cost.configuredOutputTokens", "op": "eq", "value": 3960 },
+    { "path": "revision", "op": "eq", "value": 13 }
+  ]
+}
