@@ -136,6 +136,15 @@ export interface StructuredSummary {
 
 export interface BlockGenerationMetadata {
   requestedRoute: "main" | "configured";
+  actualWriter?: "main" | "configured";
+  fallbackReason?: string;
+  policyRevision?: string;
+  rawSourceHash?: string;
+  transferSourceHash?: string;
+  redactionManifestHash?: string;
+  redactionPolicyVersion?: string;
+  /** Retained for audit/search only; never rendered as authoritative provider history. */
+  nonAuthoritativeCommentary?: string;
   execution: "inline-main" | "isolated-main" | "isolated-configured";
   provider: string;
   model: string;
@@ -235,6 +244,11 @@ export interface CheckpointRecord {
   model?: string;
   provenance?: BlockGenerationMetadata;
   sourceHash?: string;
+  rawSourceHash?: string;
+  transferSourceHash?: string;
+  redactionManifestHash?: string;
+  redactionPolicyVersion?: string;
+  policyRevision?: string;
   /** Versioned exact-source ownership. Missing on migrated records means incomplete. */
   coverageVersion?: 1;
   coverageComplete?: boolean;
@@ -257,6 +271,10 @@ export interface TokenCalibrationState {
   anchorProviderTokens: number;
   anchorLocalTokens: number;
   anchorEpoch: number;
+  anchorRequestGeneration?: number;
+  anchorPayloadHash?: string;
+  anchorFixedPrefixFingerprint?: string;
+  anchorMediaVerified?: boolean;
   fixedOverheadTokens: number;
   candidateRatio?: number;
   candidateSamples?: number;
@@ -266,7 +284,10 @@ export interface TokenCalibrationState {
 }
 
 export interface CompressionStats {
+  /** Legacy gross source-token total. Prefer netTokensReclaimed for value reporting. */
   tokensCompressed: number;
+  grossSourceTokens: number;
+  netTokensReclaimed: number;
   compressionCount: number;
   rawTokensExternalized: number;
   semanticTokensCompressed: number;
@@ -302,6 +323,15 @@ export interface CompressionState {
     recentRetrievals: Record<string, number>;
     /** Stable completed-turn identity; prevents duplicate lifecycle hooks from aging blocks twice. */
     lastSurvivedTurnId?: string;
+    /** Persistent per-route/candidate backoff for automatic distillation. */
+    automaticCooldowns: Record<string, {
+      failures: number;
+      nextRetryAt: number;
+      circuitOpen: boolean;
+      warned: boolean;
+      sourceHash: string;
+      policyRevision: string;
+    }>;
     tokenCalibration: Record<string, TokenCalibrationState>;
   };
   stats: CompressionStats;

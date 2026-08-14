@@ -41,7 +41,8 @@ export function clearHistoricalContent(
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]!;
     if (isSafePlaintextReasoning(message, config, index, currentTurnStart, messages)) {
-      addCandidate(candidates, index, message.text ?? "", CLEARED_REASONING_MARKER, countTokens);
+      const artifact = findArtifact(message, artifacts);
+      if (artifact) addCandidate(candidates, index, message.text ?? "", renderClearedReasoning(artifact, countTokens(message.text ?? "")), countTokens);
       continue;
     }
     if (message.contentType !== "tool-result") continue;
@@ -130,6 +131,16 @@ function findArtifact(
     artifact.sourceMessageId === message.id
     || (message.toolCallId !== undefined && artifact.toolCallId === message.toolCallId)
   ));
+}
+
+function renderClearedReasoning(artifact: ArtifactRecord, originalTokens: number): string {
+  return [
+    CLEARED_REASONING_MARKER,
+    `original: ~${originalTokens} tokens`,
+    `artifact: ${artifact.id}`,
+    `sha256: ${artifact.sha256}`,
+    `Retrieve: acp_artifact({ id: "${artifact.id}" })`,
+  ].join("\n");
 }
 
 function renderClearedToolResult(

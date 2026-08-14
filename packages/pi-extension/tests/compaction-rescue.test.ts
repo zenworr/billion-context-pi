@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createInitialState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
+import { readStoredStateSnapshot } from "../src/state.js";
 
 const USAGE = {
   input: 120,
@@ -253,6 +254,10 @@ test("a committed Tier-1 rescue cancels threshold compaction only with a fresh v
     updatedAt: Date.now(),
   };
   await writeFile(`${fixture.sessionFile}.acp.json`, JSON.stringify(state), "utf8");
+  await fixture.handlers.get("before_provider_request")?.[0]?.({
+    type: "before_provider_request",
+    payload: { system: "stable", input: "x".repeat(600_000), tools: [] },
+  }, fixture.ctx);
 
   const result = await fixture.handler(compactionEvent(fixture.entries, fixture.controller), fixture.ctx) as {
     cancel?: boolean;
@@ -304,10 +309,7 @@ test("native compaction keeps ACP block coverage incomplete and active", async (
     tokensBefore: 150_000, details: {},
   } }, fixture.ctx);
 
-  const persisted = JSON.parse(await readFile(`${fixture.sessionFile}.acp.json`, "utf8")) as {
-    blocks: Array<{ blockId: string; active: boolean }>;
-    checkpoints: Array<{ coverageComplete?: boolean; sourceBlockIds: string[]; sourceHash?: string }>;
-  };
+  const persisted = await readStoredStateSnapshot(`${fixture.sessionFile}.acp.json`);
   assert.equal(persisted.blocks.find((block) => block.blockId === "b1")?.active, true);
   assert.equal(persisted.checkpoints.at(-1)?.coverageComplete, false);
   assert.deepEqual(persisted.checkpoints.at(-1)?.sourceBlockIds, []);

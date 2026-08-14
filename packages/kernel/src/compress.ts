@@ -443,6 +443,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
     state.stats.compressionCount += blocksCreated;
     state.stats.tokensCompressed += tokensCompressed;
+    state.stats.grossSourceTokens = (state.stats.grossSourceTokens ?? 0) + tokensCompressed;
     state.stats.semanticTokensCompressed += tokensCompressed;
 
     if (blocksCreated > 0) {
@@ -1324,6 +1325,10 @@ function cloneState(state: CompressionState): CompressionState {
       nudgeBaselines: { ...(state.policyState?.nudgeBaselines ?? {}) },
       lastActionAt: { ...(state.policyState?.lastActionAt ?? {}) },
       recentRetrievals: { ...(state.policyState?.recentRetrievals ?? {}) },
+      lastSurvivedTurnId: state.policyState?.lastSurvivedTurnId,
+      automaticCooldowns: Object.fromEntries(
+        Object.entries(state.policyState?.automaticCooldowns ?? {}).map(([key, value]) => [key, { ...value }]),
+      ),
       tokenCalibration: Object.fromEntries(
         Object.entries(state.policyState?.tokenCalibration ?? {}).map(([key, value]) => [key, { ...value }]),
       ),

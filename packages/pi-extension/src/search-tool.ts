@@ -2,9 +2,10 @@ import { Type, type Static } from "typebox";
 import type { AgentToolResult, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { searchBlocks, type SearchDocKind, type SearchResult } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
-import { buildSearchDocs } from "./search-index.js";
+import { buildSearchDocsCached } from "./search-index.js";
 import { logThrow } from "./log.js";
 import { recordRecentRetrievals } from "./retrieval-tracking.js";
+import { publicAcpRef, type PublicRefKind } from "./public-refs.js";
 
 const SearchParams = Type.Object({
     query: Type.String({ description: "Keywords, path, symbol, or exact error text to locate in compressed history." }),
@@ -34,21 +35,24 @@ export function makeSearchTool(runtime: AcpRuntime): ToolDefinition<typeof Searc
         ],
         parameters: SearchParams,
         async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-            let result: string;
+            let result: Awaited<ReturnType<typeof handleSearch>>;
             try {
                 result = await handleSearch(params as SearchArgs, runtime, ctx);
             } catch (e) {
                 logThrow("search", e, { sid: ctx.sessionManager.getSessionId(), query: (params as SearchArgs).query });
                 throw e;
             }
-            return { details: undefined, content: [{ type: "text", text: result }] };
+            return { details: result.details, content: [{ type: "text", text: result.text }] };
         },
     };
 }
 
-async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: ExtensionContext): Promise<string> {
+async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: ExtensionContext): Promise<{
+    text: string;
+    details: { version: 1; query: string; results: Array<SearchResult & { canonicalRef: string; pinCommand: string }> };
+}> {
     const { state } = await runtime.stateFor(ctx);
-    const docs = buildSearchDocs(ctx, state);
+    const docs = await buildSearchDocsCached(ctx, state);
     const msgCount = docs.filter((d) => d.kind === "message").length;
     const blockCount = docs.filter((d) => d.kind === "block").length;
     const artifactCount = docs.filter((d) => d.kind === "artifact").length;
@@ -62,19 +66,23 @@ async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: Extensio
 
     if (results.length === 0) {
         const blocks = state.blocks.length;
-        return `No matches for "${args.query}" across ${blocks} block(s) and ${msgCount} historical message(s).`;
+        return { text: `No matches for "${args.query}" across ${blocks} block(s) and ${msgCount} historical message(s).`, details: { version: 1, query: args.query, results: [] } };
     }
 
     await recordRecentRetrievals(runtime, ctx, results.map((result) => result.checkpointId ?? result.blockId ?? result.ref));
+    const enriched = results.map((result) => {
+        const canonicalRef = publicAcpRef(result.kind as PublicRefKind, result.ref);
+        return { ...result, canonicalRef, pinCommand: `pin_context({ ref: "${canonicalRef}" })` };
+    });
     const lines = [`Found ${results.length} match(es) for "${args.query}" (searched ${blockCount} blocks + ${checkpointCount} checkpoints + ${msgCount} messages + ${artifactCount} artifacts):`];
-    for (const r of results) lines.push("", formatResult(r));
-    return lines.join("\n");
+    for (const r of enriched) lines.push("", formatResult(r));
+    return { text: lines.join("\n"), details: { version: 1, query: args.query, results: enriched } };
 }
 
-function formatResult(r: SearchResult): string {
+function formatResult(r: SearchResult & { canonicalRef: string; pinCommand: string }): string {
     const sizeStr = r.tokens != null ? formatSize(r.tokens) : "";
     const meta = [
-        `${r.kind} ${r.ref}`,
+        `${r.kind} ${r.canonicalRef}`,
         r.role ? `(${r.role})` : "",
         r.kind === "artifact" ? "" : `T${r.tier}`,
         `score:${r.score.toFixed(2)}`,
@@ -93,7 +101,7 @@ function formatResult(r: SearchResult): string {
               ? `→ decompress({ blockId: "${r.ref}" })  (message owned by checkpoint ${r.checkpointId})`
               : `(message ${r.ref} is still visible in context)`;
 
-    return `${header}\n  ${truncate(r.preview, 2_000)}\n  ${decompressHint}`;
+    return `${header}\n  ${truncate(r.preview, 2_000)}\n  ${decompressHint}\n  → ${r.pinCommand}`;
 }
 
 function truncate(s: string, n: number): string {

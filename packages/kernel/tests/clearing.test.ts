@@ -49,6 +49,20 @@ function artifact(index: number, toolName = "read"): ArtifactRecord {
   };
 }
 
+function reasoningArtifact(sourceMessageId: string): ArtifactRecord {
+  return {
+    id: `ar-${sourceMessageId}`,
+    sha256: "a".repeat(64),
+    sourceMessageId,
+    mime: "text/plain; charset=utf-8",
+    bytes: 20_000,
+    estimatedTokens: 20_000,
+    localPath: `/tmp/${sourceMessageId}.gz`,
+    createdAt: 1,
+    retrievable: true,
+  };
+}
+
 const countTokens = (text: string): number => text.length;
 
 function messages(count: number, tokens: number): CoreMessage[] {
@@ -194,10 +208,11 @@ test("safe-only reasoning clears only explicit provider-agnostic plaintext", () 
     clearAtLeastTokens: 1,
     reasoning: "safe-only" as const,
   };
-  const cleared = clearHistoricalContent(input, [], config, countTokens);
+  const cleared = clearHistoricalContent(input, [reasoningArtifact("plain")], config, countTokens);
 
   assert.equal(cleared.clearedCount, 1);
-  assert.equal(cleared.messages[0]!.text, CLEARED_REASONING_MARKER);
+  assert.match(cleared.messages[0]!.text ?? "", /^\[ACP cleared historical plaintext reasoning\]/);
+  assert.match(cleared.messages[0]!.text ?? "", /acp_artifact/);
   for (let index = 1; index < input.length; index++) {
     assert.strictEqual(cleared.messages[index], input[index]);
   }
@@ -250,10 +265,10 @@ test("reasoning clearing preserves tool call and result protocol", () => {
     clearAtLeastTokens: 1,
     reasoning: "safe-only" as const,
   };
-  const cleared = clearHistoricalContent(input, [], config, countTokens);
+  const cleared = clearHistoricalContent(input, [reasoningArtifact("reasoning")], config, countTokens);
 
   assert.equal(cleared.messages.length, input.length);
-  assert.equal(cleared.messages[0]!.text, CLEARED_REASONING_MARKER);
+  assert.match(cleared.messages[0]!.text ?? "", /^\[ACP cleared historical plaintext reasoning\]/);
   assert.strictEqual(cleared.messages[1], input[1]);
   assert.strictEqual(cleared.messages[2], input[2]);
   assert.equal(cleared.messages[1]!.toolCallId, "tc-1");
@@ -290,14 +305,16 @@ test("processTurn never tags preserved or signed reasoning payloads", () => {
       reasoning: "safe-only",
     },
   });
+  const safeState = createInitialState("safe");
+  safeState.artifacts.push(reasoningArtifact("plain"));
   const safeTurn = core.processTurn({
     messages: messagesWithPairs,
-    state: createInitialState("safe"),
+    state: safeState,
     config: safeConfig,
     tokenCount: 40_000,
   });
 
-  assert.equal(safeTurn.messages.find((message) => message.id === "plain")?.text, CLEARED_REASONING_MARKER);
+  assert.match(safeTurn.messages.find((message) => message.id === "plain")?.text ?? "", /^\[ACP cleared historical plaintext reasoning\]/);
   assert.equal(safeTurn.messages.find((message) => message.id === "provider")?.text, providerText);
 
   const preserveConfig = defaultConfig(200_000, {

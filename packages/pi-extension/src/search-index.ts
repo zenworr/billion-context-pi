@@ -15,10 +15,48 @@
  * reports ALL entries as in-context. The ACP state is the source of truth.
  */
 
+import { randomUUID } from "node:crypto";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import type { ExtensionContext, SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 import { artifactDocs, blockDocs, messageDocs, type SearchDoc, type MessageInput, type MessageRole } from "acp-kernel";
 import { entriesToCoreMessages } from "./messages.js";
 import type { CompressionState } from "acp-kernel";
+
+interface PersistedSearchIndex {
+    version: 1;
+    graphRevision: number;
+    entryCount: number;
+    lastEntryId?: string;
+    docs: SearchDoc[];
+}
+
+/** Load a persistent revision-keyed index when possible; rebuild atomically otherwise. */
+export async function buildSearchDocsCached(ctx: ExtensionContext, state: CompressionState): Promise<SearchDoc[]> {
+    const entries = ctx.sessionManager.getEntries();
+    const sessionFile = ctx.sessionManager.getSessionFile?.();
+    if (!sessionFile) return buildSearchDocsFromEntries(entries, state);
+    const indexFile = `${sessionFile}.acp-search-index.json`;
+    let lastEntryId: string | undefined;
+    for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index]!;
+        if ("id" in entry && typeof entry.id === "string") { lastEntryId = entry.id; break; }
+    }
+    try {
+        const cached = JSON.parse(await readFile(indexFile, "utf8")) as PersistedSearchIndex;
+        if (cached.version === 1 && cached.graphRevision === state.graphRevision
+            && cached.entryCount === entries.length && cached.lastEntryId === lastEntryId && Array.isArray(cached.docs)) {
+            return cached.docs;
+        }
+    } catch {
+        // Missing, torn, or stale indexes are safe to rebuild from canonical state.
+    }
+    const docs = buildSearchDocsFromEntries(entries, state);
+    const record: PersistedSearchIndex = { version: 1, graphRevision: state.graphRevision, entryCount: entries.length, lastEntryId, docs };
+    const temporary = `${indexFile}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    await rename(temporary, indexFile);
+    return docs;
+}
 
 /** All message refs covered by any block (active or inactive). */
 function buildCoveredRefs(state: CompressionState): Set<string> {
@@ -66,8 +104,10 @@ function toRole(entry: SessionMessageEntry): MessageRole | null {
 }
 
 export function buildSearchDocs(ctx: ExtensionContext, state: CompressionState): SearchDoc[] {
-    const sm = ctx.sessionManager;
-    const allEntries: SessionEntry[] = sm.getEntries();
+    return buildSearchDocsFromEntries(ctx.sessionManager.getEntries(), state);
+}
+
+function buildSearchDocsFromEntries(allEntries: SessionEntry[], state: CompressionState): SearchDoc[] {
     const covered = buildCoveredRefs(state);
     const ownerMap = buildMessageOwnerMap(state);
     const checkpointOwnerMap = new Map<string, string>();

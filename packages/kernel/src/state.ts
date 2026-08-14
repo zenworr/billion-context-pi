@@ -26,10 +26,13 @@ export function createInitialState(sessionId = ""): CompressionState {
       nudgeBaselines: {},
       lastActionAt: {},
       recentRetrievals: {},
+      automaticCooldowns: {},
       tokenCalibration: {},
     },
     stats: {
       tokensCompressed: 0,
+      grossSourceTokens: 0,
+      netTokensReclaimed: 0,
       compressionCount: 0,
       rawTokensExternalized: 0,
       semanticTokensCompressed: 0,

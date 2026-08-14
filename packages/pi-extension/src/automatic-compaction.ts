@@ -9,13 +9,14 @@ import type {
   CoreMessage,
   StructuredSummary,
 } from "acp-kernel";
-import { TransactionalBackgroundJobs, sameSnapshot, type BackgroundTrigger, type JobSnapshot } from "./background-jobs.js";
+import { TransactionalBackgroundJobs, sameSnapshot, type BackgroundJobOutcome, type BackgroundTrigger, type JobSnapshot } from "./background-jobs.js";
 import { compressorModeForTier, compressionThinkingLevel, parseCompressionModel } from "./config.js";
 import { routeCompaction } from "./compaction-routing.js";
 import {
   extractCompressionManifest,
   mergeCompressionManifests,
   sha256,
+  renderAuthoritativeSummary,
   structuredSummaryFromRendered,
   validateAndRepairSummary,
 } from "./manifest.js";
@@ -23,9 +24,12 @@ import { compressionErrorUsage, compressWithModel, type CompressionUsage } from 
 import { OptimizationTelemetry, type OptimizationRoute } from "./optimization-telemetry.js";
 import { QualityAdapter } from "./quality-adaptation.js";
 import type { AcpRuntime } from "./runtime.js";
-import { ensureCompactionTransferAllowed, redactCompactionSecrets } from "./compress-tool.js";
+import { ensureCompactionTransferAllowed, redactCompactionTransfer } from "./compress-tool.js";
 import { logInfo, logWarn } from "./log.js";
 import { wasRecentlyRetrieved } from "./retrieval-tracking.js";
+import { compressionPolicyRevision } from "./compression-plan-tool.js";
+import { collectCoveredMessageIds, estimateTokens } from "./tokens.js";
+import { CompressionCallBudget } from "./model-call-budget.js";
 
 type CompressionModel = NonNullable<ExtensionContext["model"]>;
 
@@ -39,6 +43,8 @@ interface AutomaticSnapshot extends JobSnapshot {
   sourceTokens: number;
   source: string;
   manifest: CompressionManifest;
+  candidateKey: string;
+  policyRevision: string;
 }
 
 interface AutomaticProposal {
@@ -74,8 +80,12 @@ export function createAutomaticCompaction(runtime: AcpRuntime): AutomaticCompact
     schedule(trigger, ctx) {
       if (runtime.adapter.optimization?.automaticDistillation !== true) return;
       const shadow = runtime.adapter.optimization.shadowCompaction === true;
+      let scheduledSnapshot: AutomaticSnapshot | undefined;
       void jobs.schedule(trigger, {
-        capture: (signal) => captureSnapshot(runtime, ctx, signal),
+        capture: async (signal) => {
+          scheduledSnapshot = await captureSnapshot(runtime, ctx, signal);
+          return scheduledSnapshot;
+        },
         generate: (snapshot, signal) => generateProposal(runtime, ctx, snapshot, signal, telemetry, quality),
         current: (snapshot, signal) => currentSnapshot(runtime, ctx, snapshot, signal),
         commit: (snapshot, proposal, signal) => commitProposal(runtime, ctx, snapshot, proposal, signal, telemetry),
@@ -90,6 +100,7 @@ export function createAutomaticCompaction(runtime: AcpRuntime): AutomaticCompact
               shadow: outcome === "shadowed",
             });
           }
+          if (scheduledSnapshot) void recordAutomaticOutcome(runtime, ctx, scheduledSnapshot, outcome);
           logInfo("optimization", { event: outcome, trigger, shadow, durationMs });
         },
       });
@@ -113,6 +124,59 @@ export function createAutomaticCompaction(runtime: AcpRuntime): AutomaticCompact
     },
   };
   return controller;
+}
+
+async function recordAutomaticOutcome(
+  runtime: AcpRuntime,
+  ctx: ExtensionContext,
+  snapshot: AutomaticSnapshot,
+  outcome: BackgroundJobOutcome,
+): Promise<void> {
+  if (outcome !== "failed" && outcome !== "committed") return;
+  const release = await runtime.acquireLock(snapshot.sessionId);
+  try {
+    const { state } = await runtime.stateFor(ctx);
+    const automaticCooldowns = { ...state.policyState.automaticCooldowns };
+    if (outcome === "committed") delete automaticCooldowns[snapshot.candidateKey];
+    else {
+      const previous = automaticCooldowns[snapshot.candidateKey];
+      const next = nextAutomaticCooldown(previous, Date.now(), snapshot.planSourceHash, snapshot.policyRevision);
+      const { failures, circuitOpen, warned } = next;
+      automaticCooldowns[snapshot.candidateKey] = next;
+      if (circuitOpen && previous?.warned !== true) {
+        const warning = `ACP automatic Tier-${snapshot.tier} distillation paused for this unchanged candidate after ${failures} failures. It will retry after source or policy changes.`;
+        logWarn("optimization", { event: "circuit-open", candidateKey: snapshot.candidateKey, failures });
+        if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+      }
+    }
+    await runtime.save({
+      ...state,
+      metadataRevision: state.metadataRevision + 1,
+      policyState: { ...state.policyState, automaticCooldowns },
+    }, ctx);
+  } catch (error) {
+    logWarn("optimization", { event: "cooldown-state-failed", error: error instanceof Error ? error.message : String(error) });
+  } finally {
+    release();
+  }
+}
+
+export function nextAutomaticCooldown(
+  previous: CompressionState["policyState"]["automaticCooldowns"][string] | undefined,
+  now: number,
+  sourceHash: string,
+  policyRevision: string,
+): CompressionState["policyState"]["automaticCooldowns"][string] {
+  const failures = (previous?.failures ?? 0) + 1;
+  const circuitOpen = failures >= 3;
+  return {
+    failures,
+    nextRetryAt: now + Math.min(5 * 60_000, 5_000 * (2 ** Math.min(6, failures - 1))),
+    circuitOpen,
+    warned: previous?.warned === true || circuitOpen,
+    sourceHash,
+    policyRevision,
+  };
 }
 
 export function wireAutomaticCompaction(pi: ExtensionAPI, runtime: AcpRuntime): AutomaticCompactionController {
@@ -163,6 +227,28 @@ async function captureSnapshot(runtime: AcpRuntime, ctx: ExtensionContext, signa
     if (plannedBlocks.length !== planRange.sourceBlockIds.length) return undefined;
     const sourceHashes = Object.fromEntries(plannedBlocks.map((block) => [block.blockId, blockDigest(block)]));
     const source = serializeAutomaticSource(plannedBlocks, planRange.sourceMessageIds, coreMessages, state);
+    const policyRevision = compressionPolicyRevision(runtime);
+    const writer = compressorModeForTier(runtime.adapter, candidate.tier);
+    const candidateKey = sha256(`${writer}:${candidate.tier}:${planned.plan.sourceHash}:${policyRevision}`);
+    const cooldown = state.policyState.automaticCooldowns[candidateKey];
+    if (cooldown && cooldown.sourceHash === planned.plan.sourceHash && cooldown.policyRevision === policyRevision
+      && (cooldown.circuitOpen || cooldown.nextRetryAt > Date.now())) return undefined;
+    if (writer === "configured") {
+      const configuredRef = parseCompressionModel(runtime.adapter.compress?.model);
+      const configured = configuredRef ? ctx.modelRegistry.find(configuredRef.provider, configuredRef.id) : undefined;
+      if (!authenticated(ctx, configured)) return undefined;
+      try {
+        ensureCompactionTransferAllowed({
+          activeProvider: ctx.model?.provider,
+          configuredProvider: configured!.provider,
+          allowCrossProvider: runtime.adapter.compress?.allowCrossProvider === true,
+          acknowledgeCrossProviderDataTransfer: runtime.adapter.compress?.acknowledgeCrossProviderDataTransfer === true,
+        });
+      } catch (error) {
+        logWarn("optimization", { event: "preflight-transfer-denied", candidateKey, error: error instanceof Error ? error.message : String(error) });
+        return undefined;
+      }
+    }
     const messageById = new Map(coreMessages.map((message) => [message.id, message]));
     const rawManifest = extractCompressionManifest(
       planRange.sourceMessageIds.flatMap((id) => {
@@ -185,6 +271,8 @@ async function captureSnapshot(runtime: AcpRuntime, ctx: ExtensionContext, signa
       planSourceHash: planned.plan.sourceHash,
       sourceTokens: planRange.sourceTokens,
       source,
+      candidateKey,
+      policyRevision,
       manifest: mergeCompressionManifests([
         rawManifest,
         ...plannedBlocks.flatMap((block) => block.manifest ? [block.manifest] : []),
@@ -264,25 +352,35 @@ async function generateProposal(
     });
   }
   const started = Date.now();
+  const initialTransfer = route === "configured"
+    ? redactCompactionTransfer(snapshot.source, runtime.adapter.compress?.secretPatterns)
+    : undefined;
   try {
-    const runModel = (model: CompressionModel, routeForCall: OptimizationRoute, source: string) => compressWithModel({
-      ctx,
-      model,
-      thinkingLevel: decision.thinking,
-      tier: snapshot.tier,
-      source: routeForCall === "configured" ? redactCompactionSecrets(source, runtime.adapter.compress?.secretPatterns) : source,
-      prompts: runtime.prompts,
-      summaryMaxChars: 20_000,
-      signal,
-    });
+    const callBudget = new CompressionCallBudget(runtime.adapter.compress);
+    const runModel = (model: CompressionModel, routeForCall: OptimizationRoute, rawSource: string) => {
+      const source = routeForCall === "configured" ? redactCompactionTransfer(rawSource, runtime.adapter.compress?.secretPatterns).source : rawSource;
+      return compressWithModel({
+        ctx,
+        model,
+        thinkingLevel: decision.thinking,
+        tier: snapshot.tier,
+        source,
+        prompts: runtime.prompts,
+        summaryMaxChars: 20_000,
+        signal,
+        beforeCall: (inputTokens, outputTokens) => callBudget.reserveEstimated(inputTokens, outputTokens),
+      });
+    };
     let accumulatedUsage: CompressionUsage | undefined;
     const paidCall = async (model: CompressionModel, routeForCall: OptimizationRoute, source: string) => {
       try {
         const result = await runModel(model, routeForCall, source);
         accumulatedUsage = mergeCompressionUsage(accumulatedUsage, result.usage);
+        callBudget.observe(accumulatedUsage);
         return result;
       } catch (error) {
         accumulatedUsage = mergeCompressionUsage(accumulatedUsage, compressionErrorUsage(error));
+        callBudget.observe(accumulatedUsage);
         throw error;
       }
     };
@@ -356,9 +454,10 @@ async function generateProposal(
     if (runtime.adapter.optimization?.telemetry === true) telemetry.recordUsage(actualRoute, result.usage);
     const outcome = validation.status === "repaired" ? "repaired" : "passed";
     quality.record(`${selected.provider}/${selected.id}`, snapshot.tier, outcome);
+    const structuredSummary = structuredSummaryFromRendered(validation.renderedSummary, snapshot.manifest, [], snapshot.tier);
     return {
-      summary: validation.renderedSummary,
-      structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, snapshot.manifest, [], snapshot.tier),
+      summary: renderAuthoritativeSummary(structuredSummary),
+      structuredSummary,
       quality: {
         status: validation.status,
         missingRequiredFacts: validation.missingRequiredFacts,
@@ -366,7 +465,15 @@ async function generateProposal(
         attempts,
       },
       provenance: {
-        requestedRoute: "configured",
+        requestedRoute: route,
+        actualWriter: actualRoute,
+        fallbackReason: actualRoute !== route ? `Automatic ${route} writer fell back to ${actualRoute}.` : undefined,
+        policyRevision: snapshot.policyRevision,
+        rawSourceHash: initialTransfer?.rawSourceHash ?? sha256(snapshot.source),
+        transferSourceHash: initialTransfer?.transferSourceHash,
+        redactionManifestHash: initialTransfer?.redactionManifestHash,
+        redactionPolicyVersion: initialTransfer?.redactionPolicyVersion,
+        nonAuthoritativeCommentary: validation.renderedSummary,
         execution: actualRoute === "configured" ? "isolated-configured" : "isolated-main",
         provider: selected.provider,
         model: selected.id,
@@ -423,11 +530,14 @@ async function commitProposal(
       config: runtime.configFor(ctx),
     });
     if (!replanned.plan || replanned.plan.sourceHash !== snapshot.planSourceHash) return false;
+    const config = runtime.configFor(ctx);
+    const beforeTurn = runtime.core.processTurn({ messages: coreMessages, state: structuredClone(state), config, tokenCount: snapshot.sourceTokens });
+    const beforeTokens = estimateTokens(beforeTurn.messages, collectCoveredMessageIds(beforeTurn.state));
     const applied = runtime.core.applyCompression({
       ranges: [{ startRef: snapshot.startRef, endRef: snapshot.endRef, summary: proposal.summary }],
       messages: coreMessages,
       state,
-      config: runtime.configFor(ctx),
+      config,
       expectedRevision: state.revision,
       expectedSourceHash: snapshot.planSourceHash,
       atomic: true,
@@ -442,12 +552,16 @@ async function commitProposal(
     block.summaryHash = sha256(proposal.summary);
     block.provenance = proposal.provenance;
     block.quality = proposal.quality;
+    const afterTurn = runtime.core.processTurn({ messages: coreMessages, state: structuredClone(applied.state), config, tokenCount: beforeTokens });
+    const afterTokens = estimateTokens(afterTurn.messages, collectCoveredMessageIds(afterTurn.state));
+    const netSavings = Math.max(0, beforeTokens - afterTokens);
+    applied.state.stats.netTokensReclaimed = (applied.state.stats.netTokensReclaimed ?? 0) + netSavings;
     if (signal.aborted) return false;
     await runtime.save(applied.state, ctx);
     if (runtime.adapter.optimization?.telemetry === true) {
-      telemetry.recordMutation({ savingsTokens: applied.result.tokensCompressed, latencyMs: Math.max(0, Date.now() - proposal.generatedAt) });
+      telemetry.recordMutation({ savingsTokens: netSavings, latencyMs: Math.max(0, Date.now() - proposal.generatedAt) });
     }
-    logInfo("optimization", { event: "committed", sid, tier: snapshot.tier, blockId: block.blockId, savingsTokens: applied.result.tokensCompressed });
+    logInfo("optimization", { event: "committed", sid, tier: snapshot.tier, blockId: block.blockId, netSavingsTokens: netSavings, grossSourceTokens: applied.result.tokensCompressed });
     return true;
   } catch (error) {
     logWarn("optimization", { event: "commit-failed", sid, error: error instanceof Error ? error.message : String(error) });

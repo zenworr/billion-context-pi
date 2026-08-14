@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { SessionStateStore, readParentSessionPath } from "../src/state.js";
@@ -50,6 +50,26 @@ test("save then load round-trips state", async () => {
   assert.equal(after.blocks[0]!.blockId, "b0");
   assert.equal(after.nextBlockId, 1);
   assert.equal(after.messageRefs.byRef.m00000, "a");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("append-only journal replays committed patches and ignores a torn tail", async () => {
+  const dir = await tempDir();
+  const file = path.join(dir, "session.json");
+  const store = new SessionStateStore();
+  const initial = createInitialState("journal-state");
+  const saved = await store.save(initial, file, "journal-state");
+  saved.nextBlockId = 7;
+  saved.policyState.lastSurvivedTurnId = "turn-7";
+  const updated = await store.save(saved, file, "journal-state");
+  const journalPath = `${file}.acp.json.journal`;
+  assert.match(await readFile(journalPath, "utf8"), /"nextBlockId":7/);
+  await appendFile(journalPath, '{"version":1,"revision":999,"patch":');
+  store.invalidate(file, "journal-state");
+  const loaded = await store.load(file, "journal-state");
+  assert.equal(loaded.revision, updated.revision);
+  assert.equal(loaded.nextBlockId, 7);
+  assert.equal(loaded.policyState.lastSurvivedTurnId, "turn-7");
   await rm(dir, { recursive: true, force: true });
 });
 

@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defaultPrompts } from "acp-kernel";
 import {
   compressWithModel,
+  compressionErrorUsage,
   estimateCompressionInputTokens,
   MAX_COMPRESSION_INPUT_TOKENS,
 } from "../src/model-compressor.js";
@@ -93,6 +94,41 @@ test("configured compression splits oversized sources below the 220k input ceili
   assert.ok(observed.every((tokens) => tokens <= MAX_COMPRESSION_INPUT_TOKENS), `unsafe requests: ${observed.join(",")}`);
   assert.match(result.summary, /src\/example\.ts/);
   assert.equal(result.usage.input, observed.length * usage.input);
+});
+
+test("map-reduce reserves every provider call and preserves partial usage on later failure", async () => {
+  const model = compressionModel();
+  const source = Array.from({ length: 400 }, (_, index) => `[m${String(index).padStart(5, "0")}] user/text\n${"x".repeat(2_000)}`).join("\n\n");
+  let calls = 0;
+  let reservations = 0;
+  const ctx = {
+    modelRegistry: {
+      complete: async () => {
+        calls++;
+        if (calls === 2) throw new Error("later chunk failed");
+        return { content: [{ type: "text", text: `Source-backed detail ${"x".repeat(240)}` }], stopReason: "stop", usage };
+      },
+    },
+  } as unknown as ExtensionContext;
+  await assert.rejects(
+    compressWithModel({
+      ctx,
+      model,
+      thinkingLevel: "medium",
+      tier: 1,
+      source,
+      prompts: defaultPrompts,
+      summaryMaxChars: 20_000,
+      beforeCall: () => { reservations++; },
+    }),
+    (error) => {
+      assert.match(error instanceof Error ? error.message : String(error), /later chunk failed/);
+      assert.equal(compressionErrorUsage(error)?.input, usage.input);
+      return true;
+    },
+  );
+  assert.equal(reservations, calls);
+  assert.equal(calls, 2);
 });
 
 test("input estimator includes prompt and JSON envelope", () => {

@@ -6,7 +6,7 @@ import type {
   SessionBeforeCompactEvent,
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { CompressionManifest, NudgeDecision, CompressionBlock, CompressionState, Prompts } from "acp-kernel";
+import type { CompressionManifest, NudgeDecision, CompressionBlock, CompressionState, CoreMessage, Prompts } from "acp-kernel";
 import { commitCheckpointEpoch, renderNudgeText, resolvePrompts, defaultPrompts } from "acp-kernel";
 import {
   type AdapterConfig,
@@ -19,6 +19,7 @@ import {
 } from "./config.js";
 import { createRuntime, type AcpRuntime } from "./runtime.js";
 import { makeCompressTool } from "./compress-tool.js";
+import { compressionPolicyRevision, makePlanCompressionTool } from "./compression-plan-tool.js";
 import { makeDecompressTool } from "./decompress-tool.js";
 import { makeSearchTool } from "./search-tool.js";
 import { makeStatusTool } from "./status-tool.js";
@@ -46,17 +47,19 @@ import { formatSystemPromptForEvent } from "./compat.js";
 import { wireAutomaticCompaction, type AutomaticCompactionController } from "./automatic-compaction.js";
 import { captureWorldStateAsync, FreshnessTracker, renderWorldOverlay } from "./freshness.js";
 import { registerPinTool, renderPins } from "./pin-tool.js";
-import { cleanupArtifactStore, ensureArtifactStore } from "./artifact-store.js";
-import { compressWithModel, type CompressionUsage } from "./model-compressor.js";
-import { ensureCompactionTransferAllowed, redactCompactionSecrets } from "./compress-tool.js";
+import { cleanupArtifactStore, ensureArtifactStore, spoolArtifact } from "./artifact-store.js";
+import { compressWithModel, compressionErrorUsage, type CompressionUsage } from "./model-compressor.js";
+import { CompressionCallBudget } from "./model-call-budget.js";
+import { ensureCompactionTransferAllowed, redactCompactionTransfer } from "./compress-tool.js";
 import {
   compileBranchSource,
   compileCheckpointSource,
   manifestForCompiledSource,
   prepareBranchSource,
 } from "./checkpoint-source.js";
-import { sha256, structuredSummaryFromRendered, validateAndRepairSummary } from "./manifest.js";
+import { renderAuthoritativeSummary, sha256, structuredSummaryFromRendered, validateAndRepairSummary } from "./manifest.js";
 import { compileFinalRequestProjection } from "./final-request.js";
+import { auditProviderPayload, deepFreezeProviderPayload, sanitizeUnsafeProviderMedia } from "./provider-audit.js";
 
 
 type AgentMessage = SessionMessageEntry["message"];
@@ -77,6 +80,8 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     wireContextTransform(pi, runtime, freshness, baseAdapter);
     wireToolGuardrails(pi, runtime);
     wireSystemPrompt(pi, runtime, freshness, baseAdapter);
+    wireProviderRequestAuditor(pi, runtime, freshness, baseAdapter);
+    pi.registerTool(makePlanCompressionTool(runtime));
     pi.registerTool(makeCompressTool(runtime));
     pi.registerTool(makeDecompressTool(runtime));
     pi.registerTool(makeSearchTool(runtime));
@@ -131,13 +136,18 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
     if (!event.preparation.userWantsSummary || runtime.adapter.compress?.branchSummaryCompressor !== "configured") return;
     const sid = ctx.sessionManager.getSessionId();
     const release = await runtime.acquireLock(sid);
+    let compiled: ReturnType<typeof compileBranchSource>;
     try {
       const { state } = await runtime.stateFor(ctx);
-      const compiled = compileBranchSource(
+      compiled = compileBranchSource(
         event.preparation.entriesToSummarize,
         state.messageRefs.byRaw,
         freshness.branchProjectContext(),
       );
+    } finally {
+      release();
+    }
+    try {
       if (!compiled.source.trim()) throw new Error("Pi supplied no branch-bounded messages to summarize.");
       const model = configuredCompressionModel(runtime, ctx);
       if (!model) throw new Error("The configured branch summary model is unavailable or unauthenticated.");
@@ -147,45 +157,55 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
         allowCrossProvider: runtime.adapter.compress?.allowCrossProvider === true,
         acknowledgeCrossProviderDataTransfer: runtime.adapter.compress?.acknowledgeCrossProviderDataTransfer === true,
       });
-      const prepared = prepareBranchSource(
-        compiled,
-        (source) => redactCompactionSecrets(source, runtime.adapter.compress?.secretPatterns),
-      );
+      const prepared = prepareBranchSource(compiled, (source) => source);
+      const transfer = redactCompactionTransfer(prepared.source, runtime.adapter.compress?.secretPatterns);
+      const transferManifest = manifestForCompiledSource(transfer.source);
+      const callBudget = new CompressionCallBudget(runtime.adapter.compress);
+      const deadline = AbortSignal.timeout(runtime.adapter.compress?.maxDurationMs ?? 60_000);
+      const generationSignal = event.signal ? AbortSignal.any([event.signal, deadline]) : deadline;
       const result = await compressWithModel({
         ctx,
         model,
         thinkingLevel: compressionThinkingLevel(runtime.adapter, "branch"),
         tier: 1,
-        source: prepared.source,
+        source: transfer.source,
         prompts: runtime.prompts,
         summaryMaxChars: 30_000,
-        signal: event.signal,
+        signal: generationSignal,
+        beforeCall: (inputTokens, outputTokens) => callBudget.reserveEstimated(inputTokens, outputTokens),
         trustedInstructions: event.preparation.customInstructions,
         replaceInstructions: event.preparation.replaceInstructions === true,
       });
+      callBudget.observe(result.usage);
       const validation = validateAndRepairSummary({
         summary: result.summary,
-        manifest: prepared.manifest,
+        manifest: transferManifest,
         sourceTokens: compiled.sourceTokens,
         tier: 1,
         summaryMaxChars: 30_000,
       });
+      const structuredSummary = structuredSummaryFromRendered(validation.renderedSummary, prepared.manifest);
       return {
         summary: {
-          summary: validation.renderedSummary,
+          summary: renderAuthoritativeSummary(structuredSummary),
           usage: result.usage,
           details: {
             source: "hybrid-acp-configured-branch",
             route: result.model,
             thinking: result.thinking,
-            sourceHash: prepared.manifest.sourceHash,
+            sourceHash: transfer.rawSourceHash,
+            rawSourceHash: transfer.rawSourceHash,
+            transferSourceHash: transfer.transferSourceHash,
+            redactionManifestHash: transfer.redactionManifestHash,
+            redactionPolicyVersion: transfer.redactionPolicyVersion,
             sourceMessageIds: compiled.sourceMessageIds,
             validation: validation.status,
             instructionHash: event.preparation.customInstructions
               ? sha256(event.preparation.customInstructions)
               : undefined,
             replaceInstructions: event.preparation.replaceInstructions === true,
-            structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, prepared.manifest),
+            structuredSummary,
+            nonAuthoritativeCommentary: validation.renderedSummary,
           },
         },
       };
@@ -196,8 +216,6 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
         error: error instanceof Error ? error.message : String(error),
       });
       return;
-    } finally {
-      release();
     }
   });
 
@@ -261,6 +279,11 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
           cachedInputTokens: usage?.cacheRead,
         } : undefined,
         sourceHash: capturedSourceVerified ? reportedSourceHash : undefined,
+        rawSourceHash: capturedSourceVerified && typeof detailRecord?.rawSourceHash === "string" ? detailRecord.rawSourceHash : undefined,
+        transferSourceHash: capturedSourceVerified && typeof detailRecord?.transferSourceHash === "string" ? detailRecord.transferSourceHash : undefined,
+        redactionManifestHash: capturedSourceVerified && typeof detailRecord?.redactionManifestHash === "string" ? detailRecord.redactionManifestHash : undefined,
+        redactionPolicyVersion: capturedSourceVerified && typeof detailRecord?.redactionPolicyVersion === "string" ? detailRecord.redactionPolicyVersion : undefined,
+        policyRevision: capturedSourceVerified && typeof detailRecord?.policyRevision === "string" ? detailRecord.policyRevision : undefined,
         coverageComplete: capturedSourceVerified && sourceMessageIds.length > 0,
         validationStatus: detailRecord?.validation === "passed" || detailRecord?.validation === "repaired"
           || detailRecord?.validation === "fallback" || detailRecord?.validation === "unverified"
@@ -314,6 +337,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
     const configuredTierOneRescue = compressorModeForTier(runtime.adapter, 1) === "configured";
     const configuredHigherTierRescue = compressorModeForTier(runtime.adapter, 2) === "configured"
       || compressorModeForTier(runtime.adapter, 3) === "configured";
+    const rescueCallBudget = new CompressionCallBudget(runtime.adapter.compress);
     const rescueController = new AbortController();
     const abortRescueFromHost = () => rescueController.abort(event.signal.reason);
     event.signal.addEventListener("abort", abortRescueFromHost, { once: true });
@@ -339,7 +363,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
     }
     let tierOneRescue: TierOneRescueOutcome = "unavailable";
     if (configuredTierOneRescue && !higherTierMadeSafe && !rescueController.signal.aborted) {
-      tierOneRescue = await runTierOneRescue(runtime, ctx, { ...event, signal: rescueController.signal });
+      tierOneRescue = await runTierOneRescue(runtime, ctx, { ...event, signal: rescueController.signal }, rescueCallBudget);
       if (tierOneRescue === "aborted" && event.signal.aborted) {
         finishRescueBudget();
         return;
@@ -353,6 +377,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
       return;
     }
     const release = await runtime.acquireLock(sid);
+    let lockHeld = true;
     try {
       const { state, coreMessages } = await runtime.stateFor(ctx);
       const config = runtime.configFor(ctx);
@@ -421,7 +446,8 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
       });
       const projectedTokens = finalProjection.estimatedTokens;
       const calibration = turn.state.policyState.tokenCalibration[modelKey];
-      const changed = turn.projection.contentChanged && projectedTokens < hostTokensBefore;
+      const providerAudit = runtime.providerAuditFor(sid);
+      const changed = Boolean(providerAudit) && turn.projection.contentChanged && projectedTokens < hostTokensBefore;
       runtime.recordProjection(sid, {
         revision: state.revision,
         graphRevision: state.graphRevision,
@@ -463,14 +489,31 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
         return { cancel: true };
       }
       if (configuredCheckpoint && !rescueController.signal.aborted) {
+        const expectedRevision = state.revision;
+        const expectedGraphRevision = state.graphRevision;
+        const frozenState = structuredClone(turn.state);
+        release();
+        lockHeld = false;
         const checkpoint = await generateConfiguredCheckpoint(
           runtime,
           ctx,
           { ...event, signal: rescueController.signal },
-          turn.state,
+          frozenState,
           checkpointTransactionId,
+          rescueCallBudget,
         );
-        if (checkpoint) return { compaction: checkpoint };
+        if (checkpoint) {
+          const verifyRelease = await runtime.acquireLock(sid);
+          try {
+            const current = await runtime.stateFor(ctx);
+            if (current.state.revision === expectedRevision && current.state.graphRevision === expectedGraphRevision) {
+              return { compaction: checkpoint };
+            }
+            logWarn("compaction", { event: "configured-checkpoint-stale", sid, expectedRevision, actualRevision: current.state.revision });
+          } finally {
+            verifyRelease();
+          }
+        }
       }
       logWarn("compaction", {
         event: "host-fallback",
@@ -488,7 +531,7 @@ function wireCompactionCoordinator(pi: ExtensionAPI, runtime: AcpRuntime, freshn
       });
       return;
     } finally {
-      release();
+      if (lockHeld) release();
       finishRescueBudget();
     }
   });
@@ -526,6 +569,7 @@ async function runTierOneRescue(
   runtime: AcpRuntime,
   ctx: ExtensionContext,
   event: SessionBeforeCompactEvent,
+  callBudget: CompressionCallBudget,
 ): Promise<TierOneRescueOutcome> {
   if (event.signal.aborted) return "aborted";
   let snapshot: TierOneRescueSnapshot | undefined;
@@ -541,29 +585,33 @@ async function runTierOneRescue(
   if (!snapshot) return "unavailable";
 
   const started = Date.now();
+  const transfer = redactCompactionTransfer(snapshot.source, runtime.adapter.compress?.secretPatterns);
   try {
     const result = await compressWithModel({
       ctx,
       model: snapshot.model,
       thinkingLevel: compressionThinkingLevel(runtime.adapter),
       tier: 1,
-      source: redactCompactionSecrets(snapshot.source, runtime.adapter.compress?.secretPatterns),
+      source: transfer.source,
       prompts: runtime.prompts,
       summaryMaxChars: 40_000,
       signal: event.signal,
+      beforeCall: (inputTokens, outputTokens) => callBudget.reserveEstimated(inputTokens, outputTokens),
     });
+    callBudget.observe(result.usage);
     if (event.signal.aborted) return "aborted";
     const validation = validateAndRepairSummary({
       summary: result.summary,
-      manifest: snapshot.manifest,
+      manifest: manifestForCompiledSource(transfer.source),
       sourceTokens: snapshot.sourceTokens,
       tier: 1,
       summaryMaxChars: 40_000,
     });
     if (event.signal.aborted) return "aborted";
+    const structuredSummary = structuredSummaryFromRendered(validation.renderedSummary, snapshot.manifest);
     return commitTierOneRescue(runtime, ctx, event.signal, snapshot, {
-      summary: validation.renderedSummary,
-      structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, snapshot.manifest),
+      summary: renderAuthoritativeSummary(structuredSummary),
+      structuredSummary,
       quality: {
         status: validation.status,
         missingRequiredFacts: validation.missingRequiredFacts,
@@ -572,6 +620,13 @@ async function runTierOneRescue(
       },
       provenance: {
         requestedRoute: "configured",
+        actualWriter: "configured",
+        policyRevision: compressionPolicyRevision(runtime),
+        rawSourceHash: transfer.rawSourceHash,
+        transferSourceHash: transfer.transferSourceHash,
+        redactionManifestHash: transfer.redactionManifestHash,
+        redactionPolicyVersion: transfer.redactionPolicyVersion,
+        nonAuthoritativeCommentary: validation.renderedSummary,
         execution: "isolated-configured",
         provider: snapshot.model.provider,
         model: snapshot.model.id,
@@ -584,10 +639,15 @@ async function runTierOneRescue(
       },
     });
   } catch (error) {
+    let failure: unknown = error;
+    const failedUsage = compressionErrorUsage(error);
+    if (failedUsage) {
+      try { callBudget.observe(failedUsage); } catch (budgetError) { failure = budgetError; }
+    }
     logWarn("compaction", {
       event: "tier-one-rescue-generation-failed",
       sessionId: snapshot.sessionId,
-      error: error instanceof Error ? error.message : String(error),
+      error: failure instanceof Error ? failure.message : String(failure),
     });
     return event.signal.aborted ? "aborted" : "failed";
   }
@@ -830,6 +890,7 @@ async function generateConfiguredCheckpoint(
   event: SessionBeforeCompactEvent,
   state: CompressionState,
   checkpointTransactionId?: string,
+  sharedCallBudget?: CompressionCallBudget,
 ): Promise<{
   summary: string;
   firstKeptEntryId: string;
@@ -841,9 +902,15 @@ async function generateConfiguredCheckpoint(
     route: string;
     thinking: string;
     sourceHash: string;
+    rawSourceHash: string;
+    transferSourceHash: string;
+    redactionManifestHash: string;
+    redactionPolicyVersion: string;
+    policyRevision: string;
     sourceMessageIds: string[];
     validation: string;
     structuredSummary: ReturnType<typeof structuredSummaryFromRendered>;
+    nonAuthoritativeCommentary?: string;
     checkpointTransactionId?: string;
   };
 } | undefined> {
@@ -861,9 +928,15 @@ async function generateConfiguredCheckpoint(
       branchEntries: event.branchEntries,
       state,
     });
-    const source = redactCompactionSecrets(compiled.source, runtime.adapter.compress?.secretPatterns);
+    const transfer = redactCompactionTransfer(compiled.source, runtime.adapter.compress?.secretPatterns);
+    const source = transfer.source;
+    const localManifest = manifestForCompiledSource(compiled.source);
     const manifest = manifestForCompiledSource(source);
-    const runCheckpoint = (checkpointSource: string) => compressWithModel({
+    const callBudget = sharedCallBudget ?? new CompressionCallBudget(runtime.adapter.compress);
+    const deadline = AbortSignal.timeout(runtime.adapter.compress?.maxDurationMs ?? 60_000);
+    const generationSignal = event.signal ? AbortSignal.any([event.signal, deadline]) : deadline;
+    const runCheckpoint = (checkpointSource: string) => {
+      return compressWithModel({
       ctx,
       model,
       thinkingLevel: compressionThinkingLevel(runtime.adapter, "checkpoint"),
@@ -871,9 +944,12 @@ async function generateConfiguredCheckpoint(
       source: checkpointSource,
       prompts: runtime.prompts,
       summaryMaxChars: 40_000,
-      signal: event.signal,
-    });
+        signal: generationSignal,
+        beforeCall: (inputTokens, outputTokens) => callBudget.reserveEstimated(inputTokens, outputTokens),
+      });
+    };
     let result = await runCheckpoint(source);
+    callBudget.observe(result.usage);
     let validation: ReturnType<typeof validateAndRepairSummary> | undefined;
     let validationFailure: unknown;
     try {
@@ -894,6 +970,7 @@ async function generateConfiguredCheckpoint(
         `[Authoritative source]\n${source}`,
       ].join("\n\n"));
       result = { ...repair, usage: mergeCheckpointUsage(result.usage, repair.usage) };
+      callBudget.observe(result.usage);
       validation = validateAndRepairSummary({
         summary: result.summary,
         manifest,
@@ -902,7 +979,8 @@ async function generateConfiguredCheckpoint(
         summaryMaxChars: 40_000,
       });
     }
-    const summary = `[Hybrid ACP checkpoint]\n${validation.renderedSummary}`;
+    const structuredSummary = structuredSummaryFromRendered(validation.renderedSummary, localManifest);
+    const summary = `[Hybrid ACP checkpoint]\n${renderAuthoritativeSummary(structuredSummary)}`;
     return {
       summary,
       firstKeptEntryId: event.preparation.firstKeptEntryId,
@@ -913,10 +991,16 @@ async function generateConfiguredCheckpoint(
         source: "hybrid-acp-configured",
         route: result.model,
         thinking: result.thinking,
-        sourceHash: sha256(source),
+        sourceHash: transfer.rawSourceHash,
+        rawSourceHash: transfer.rawSourceHash,
+        transferSourceHash: transfer.transferSourceHash,
+        redactionManifestHash: transfer.redactionManifestHash,
+        redactionPolicyVersion: transfer.redactionPolicyVersion,
+        policyRevision: compressionPolicyRevision(runtime),
         sourceMessageIds: compiled.sourceMessageIds,
         validation: validation.status,
-        structuredSummary: structuredSummaryFromRendered(validation.renderedSummary, manifest),
+        structuredSummary,
+        nonAuthoritativeCommentary: validation.renderedSummary,
         checkpointTransactionId,
       },
     };
@@ -993,16 +1077,39 @@ async function reloadRuntimeConfig(runtime: AcpRuntime, baseAdapter: AdapterConf
   // than accidentally loading configuration from this process's repository.
   if (typeof ctx.cwd !== "string" || ctx.cwd.length === 0) return;
   const user = await loadUserConfig(ctx.cwd);
-  const resolved = applyUserConfig(baseAdapter, user);
+  const loaded = applyUserConfig(baseAdapter, user);
+  const sid = ctx.sessionManager?.getSessionId?.() ?? "__acp_global__";
+  const resolved = runtime.agentPolicyRunActive(sid)
+    ? applyImmediateSecurityRevocations(runtime.adapter, loaded)
+    : loaded;
   runtime.setAdapter(resolved);
   setDelegateDisplayUsage(resolveDelegate(resolved).displayUsage);
   setDebugEnabled(resolved.debug ?? false);
+  if (runtime.agentPolicyRunActive(sid)) return;
   try {
     runtime.setPrompts(resolvePrompts(resolved.prompts, { acknowledgeRisk: resolved.acknowledgePromptsRisk === true }));
   } catch (error) {
     logWarn("config", { event: "prompts-resolve-failed", error: error instanceof Error ? error.message : String(error) });
     runtime.setPrompts(defaultPrompts);
   }
+}
+
+function applyImmediateSecurityRevocations(frozen: AdapterConfig, loaded: AdapterConfig): AdapterConfig {
+  const frozenDelegate = resolveDelegate(frozen);
+  const loadedDelegate = resolveDelegate(loaded);
+  const delegate = !loadedDelegate.enabled
+    ? false
+    : frozenDelegate.enabled ? loaded.delegate : false;
+  return {
+    ...frozen,
+    delegate,
+    compress: {
+      ...frozen.compress,
+      allowCrossProvider: frozen.compress?.allowCrossProvider === true && loaded.compress?.allowCrossProvider === true,
+      acknowledgeCrossProviderDataTransfer: frozen.compress?.acknowledgeCrossProviderDataTransfer === true
+        && loaded.compress?.acknowledgeCrossProviderDataTransfer === true,
+    },
+  };
 }
 
 function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
@@ -1073,6 +1180,48 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
   });
 }
 
+async function ensureReasoningArtifacts(
+  initial: CompressionState,
+  messages: readonly CoreMessage[],
+  sessionId: string,
+  adapter: AdapterConfig,
+): Promise<CompressionState> {
+  let state = initial;
+  let currentTurnStart = messages.length;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]!.role === "user" && !messages[index]!.synthetic) { currentTurnStart = index; break; }
+  }
+  for (let index = 0; index < currentTurnStart; index++) {
+    const message = messages[index]!;
+    if (message.role !== "assistant" || message.contentType !== "reasoning"
+      || message.reasoningKind !== "plaintext-provider-agnostic" || message.reasoningSignature !== undefined
+      || message.hardProtected || !(message.text?.length)) continue;
+    const group = message.protocolGroupId ?? message.id.split("#", 1)[0]!;
+    const companionComplete = messages.some((candidate, candidateIndex) => candidateIndex > index
+      && candidateIndex < currentTurnStart
+      && (candidate.protocolGroupId ?? candidate.id.split("#", 1)[0]!) === group
+      && candidate.role === "assistant"
+      && (candidate.contentType === "text" || candidate.contentType === "tool-call"));
+    if (!companionComplete || state.artifacts.some((artifact) => artifact.sourceMessageId === message.id && artifact.retrievable)) continue;
+    try {
+      const spooled = await spoolArtifact(state, {
+        sessionId,
+        sourceMessageId: message.id,
+        toolName: "reasoning",
+        text: message.text,
+        force: true,
+        maxArtifactBytes: adapter.artifacts?.maxArtifactBytes,
+        maxSessionBytes: adapter.artifacts?.maxSessionBytes,
+        maxGlobalBytes: adapter.artifacts?.maxGlobalBytes,
+      });
+      if (spooled) state = spooled.state;
+    } catch (error) {
+      logWarn("artifact", { event: "reasoning-spool-failed-preserved-inline", sourceMessageId: message.id, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return state;
+}
+
 // The core integration: Pi's `context` event fires before every LLM call with the
 // messages about to be sent. We run acp-kernel's processTurn (prune + ref-tag +
 // nudge decision) and return the transformed AgentMessage[].
@@ -1085,23 +1234,40 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
       // revocations (transfer consent, secrets, clearing) take effect now.
       await reloadRuntimeConfig(runtime, baseAdapter, ctx);
       const { state, coreMessages, entries } = await runtime.stateFor(ctx, event.messages);
-      const workingState = structuredClone(state);
+      let workingState = structuredClone(state);
       const config = runtime.configFor(ctx);
+      if (config.clearing.reasoning === "safe-only") {
+        workingState = await ensureReasoningArtifacts(workingState, coreMessages, sid, runtime.adapter);
+      }
       const coveredIds = collectCoveredMessageIds(workingState);
       const realUsage = ctx.getContextUsage?.();
       const modelKey = modelCalibrationKey(ctx.model);
       const previousProjection = runtime.projectionFor(sid);
+      const previousAudit = runtime.providerAuditFor(sid, false);
       const previousCalibration = JSON.stringify(workingState.policyState.tokenCalibration[modelKey] ?? null);
+      const exactAuditMatch = previousProjection?.authoritative === true
+        && previousAudit !== undefined
+        && previousProjection.requestGeneration === previousAudit.requestGeneration
+        && previousProjection.payloadHash === previousAudit.payloadHash
+        && previousProjection.fixedPrefixFingerprint === previousAudit.fixedPrefixFingerprint;
       if (previousProjection
         && previousProjection.modelKey === modelKey
         && previousProjection.epoch === workingState.currentEpoch
-        && previousProjection.contextWindow === config.modelContextLimit) {
+        && previousProjection.contextWindow === config.modelContextLimit
+        && (!previousProjection.authoritative || exactAuditMatch)) {
         updateTokenCalibration(
           workingState,
           modelKey,
           previousProjection.localTokens,
           realUsage?.tokens,
           workingState.currentEpoch,
+          Date.now(),
+          exactAuditMatch ? {
+            requestGeneration: previousAudit.requestGeneration,
+            payloadHash: previousAudit.payloadHash,
+            fixedPrefixFingerprint: previousAudit.fixedPrefixFingerprint,
+            mediaVerified: previousAudit.mediaVerified,
+          } : undefined,
         );
       }
       const estimated = estimateTokens(coreMessages, coveredIds);
@@ -1282,24 +1448,127 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, freshness: 
 }
 
 function wireSystemPrompt(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
+  let worldCapture: Promise<string> | undefined;
+  const captureWorldDebounced = (cwd: string): Promise<string> => {
+    if (worldCapture) return worldCapture;
+    const started = Date.now();
+    worldCapture = captureWorldStateAsync(cwd).then(renderWorldOverlay).finally(() => {
+      logInfo("latency", { event: "world-capture", durationMs: Date.now() - started });
+      setTimeout(() => { worldCapture = undefined; }, 100).unref();
+    });
+    return worldCapture;
+  };
   pi.on("before_agent_start", async (event, ctx) => {
     await reloadRuntimeConfig(runtime, baseAdapter, ctx);
-    const delegate = runtime.adapter.delegate !== false;
+    const sid = ctx.sessionManager?.getSessionId?.() ?? "__acp_global__";
+    runtime.beginAgentPolicyRun(sid);
+    const delegate = resolveDelegate(runtime.adapter).enabled;
     const acp = buildAcpSystemPrompt(runtime.prompts, runtime.adapter);
     const prompt = delegate ? `${acp}\n${ACP_DELEGATE_PROMPT}` : acp;
     const projectOverlay = freshness.projectOverlay(event.systemPromptOptions?.contextFiles ?? [], ctx.cwd);
-    const worldOverlay = renderWorldOverlay(await captureWorldStateAsync(ctx.cwd));
+    const worldOverlay = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? await captureWorldDebounced(ctx.cwd) : "";
     freshness.queueRuntimeOverlay(projectOverlay, worldOverlay);
-    // Keep the provider prefix stable. Changed project-file contents and world
-    // state are emitted near the user tail, not in the cache-sensitive prefix.
-    return { systemPrompt: formatSystemPromptForEvent(event.systemPrompt, prompt) };
+    const authoritativeBase = freshness.patchSystemPrompt(event.systemPrompt);
+    return { systemPrompt: formatSystemPromptForEvent(authoritativeBase, prompt) };
   });
   const mutatingTools = new Set(["bash", "write", "edit", "apply_patch"]);
   pi.on("tool_result", async (event, ctx) => {
     if (!mutatingTools.has(event.toolName)) return;
+    if (event.toolName === "bash" && !bashMayMutate(event.input.command)) return;
+    const started = Date.now();
     const projectOverlay = freshness.refreshProjectOverlay();
-    const worldOverlay = renderWorldOverlay(await captureWorldStateAsync(ctx.cwd));
+    const worldOverlay = await captureWorldDebounced(ctx.cwd);
     freshness.queueRuntimeOverlay(projectOverlay, worldOverlay);
+    logInfo("latency", { event: "freshness-refresh", toolName: event.toolName, durationMs: Date.now() - started });
+  });
+  pi.on("agent_end", (_event, ctx) => {
+    runtime.endAgentPolicyRun(ctx.sessionManager?.getSessionId?.() ?? "__acp_global__");
+  });
+}
+
+function bashMayMutate(command: unknown): boolean {
+  if (typeof command !== "string" || !command.trim()) return true;
+  const normalized = command.trim().replace(/\s+/g, " ");
+  const readOnly = /^(?:pwd|ls(?: |$)|rg(?: |$)|grep(?: |$)|fd(?: |$)|find(?: |$)|cat(?: |$)|head(?: |$)|tail(?: |$)|git (?:status|diff|log|show|rev-parse|branch)(?: |$))/.test(normalized);
+  const explicitMutation = /(?:^|\s)(?:>|>>|tee|rm|mv|cp|touch|mkdir|rmdir|chmod|chown|sed\s+-i|git\s+(?:add|commit|checkout|switch|reset|restore|merge|rebase|cherry-pick|clean)|npm\s+(?:install|uninstall)|pnpm\s+(?:add|remove)|yarn\s+(?:add|remove))(?:\s|$)/.test(normalized);
+  return !readOnly || explicitMutation;
+}
+
+function wireProviderRequestAuditor(pi: ExtensionAPI, runtime: AcpRuntime, freshness: FreshnessTracker, baseAdapter: AdapterConfig): void {
+  pi.on("before_provider_request", async (event, ctx) => {
+    const sid = ctx.sessionManager.getSessionId();
+    // Freeze non-security policy for the run, but observe consent and delegate
+    // revocations before every outbound provider request.
+    await reloadRuntimeConfig(runtime, baseAdapter, ctx);
+    const patchedPayload = freshness.patchProviderPayload(event.payload);
+    const sanitized = sanitizeUnsafeProviderMedia(patchedPayload);
+    const payload = deepFreezeProviderPayload(sanitized.payload);
+    if (sanitized.droppedMedia > 0) {
+      ctx.ui.notify(`ACP omitted ${sanitized.droppedMedia} unverified media payload(s). Externalize or resend them with verified dimensions and format.`, "warning");
+      logWarn("provider-audit", { event: "unverified-media-omitted", sid, count: sanitized.droppedMedia });
+    }
+    const modelKey = modelCalibrationKey(ctx.model);
+    const audit = auditProviderPayload(payload, ctx.model?.provider);
+    const previous = runtime.providerAuditFor(sid, false);
+    const release = await runtime.acquireLock(sid);
+    try {
+      const { state } = await runtime.stateFor(ctx);
+      let persisted = state;
+      if (previous && previous.fixedPrefixFingerprint !== audit.fixedPrefixFingerprint
+        && state.policyState.tokenCalibration[modelKey] !== undefined) {
+        const next = structuredClone(state);
+        delete next.policyState.tokenCalibration[modelKey];
+        persisted = await runtime.save(next, ctx);
+        logWarn("calibration", { event: "fixed-prefix-changed", sid, modelKey });
+      }
+      runtime.beginProviderCycle(sid);
+      const recorded = runtime.recordProviderAudit(sid, {
+        ...audit,
+        modelKey,
+        contextWindow: runtime.liveContextLimit(ctx),
+      });
+      runtime.recordContextTokens(sid, audit.estimatedTokens);
+      const priorProjection = runtime.projectionFor(sid);
+      runtime.recordProjection(sid, {
+        revision: persisted.revision,
+        graphRevision: persisted.graphRevision,
+        epoch: persisted.currentEpoch,
+        modelKey,
+        contextWindow: runtime.liveContextLimit(ctx),
+        estimatedTokens: audit.estimatedTokens,
+        localTokens: audit.textTokens + audit.mediaTokens,
+        originalTokens: priorProjection?.originalTokens ?? audit.estimatedTokens,
+        tokensCleared: priorProjection?.tokensCleared ?? 0,
+        tokensPruned: priorProjection?.tokensPruned ?? 0,
+        projectionHash: audit.canonicalPayloadHash,
+        sourceMessages: priorProjection?.sourceMessages ?? 0,
+        projectedMessages: priorProjection?.projectedMessages ?? 0,
+        changed: priorProjection?.changed ?? false,
+        recordedAt: recorded.recordedAt,
+        authoritative: true,
+        requestGeneration: recorded.requestGeneration,
+        payloadHash: audit.payloadHash,
+        toolSchemaFingerprint: audit.toolSchemaFingerprint,
+        systemPromptFingerprint: audit.systemPromptFingerprint,
+        fixedPrefixFingerprint: audit.fixedPrefixFingerprint,
+        mediaTokens: audit.mediaTokens,
+        mediaVerified: audit.mediaVerified,
+      });
+      debug.event("provider-request-audit", {
+        sid,
+        tokens: audit.estimatedTokens,
+        mediaTokens: audit.mediaTokens,
+        mediaVerified: audit.mediaVerified,
+        payloadHash: audit.payloadHash,
+        fixedPrefixFingerprint: audit.fixedPrefixFingerprint,
+      });
+    } finally {
+      release();
+    }
+    return payload;
+  });
+  pi.on("tool_result", (_event, ctx) => {
+    runtime.markProviderMutation(ctx.sessionManager.getSessionId());
   });
 }
 
@@ -1363,31 +1632,26 @@ export function remainingToolBudgetText(tokenCount: number, limit: number): stri
   return `Remaining context budget until tool block: ${Math.round(remaining / 1000)}k`;
 }
 
-function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], prompts: Prompts, adapter: AdapterConfig, tokenCount: number, hardLimit: number): AgentMessage {
-  const rendered = renderNudgeText(nudge, prompts);
+function nudgeMessage(nudge: NudgeDecision, blocks: CompressionBlock[], _prompts: Prompts, adapter: AdapterConfig, tokenCount: number, hardLimit: number): AgentMessage {
   const tier = (nudge.tier ?? 1) as 1 | 2 | 3;
-  const routedText = routeCompressionNudgeText(rendered.text, adapter, tier);
-  const lines = [routedText, remainingToolBudgetText(tokenCount, hardLimit)];
-
-  if (blocks.length > 0) {
-    const totalSummary = blocks.reduce((s, b) => s + Math.ceil((b.summary || "").length / 4), 0);
-    const totalCompressed = blocks.reduce((s, b) => s + (b.compressedTokens || 0), 0);
-    const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`);
-    const tierCounts: Record<number, number> = {};
-    for (const b of blocks) {
-      const t = b.tier ?? 1;
-      tierCounts[t] = (tierCounts[t] || 0) + 1;
-    }
-    const tierStr = Object.keys(tierCounts).map(Number).sort().map((t) => `T${t}:${tierCounts[t]}`).join(" ");
-    const ids = blocks.slice(0, 10).map((b) => b.blockId).join(", ");
-    const extra = blocks.length > 10 ? ` (+${blocks.length - 10} more)` : "";
-    lines.push("");
-    lines.push(`Compressed blocks: ${blocks.length} active (${tierStr}) — ${fmt(totalSummary)} summary, ${fmt(totalCompressed)} original compressed. Blocks: ${ids}${extra}.`);
-  }
+  const writer = compressorModeForTier(adapter, tier);
+  const ranges = [...nudge.compressibleRanges]
+    .sort((left, right) => right.tokens - left.tokens)
+    .slice(0, 5)
+    .map((range) => `${range.startRef}..${range.endRef} (~${Math.round(range.tokens / 1000)}k)`);
+  const permission = writer === "configured"
+    ? "Omit summary; caller summaries are forbidden."
+    : "Call plan_compression first; then pass its transactionId and a source-backed summary.";
+  const lines = [
+    `ACP compression action: Tier ${tier}, ${writer} writer. ${permission}`,
+    ranges.length > 0 ? `Valid ranges only: ${ranges.join(", ")}.` : "No valid range is available; do not retry compression and allow host checkpointing.",
+    `Reason: ${nudge.reason ?? "context budget"}. ${remainingToolBudgetText(tokenCount, hardLimit)}.`,
+  ];
+  if (blocks.length > 0) lines.push(`Active blocks: ${blocks.slice(0, 5).map((block) => block.blockId).join(", ")}${blocks.length > 5 ? ` (+${blocks.length - 5})` : ""}.`);
 
   return {
     role: "user",
-    content: [{ type: "text", text: lines.join("\n") }],
+    content: [{ type: "text", text: lines.join("\n").slice(0, 4_000) }],
     timestamp: Date.now(),
   } as AgentMessage;
 }

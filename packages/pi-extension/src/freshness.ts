@@ -48,23 +48,62 @@ export class FreshnessTracker {
 
   invalidate(): void { this.authoritativeProjectOverlay = undefined; }
 
-  queueRuntimeOverlay(project: string | undefined, world: string): void {
-    if (project !== undefined) this.authoritativeProjectOverlay = project;
+  queueRuntimeOverlay(_project: string | undefined, world: string): void {
     const worldHash = createHash("sha256").update(world).digest("hex");
     if (worldHash !== this.lastWorldHash) this.pendingWorldOverlay = world;
     this.lastWorldHash = worldHash;
   }
 
   previewRuntimeOverlay(): string | undefined {
-    const parts = [this.authoritativeProjectOverlay, this.pendingWorldOverlay].filter((value): value is string => Boolean(value));
-    return parts.length > 0 ? parts.join("\n\n") : undefined;
+    return this.pendingWorldOverlay;
   }
 
   consumeRuntimeOverlay(): string | undefined {
     const world = this.pendingWorldOverlay;
     this.pendingWorldOverlay = undefined;
-    const parts = [this.authoritativeProjectOverlay, world].filter((value): value is string => Boolean(value));
-    return parts.length > 0 ? parts.join("\n\n") : undefined;
+    return world;
+  }
+
+  /** Replace Pi's exact stale context-file segments at system priority. */
+  patchSystemPrompt(systemPrompt: string): string {
+    let prompt = systemPrompt;
+    const injections: string[] = [];
+    const currentByPath = new Map(this.currentProjectFiles.map((file) => [file.path, file]));
+    for (const host of this.hostProjectFiles) {
+      const current = currentByPath.get(host.path);
+      const replacement = current?.deleted
+        ? renderProjectDeletion(host.path)
+        : renderProjectInstruction(host.path, current?.content ?? host.content);
+      const expression = new RegExp(`<project_instructions\\s+path=["']${escapeRegExp(host.path)}["'][^>]*>[\\s\\S]*?<\\/project_instructions>`, "g");
+      let placed = false;
+      prompt = prompt.replace(expression, () => {
+        if (placed) return "";
+        placed = true;
+        return replacement;
+      });
+      if (!placed) injections.push(replacement);
+    }
+    const hostPaths = new Set(this.hostProjectFiles.map((file) => file.path));
+    injections.push(...this.currentProjectFiles
+      .filter((file) => !file.deleted && !hostPaths.has(file.path))
+      .map((file) => renderProjectInstruction(file.path, file.content)));
+    if (injections.length > 0) {
+      const marker = "</project_context>";
+      const body = `${injections.join("\n\n")}\n\n`;
+      prompt = prompt.includes(marker)
+        ? prompt.replace(marker, `${body}${marker}`)
+        : `${prompt}\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n${body}</project_context>`;
+    }
+    return prompt;
+  }
+
+  /** Patch provider-specific payload strings that still contain Pi's system prompt. */
+  patchProviderPayload(payload: unknown): unknown {
+    return mapProviderSystemStrings(payload, (value) => {
+      const carriesSystemContext = value.includes("<project_context>")
+        || this.hostProjectFiles.some((file) => value.includes(`<project_instructions path=\"${file.path}\"`));
+      return carriesSystemContext ? this.patchSystemPrompt(value) : value;
+    });
   }
 
   branchProjectContext(): string | undefined {
@@ -136,6 +175,60 @@ export function renderWorldOverlay(state: WorldState): string {
 
 export function contextFilesFrom(ctx: ExtensionContext, files: ProjectContextFile[] | undefined): ProjectContextFile[] {
   return files ?? [];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function renderProjectInstruction(path: string, content: string): string {
+  return `<project_instructions path="${path}">\n${content}\n</project_instructions>`;
+}
+
+function renderProjectDeletion(path: string): string {
+  return `<project_instructions path="${path}" deleted="true">\nThis instruction file was deleted on disk. Ignore all stale content from it.\n</project_instructions>`;
+}
+
+type ProviderPayloadPosition = "root" | "system" | "message-list" | "message" | "other";
+
+function mapProviderSystemStrings(
+  value: unknown,
+  transform: (value: string) => string,
+  position: ProviderPayloadPosition = "root",
+  seen = new WeakMap<object, unknown>(),
+): unknown {
+  if (typeof value === "string") return position === "system" ? transform(value) : value;
+  if (!value || typeof value !== "object") return value;
+  const object = value as object;
+  const cached = seen.get(object);
+  if (cached !== undefined) return cached;
+  if (Array.isArray(value)) {
+    const output: unknown[] = [];
+    seen.set(object, output);
+    const itemPosition = position === "message-list" ? "message" : position;
+    for (const item of value) output.push(mapProviderSystemStrings(item, transform, itemPosition, seen));
+    return output;
+  }
+  const record = value as Record<string, unknown>;
+  const role = typeof record.role === "string" ? record.role.toLowerCase() : "";
+  const systemMessage = position === "message" && (role === "system" || role === "developer");
+  const output: Record<string, unknown> = {};
+  seen.set(object, output);
+  for (const [key, item] of Object.entries(record)) {
+    const normalized = key.toLowerCase();
+    const rootSystemField = position === "root" && [
+      "system", "systemprompt", "system_prompt", "systeminstruction", "system_instruction", "instructions", "developer",
+    ].includes(normalized);
+    const rootEnvelope = position === "root" && ["request", "body", "payload"].includes(normalized);
+    const rootMessageList = position === "root" && ["messages", "input"].includes(normalized);
+    const messageContent = systemMessage && ["content", "text", "input_text", "value"].includes(normalized);
+    const structuredSystemText = position === "system" && ["content", "text", "input_text", "value", "parts"].includes(normalized);
+    const childPosition: ProviderPayloadPosition = rootSystemField || messageContent || structuredSystemText
+      ? "system"
+      : rootEnvelope ? "root" : rootMessageList ? "message-list" : "other";
+    output[key] = mapProviderSystemStrings(item, transform, childPosition, seen);
+  }
+  return output;
 }
 
 function currentProjectFile(file: ProjectContextFile, existedAtBaseline: boolean): ProjectContextFile {

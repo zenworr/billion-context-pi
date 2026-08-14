@@ -25,20 +25,53 @@ export interface UserAcpConfig {
   displayUsage?: "merged" | "separate";
   prompts?: Partial<Prompts>;
   acknowledgePromptsRisk?: boolean;
+  /** Internal origin-aware safety result; never read from JSON. */
+  projectTransferPolicyValid?: boolean;
+  projectAllowCrossProvider?: boolean;
+  projectAcknowledgeCrossProviderDataTransfer?: boolean;
+}
+
+const configFileCache = new Map<string, { identity: string; value: unknown }>();
+
+async function readCachedConfig(file: string): Promise<unknown> {
+  const before = await fs.stat(file);
+  const identity = `${before.dev}:${before.ino}:${before.size}:${before.mtimeMs}:${before.ctimeMs}`;
+  const cached = configFileCache.get(file);
+  if (cached?.identity === identity) return structuredClone(cached.value);
+  const raw = await fs.readFile(file, "utf8");
+  const after = await fs.stat(file);
+  const afterIdentity = `${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}`;
+  if (identity !== afterIdentity) return readCachedConfig(file);
+  const value = JSON.parse(raw) as unknown;
+  configFileCache.set(file, { identity, value: structuredClone(value) });
+  while (configFileCache.size > 64) configFileCache.delete(configFileCache.keys().next().value!);
+  return value;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
- *  error (missing file, bad JSON) — never throws. */
+ *  error (missing file, bad JSON) — never throws. File identity caching removes
+ *  repeated parse I/O while preserving immediate mtime/identity revocations. */
 export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
   const home = homedir();
   const merged: UserAcpConfig = {};
-  for (const base of [join(home, CONFIG_DIR_NAME), join(cwd, CONFIG_DIR_NAME)]) {
+  const bases = [join(home, CONFIG_DIR_NAME), join(cwd, CONFIG_DIR_NAME)];
+  for (let sourceIndex = 0; sourceIndex < bases.length; sourceIndex++) {
+    const base = bases[sourceIndex]!;
+    const projectSource = sourceIndex === 1;
     const file = join(base, "acp.json");
     try {
-      const raw = await fs.readFile(file, "utf8");
-      const parsed = JSON.parse(raw);
+      const parsed = await readCachedConfig(file);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const candidate = parsed as Record<string, unknown>;
+        if (projectSource) {
+          const rawCompress = candidate.compress;
+          const object = rawCompress && typeof rawCompress === "object" && !Array.isArray(rawCompress)
+            ? rawCompress as Record<string, unknown>
+            : undefined;
+          const allow = object?.allowCrossProvider;
+          const acknowledge = object?.acknowledgeCrossProviderDataTransfer;
+          setProjectTransferPolicy(merged, allow, acknowledge);
+        }
         for (const diagnostic of configDiagnostics(candidate)) {
           logWarn("config", { event: "invalid-value", file, path: diagnostic.path, reason: diagnostic.reason });
         }
@@ -72,10 +105,24 @@ export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
       }
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
+      if (projectSource) setProjectTransferPolicyValidity(merged, false);
       if (code !== "ENOENT") {
         logWarn("config", { event: "load-failed", file, error: e instanceof Error ? e.message : String(e) });
       }
     }
+  }
+  if (merged.projectTransferPolicyValid !== true) {
+    if (merged.compress?.allowCrossProvider === true || merged.compress?.acknowledgeCrossProviderDataTransfer === true) {
+      logWarn("config", { event: "cross-provider-disabled", reason: "Project transfer policy is missing, unreadable, malformed, or incomplete." });
+    }
+  } else {
+    // Security booleans are independent from all sibling validation. An
+    // invalid threshold or model field cannot erase an explicit project deny.
+    merged.compress = {
+      ...merged.compress,
+      allowCrossProvider: merged.projectAllowCrossProvider!,
+      acknowledgeCrossProviderDataTransfer: merged.projectAcknowledgeCrossProviderDataTransfer!,
+    };
   }
   return merged;
 }
@@ -121,6 +168,11 @@ function validCompressConfig(value: unknown): CompressConfig | undefined {
     if (percentRatio(item) !== undefined) out[key] = item as number | string;
   }
   if (typeof input.nudgeGrowthTokens === "number" && Number.isSafeInteger(input.nudgeGrowthTokens) && input.nudgeGrowthTokens >= 0) out.nudgeGrowthTokens = input.nudgeGrowthTokens;
+  for (const key of ["maxRangesPerCall", "maxModelCalls", "maxInputTokens", "maxOutputTokens", "maxDurationMs", "minimumNetSavingsTokens"] as const) {
+    if (typeof input[key] === "number" && Number.isSafeInteger(input[key]) && input[key] > 0) out[key] = input[key];
+  }
+  if (typeof input.maxCostUsd === "number" && Number.isFinite(input.maxCostUsd) && input.maxCostUsd > 0) out.maxCostUsd = input.maxCostUsd;
+  if (typeof input.minimumNetSavingsPercent === "number" && Number.isFinite(input.minimumNetSavingsPercent) && input.minimumNetSavingsPercent > 0 && input.minimumNetSavingsPercent < 1) out.minimumNetSavingsPercent = input.minimumNetSavingsPercent;
   if (typeof input.model === "string" && /^[^/\s]+\/.+/.test(input.model)) out.model = input.model;
   const thinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   for (const key of ["thinkingLevel", "tier2ThinkingLevel", "tier3ThinkingLevel", "checkpointThinkingLevel", "branchThinkingLevel"] as const) {
@@ -167,13 +219,31 @@ const CONFIG_KEYS = new Set([
 const NESTED_KEYS: Record<string, readonly string[]> = {
   delegate: ["enabled", "displayUsage"],
   clearing: ["enabled", "keepRecentToolUses", "clearAtLeastTokens", "excludeTools", "reasoning"],
-  compress: ["maxContextLimit", "emergencyThresholdPercent", "nudgeGrowthTokens", "model", "thinkingLevel", "tier2ThinkingLevel", "tier3ThinkingLevel", "checkpointThinkingLevel", "branchThinkingLevel", "tier1Compressor", "tier2Compressor", "tier3Compressor", "checkpointCompressor", "branchSummaryCompressor", "allowCrossProvider", "acknowledgeCrossProviderDataTransfer", "secretPatterns"],
+  compress: ["maxContextLimit", "emergencyThresholdPercent", "nudgeGrowthTokens", "model", "thinkingLevel", "tier2ThinkingLevel", "tier3ThinkingLevel", "checkpointThinkingLevel", "branchThinkingLevel", "tier1Compressor", "tier2Compressor", "tier3Compressor", "checkpointCompressor", "branchSummaryCompressor", "allowCrossProvider", "acknowledgeCrossProviderDataTransfer", "secretPatterns", "maxRangesPerCall", "maxModelCalls", "maxInputTokens", "maxOutputTokens", "maxDurationMs", "maxCostUsd", "minimumNetSavingsTokens", "minimumNetSavingsPercent"],
   budget: ["targetActiveTokens", "targetContextPercent", "hardContextPercent", "emergencyContextPercent", "outputReserveTokens", "safetyMarginTokens"],
   memory: ["mode", "projectDirectory", "automaticPromotion"],
   artifacts: ["maxArtifactBytes", "maxSessionBytes", "maxGlobalBytes", "lifecycle"],
   optimization: ["automaticDistillation", "shadowCompaction", "telemetry", "costAwareRouting", "qualityAdaptation", "minimumBlocks", "minimumSourceTokens", "minimumSurvivalTurns", "maxReplans", "fallbackAfterFailures", "maxAdaptiveThinking"],
   prompts: ["compressPhilosophy", "howToCompressRules", "tier2DistillRules", "tier3CondenseRules"],
 };
+
+function setProjectTransferPolicy(config: UserAcpConfig, allow: unknown, acknowledge: unknown): void {
+  setInternalConfigValue(config, "projectTransferPolicyValid", typeof allow === "boolean" && typeof acknowledge === "boolean");
+  setInternalConfigValue(config, "projectAllowCrossProvider", typeof allow === "boolean" ? allow : undefined);
+  setInternalConfigValue(config, "projectAcknowledgeCrossProviderDataTransfer", typeof acknowledge === "boolean" ? acknowledge : undefined);
+}
+
+function setProjectTransferPolicyValidity(config: UserAcpConfig, valid: boolean): void {
+  setInternalConfigValue(config, "projectTransferPolicyValid", valid);
+  if (!valid) {
+    setInternalConfigValue(config, "projectAllowCrossProvider", undefined);
+    setInternalConfigValue(config, "projectAcknowledgeCrossProviderDataTransfer", undefined);
+  }
+}
+
+function setInternalConfigValue<K extends keyof UserAcpConfig>(config: UserAcpConfig, key: K, value: UserAcpConfig[K]): void {
+  Object.defineProperty(config, key, { value, enumerable: false, configurable: true, writable: true });
+}
 
 function configDiagnostics(parsed: Record<string, unknown>): ConfigDiagnostic[] {
   const diagnostics: ConfigDiagnostic[] = [];
@@ -273,6 +343,13 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
     ...validCompressConfig(adapter.compress),
     ...validCompressConfig(user.compress),
   }) ?? validCompressConfig(adapter.compress) ?? {};
+  if (user.projectTransferPolicyValid === true) {
+    compress.allowCrossProvider = user.projectAllowCrossProvider === true;
+    compress.acknowledgeCrossProviderDataTransfer = user.projectAcknowledgeCrossProviderDataTransfer === true;
+  } else if (user.projectTransferPolicyValid === false) {
+    compress.allowCrossProvider = false;
+    compress.acknowledgeCrossProviderDataTransfer = false;
+  }
   const optimization = {
     ...validOptimizationConfig(adapter.optimization),
     ...validOptimizationConfig(user.optimization),

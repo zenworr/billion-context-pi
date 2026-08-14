@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createAcpExtension, routeCompressionNudgeText } from "../src/index.js";
+import { executeCompressionWithPlan } from "./planned-compression.js";
+import { readStoredStateSnapshot } from "../src/state.js";
 
 const USAGE = {
   input: 100,
@@ -172,7 +174,7 @@ async function setup(
   assert.ok(thirdRef);
   const compress = captured.tools.find((tool) => tool.name === "compress");
   assert.ok(compress);
-  return { dir, sessionFile, ctx, notifications, compress, commands: captured.commands, firstRef, secondRef, thirdRef, entries, contextHandler };
+  return { dir, sessionFile, ctx, notifications, compress, tools: captured.tools, commands: captured.commands, firstRef, secondRef, thirdRef, entries, contextHandler };
 }
 
 test("compression nudge examples follow per-tier writer routing", () => {
@@ -255,9 +257,10 @@ test("configured Tier-1 compressor generates and anchors the summary", async (t)
   assert.match(result.content[0]!.text, /Generated summary for b1/);
   assert.match(result.content[0]!.text, /src\/telemetry\.ts/);
   assert.deepEqual(result.usage, USAGE);
-  const state = JSON.parse(await readFile(`${fixture.sessionFile}.acp.json`, "utf8"));
-  assert.match(state.blocks[0].summary, /^The source established port 4317 and required preserving src\/telemetry\.ts as a durable implementation constraint\./);
-  assert.match(state.blocks[0].summary, /Retained exact facts:\n- src\/telemetry\.ts\./);
+  const state = await readStoredStateSnapshot(`${fixture.sessionFile}.acp.json`);
+  assert.match(state.blocks[0].summary, /<acp-authoritative-summary>/);
+  assert.match(state.blocks[0].summary, /src\/telemetry\.ts/);
+  assert.match(state.blocks[0].provenance?.nonAuthoritativeCommentary ?? "", /The source established port 4317/);
 
   fixture.entries.push(
     {
@@ -296,8 +299,9 @@ test("configured Tier-1 compressor generates and anchors the summary", async (t)
     fixture.ctx,
   );
   const serializedTurn = JSON.stringify(nextTurn);
-  assert.match(serializedTurn, /The source established port 4317/);
-  assert.equal(serializedTurn.match(/The source established port 4317/g)?.length, 1, "first-class checkpoint is the sole provider-facing summary");
+  assert.match(serializedTurn, /<acp-authoritative-summary>/);
+  assert.match(serializedTurn, /src\/telemetry\.ts/);
+  assert.doesNotMatch(serializedTurn, /The source established port 4317/, "model commentary is not authoritative provider history");
   assert.doesNotMatch(serializedTurn, /summary materialized in the paired protected compress call/);
   assert.doesNotMatch(serializedTurn, /Generated summary for b1/);
   assert.doesNotMatch(serializedTurn, /durable decision is to use port 4317/);
@@ -308,7 +312,7 @@ test("configured batch previews collective minimum before paying for summaries",
   const fixture = await setup(async () => {
     calls++;
     return {
-      content: [{ type: "text", text: `Generated batch summary ${calls} preserves the selected range's durable facts without inventing context.` }],
+      content: [{ type: "text", text: "The selected source preserves its durable facts and implementation constraints without inventing context." }],
       usage: USAGE,
     };
   }, 18_000);
@@ -344,20 +348,12 @@ test("mixed-tier batch validates all main-model summaries before configured call
   t.after(() => rm(fixture.dir, { recursive: true, force: true }));
 
   const signal = new AbortController().signal;
-  await fixture.compress.execute(
-    "preflight-child-one",
-    { content: [{ startId: fixture.firstRef, endId: fixture.firstRef, summary: "First child summary preserves the durable telemetry implementation decision and exact constraints." }] },
-    signal,
-    undefined,
-    fixture.ctx,
-  );
-  await fixture.compress.execute(
-    "preflight-child-two",
-    { content: [{ startId: fixture.secondRef, endId: fixture.secondRef, summary: "Second child summary preserves the later implementation outcome and exact constraints." }] },
-    signal,
-    undefined,
-    fixture.ctx,
-  );
+  await executeCompressionWithPlan(fixture.tools, fixture.ctx, "preflight-child-one", {
+    content: [{ startId: fixture.firstRef, endId: fixture.firstRef, summary: "First child summary preserves the durable telemetry implementation decision and exact constraints." }],
+  }, signal);
+  await executeCompressionWithPlan(fixture.tools, fixture.ctx, "preflight-child-two", {
+    content: [{ startId: fixture.secondRef, endId: fixture.secondRef, summary: "Second child summary preserves the later implementation outcome and exact constraints." }],
+  }, signal);
 
   const result = await fixture.compress.execute(
     "mixed-tier-preflight",
@@ -381,24 +377,16 @@ test("higher-tier compressor rejects raw message gaps between child summaries", 
       content: [{ type: "text", text: "Tier-2 summary preserves both child decisions and the raw message that sat between their source ranges." }],
       usage: USAGE,
     };
-  });
+  }, 5_000, { tier1: "main", tier2: "configured" });
   t.after(() => rm(fixture.dir, { recursive: true, force: true }));
 
   const signal = new AbortController().signal;
-  await fixture.compress.execute(
-    "first-child",
-    { content: [{ startId: fixture.firstRef, endId: fixture.firstRef, summary: "First child summary preserves the durable telemetry implementation decision and its exact file constraint." }] },
-    signal,
-    undefined,
-    fixture.ctx,
-  );
-  await fixture.compress.execute(
-    "second-child",
-    { content: [{ startId: fixture.secondRef, endId: fixture.secondRef, summary: "Second child summary preserves the later implementation outcome represented by the second source range." }] },
-    signal,
-    undefined,
-    fixture.ctx,
-  );
+  await executeCompressionWithPlan(fixture.tools, fixture.ctx, "first-child", {
+    content: [{ startId: fixture.firstRef, endId: fixture.firstRef, summary: "First child summary preserves the durable telemetry implementation decision and its exact file constraint." }],
+  }, signal);
+  await executeCompressionWithPlan(fixture.tools, fixture.ctx, "second-child", {
+    content: [{ startId: fixture.secondRef, endId: fixture.secondRef, summary: "Second child summary preserves the later implementation outcome represented by the second source range." }],
+  }, signal);
   const result = await fixture.compress.execute(
     "tier-two",
     { content: [{ startId: "b1", endId: "b2" }] },
@@ -441,9 +429,11 @@ test("tier promotion refuses to absorb raw gaps and leaves child anchors active"
     fixture.ctx,
   );
   const serializedTurn = JSON.stringify(nextTurn);
-  assert.match(serializedTurn, /CHILD_ALPHA/);
-  assert.match(serializedTurn, /CHILD_BETA/);
-  assert.doesNotMatch(serializedTurn, /PARENT_DISTILLED/);
+  assert.doesNotMatch(serializedTurn, /CHILD_ALPHA|CHILD_BETA|PARENT_DISTILLED/, "model commentary remains audit-only");
+  assert.ok((serializedTurn.match(/<acp-authoritative-summary>/g)?.length ?? 0) >= 2, "both child anchors remain active");
+  const stored = await readStoredStateSnapshot(`${fixture.sessionFile}.acp.json`);
+  assert.match(stored.blocks[0]?.provenance?.nonAuthoritativeCommentary ?? "", /CHILD_ALPHA/);
+  assert.match(stored.blocks[1]?.provenance?.nonAuthoritativeCommentary ?? "", /CHILD_BETA/);
 });
 
 test("partial configured response is rejected, billed, and safely falls back", async (t) => {

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { createAcpExtension } from "../src/index.js";
+import { compressionToolWithPlanning } from "./planned-compression.js";
 
 function captureApi() {
   const handlers = new Map<string, ((event: any, ctx: any) => any)[]>();
@@ -51,7 +52,7 @@ function fakeCtx(entries: any[], stateFile: string, notifies: string[]) {
 // (append semantics: the block stays folded, content shown via notify).
 test("/acp-decompress returns a block's content and stays repeatable (append mode)", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
 
   const stateFile = "/tmp/pai-acp-decompress-it.session.json";
   await cleanState(stateFile);
@@ -74,7 +75,7 @@ test("/acp-decompress returns a block's content and stays repeatable (append mod
   await handlers.get("context")![0]!({ type: "context", messages: [] }, ctx);
 
   // 2) Compress the target message (m00001) to create an active block (b1).
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   const compressRes = await compressTool.execute(
     "tc1",
     { content: [{ startId: "m00002", endId: "m00002", summary: "This range contained a detailed user message discussing the initial context for the session." }] },
@@ -100,7 +101,7 @@ test("/acp-decompress returns a block's content and stays repeatable (append mod
 
 test("/acp-decompress rejects invalid input with a usage message", async () => {
   const { api } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
 
   const notifies: string[] = [];
   const ctx = fakeCtx([], "/tmp/pai-acp-decompress-invalid.session.json", notifies);
@@ -119,7 +120,7 @@ test("/acp-decompress rejects invalid input with a usage message", async () => {
 
 test("/acp-decompress reports not-found for a valid id with no matching block", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
 
   const notifies: string[] = [];
   const ctx = fakeCtx([userMsg("e1", "only message")], "/tmp/pai-acp-decompress-nf.session.json", notifies);

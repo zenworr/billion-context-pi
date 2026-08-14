@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { resolveSafeOutputPathReal, writePrivateFile } from "./artifact-store.js";
 import { tmpdir, homedir } from "node:os";
 import { recordRecentRetrievals } from "./retrieval-tracking.js";
+import { parsePublicAcpRef, publicAcpRef } from "./public-refs.js";
 
 /** Directory for auto-generated decompress output files. */
 const AUTO_DIR = join(homedir() || tmpdir(), ".cache", "pi", "acp-decompress");
@@ -48,12 +49,14 @@ export function makeDecompressTool(runtime: AcpRuntime): ToolDefinition<typeof D
       let result: string;
       try {
         result = await handleDecompress(params as DecompressArgs, runtime, ctx);
-        if (!result.startsWith("Error:")) await recordRecentRetrievals(runtime, ctx, [(params as DecompressArgs).blockId]);
+        const parsed = parsePublicAcpRef((params as DecompressArgs).blockId);
+        if (!result.startsWith("Error:")) await recordRecentRetrievals(runtime, ctx, [parsed.rawRef]);
       } catch (e) {
         logThrow("decompress", e, { sid: ctx.sessionManager.getSessionId(), blockId: (params as DecompressArgs).blockId });
         throw e;
       }
-      return { details: undefined, content: [{ type: "text", text: result }] };
+      const parsed = parsePublicAcpRef((params as DecompressArgs).blockId);
+      return { details: { version: 1, requestedRef: (params as DecompressArgs).blockId, rawRef: parsed.rawRef, canonicalRef: parsed.kind ? publicAcpRef(parsed.kind, parsed.rawRef) : undefined }, content: [{ type: "text", text: result }] };
     },
   };
 }
@@ -173,7 +176,8 @@ async function handleMessageRef(
 
 async function handleDecompress(args: DecompressArgs, runtime: AcpRuntime, ctx: ExtensionContext): Promise<string> {
   const { state, coreMessages } = await runtime.stateFor(ctx);
-  const arg = args.blockId.trim();
+  const parsed = parsePublicAcpRef(args.blockId.trim());
+  const arg = parsed.rawRef;
 
   const checkpoint = state.checkpoints.find((item) => item.id === arg);
   if (checkpoint) {

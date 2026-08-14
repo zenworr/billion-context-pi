@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { createAcpExtension } from "../src/index.js";
+import { compressionToolWithPlanning } from "./planned-compression.js";
 
 function captureApi() {
   const handlers = new Map<string, ((event: any, ctx: any) => any)[]>();
@@ -75,7 +76,7 @@ test("checkpoint-owned messages are directly retrievable by exact projected id",
   state.nextCheckpointId = 2;
   await writeFile(`${stateFile}.acp.json`, JSON.stringify(state), "utf8");
   const { api } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
   const ctx = fakeCtx([entry], stateFile) as any;
   ctx.sessionManager.getEntries = () => [entry];
   ctx.sessionManager.getEntry = (id: string) => id === entry.id ? entry : undefined;
@@ -89,7 +90,7 @@ test("checkpoint-owned messages are directly retrievable by exact projected id",
 // handles + ctx so each test can drive the decompress tool.
 async function setupWithCompressedBlock() {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
 
   const stateFile = "/tmp/pai-acp-decompress-tool-it.session.json";
   await cleanState(stateFile);
@@ -106,7 +107,7 @@ async function setupWithCompressedBlock() {
 
   await handlers.get("context")![0]!({ type: "context", messages: [] }, ctx);
 
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   await compressTool.execute(
     "tc1",
     { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message for the decompress-tool tests." }] },
@@ -176,7 +177,7 @@ test("decompress keeps the block active after a file-mode call", async () => {
 
 test("decompress restores a block's original text via getEntry fallback after tree navigation (undo)", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000, compress: { tier1Compressor: "main" } })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-undo.session.json";
   await cleanState(stateFile);
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
@@ -192,7 +193,7 @@ test("decompress restores a block's original text via getEntry fallback after tr
   // Compress phase: everything is on the active branch (e1 → block b1).
   const compressCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, compressCtx);
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   await compressTool.execute(
     "tc1",
     { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message for the decompress-tool tests." }] },
@@ -213,7 +214,7 @@ test("decompress restores a block's original text via getEntry fallback after tr
 
 test("decompress keeps the degraded message when the ref is gone from both branch and full tree", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-gone.session.json";
   await cleanState(stateFile);
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
@@ -228,7 +229,7 @@ test("decompress keeps the degraded message when the ref is gone from both branc
 
   const compressCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, compressCtx);
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   await compressTool.execute("tc1", { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message that needs restoration after navigation." }] }, undefined, undefined, compressCtx);
 
   // e1 vanished from the full tree entirely: getEntry → undefined AND the
@@ -243,7 +244,7 @@ test("decompress keeps the degraded message when the ref is gone from both branc
 
 test("decompress restores multi tool-call assistant messages (refs carry # suffix) after undo", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000, compress: { tier1Compressor: "main" } })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-tools.session.json";
   await cleanState(stateFile);
   const filler = (n: string) => `filler ${n} `.repeat(400);
@@ -269,7 +270,7 @@ test("decompress restores multi tool-call assistant messages (refs carry # suffi
 
   const compressCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, compressCtx);
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   // The multi tool-call assistant projects to two CoreMessages (e1#call-1,
   // e1#call-2), each with its own ref (m00001, m00002).
   await compressTool.execute(
@@ -291,7 +292,7 @@ test("decompress restores multi tool-call assistant messages (refs carry # suffi
 
 test("decompress survives repeated compress → navigate → decompress cycles (state not lost)", async () => {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, decompressInlineMaxChars: 20_000, compress: { tier1Compressor: "main" } })(api as any);
   const stateFile = "/tmp/pai-acp-decompress-fallback-cycles.session.json";
   await cleanState(stateFile);
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
@@ -304,7 +305,7 @@ test("decompress survives repeated compress → navigate → decompress cycles (
     userMsg("e6", filler("six")), userMsg("e7", filler("seven")),
   ];
 
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   const decompressTool = api.tools.find((t: any) => t.name === "decompress")!;
 
   // Cycle 1: compress e1 → navigate away → decompress (fallback restores).

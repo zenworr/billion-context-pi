@@ -53,6 +53,27 @@ test("calibration uses two consistent anchored deltas and fixed overhead", () =>
   assert.equal(calibratedTokenEstimate(40_000, state, key), 62_000);
 });
 
+test("calibration is bound to provider request identity and verified media", () => {
+  const state = createInitialState("calibration-identity");
+  const key = "openai/model";
+  const identity = (requestGeneration: number, fixedPrefixFingerprint = "prefix-a", mediaVerified = true) => ({
+    requestGeneration,
+    payloadHash: `payload-${requestGeneration}`,
+    fixedPrefixFingerprint,
+    mediaVerified,
+  });
+  updateTokenCalibration(state, key, 10_000, 17_000, 0, 1, identity(1));
+  const candidate = updateTokenCalibration(state, key, 20_000, 32_000, 0, 2, identity(2))!;
+  assert.equal(candidate.candidateSamples, 1);
+  const duplicate = updateTokenCalibration(state, key, 20_000, 32_000, 0, 3, identity(2))!;
+  assert.deepEqual(duplicate, candidate, "duplicate usage for one request is idempotent");
+  const reset = updateTokenCalibration(state, key, 30_000, 47_000, 0, 4, identity(3, "prefix-b"))!;
+  assert.equal(reset.samples, 0);
+  assert.equal(reset.anchorFixedPrefixFingerprint, "prefix-b");
+  const unverified = updateTokenCalibration(state, key, 40_000, 62_000, 0, 5, identity(4, "prefix-b", false))!;
+  assert.equal(unverified.verified, false, "unverified media cannot establish a trusted density sample");
+});
+
 test("calibration resets across checkpoint epochs and rejects mismatched counters", () => {
   const state = createInitialState("calibration-reset");
   const key = "openai/model";

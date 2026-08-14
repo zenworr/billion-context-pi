@@ -14,6 +14,11 @@ export interface CommitCheckpointInput {
   model?: string;
   provenance?: CheckpointRecord["provenance"];
   sourceHash?: string;
+  rawSourceHash?: string;
+  transferSourceHash?: string;
+  redactionManifestHash?: string;
+  redactionPolicyVersion?: string;
+  policyRevision?: string;
   coverageComplete?: boolean;
   validationStatus?: CheckpointRecord["validationStatus"];
   createdAt?: number;
@@ -53,6 +58,11 @@ export function commitCheckpointEpoch(state: CompressionState, input: CommitChec
     model: input.model,
     provenance: input.provenance,
     sourceHash: input.sourceHash,
+    rawSourceHash: input.rawSourceHash,
+    transferSourceHash: input.transferSourceHash,
+    redactionManifestHash: input.redactionManifestHash,
+    redactionPolicyVersion: input.redactionPolicyVersion,
+    policyRevision: input.policyRevision,
     coverageVersion: 1,
     coverageComplete: input.coverageComplete ?? false,
     validationStatus: input.validationStatus,

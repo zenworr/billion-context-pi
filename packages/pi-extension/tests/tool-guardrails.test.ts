@@ -94,13 +94,13 @@ test("capToolOutput mentions the saved full-output path for bash-style results",
   assert.match(t, /\/tmp\/acp-full\.log/);
 });
 
-test("capToolOutput preserves non-text (image) content alongside truncated text", () => {
+test("capToolOutput counts and removes non-text content from bounded inline output", () => {
   const img = { type: "image", source: { media_type: "image/png", data: "AAAA" } } as Content[number];
   const content: Content = [{ type: "text", text: "x".repeat(10_000) }, img];
   const out = capToolOutput(content, 500);
   assert.ok(out);
-  assert.equal(out!.some((c) => c.type === "image"), true, "image part must survive");
-  assert.equal(out!.some((c) => c.type === "text"), true, "truncated text part must be present");
+  assert.equal(out!.some((c) => c.type === "image"), false, "durably spooled non-text must not bypass the inline budget");
+  assert.equal(out!.some((c) => c.type === "text"), true, "bounded text and retrieval notice must be present");
 });
 
 test("capToolOutput is UTF-8 safe (never splits a multibyte sequence)", () => {

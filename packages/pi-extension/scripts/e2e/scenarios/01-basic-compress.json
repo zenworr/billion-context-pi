@@ -28,6 +28,6 @@
         "blockCount": 1,
         "activeBlockCount": 1,
         "minCompressedCount": 1,
-        "summaryContains": "src/auth/jwt.ts:78"
+        "summaryContains": "src/auth/jwt.ts"
     }
 }

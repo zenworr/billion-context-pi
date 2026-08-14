@@ -76,10 +76,13 @@ This has two practical implications:
 
 | Tool | What it does |
 |------|-------------|
-| `compress` | Replace a contiguous message range with a detailed summary |
-| `decompress` | Restore a previously compressed block's content |
-| `search_context` | Search compressed block summaries (and visible messages) by keyword |
-| `acp_status` | Show context usage, compressed blocks, compressible ranges |
+| `plan_compression` | Freeze exact normalized sources for a one-use main-writer transaction |
+| `compress` | Commit a frozen main-writer summary or invoke the configured writer |
+| `decompress` | Restore a previously compressed block or checkpoint source |
+| `search_context` | Search compressed history and return stable `acp:<kind>:<id>` refs |
+| `pin_context` | Temporarily retain a stable message, block, checkpoint, or artifact ref |
+| `acp_artifact` | Retrieve a bounded slice or private file for durable cleared output |
+| `acp_status` | Show context usage, compressed blocks, and exact valid ranges |
 | `acp_delegate` | Spawn a clean-context sub-agent for a task (review / research / implement / plan / advise) |
 | `acp_delegate_wait` | Block until a delegate run finishes (returns its result; times out otherwise) |
 | `acp_delegate_cancel` | Cancel a running delegate by runId |
@@ -135,9 +138,9 @@ Blocks: 3 active (3.7K summary, 15.2K original compressed)
 
 ## Compression model commands
 
-`/acp-model` selects an authenticated model that can write compression summaries. `/acp-settings` configures its thinking level and independently routes Tier 1, Tier 2, and Tier 3 to either the main model (default) or the configured model. Choices are saved globally in `~/.pi/acp.json`.
+`/acp-model` selects an authenticated model that can write compression summaries. `/acp-settings` configures its thinking level and independently routes Tier 1, Tier 2, and Tier 3 to either the main model (default) or the configured model. Choices are saved in project-local `.pi/acp.json`.
 
-The main agent always decides when and what to compress. A configured compressor only writes the summary for the resolved range. If it fails, ACP reports the failure and falls back to the authenticated main model. Configured compressors require Pi 0.84.1 or newer.
+The main agent always decides when and what to compress. For a main-writer tier it first calls `plan_compression`, then commits the source-backed summary with the opaque one-use transaction ID. A configured-writer tier rejects caller-supplied summaries and generates from the frozen source in isolation. If that writer fails, ACP reports the reason and can fall back to a distinct authenticated main model within the configured call, token, cost, and duration budgets. Cross-provider transfer requires both consent values in the project config. Configured compressors require Pi 0.84.1 or newer.
 
 ## Configuration
 

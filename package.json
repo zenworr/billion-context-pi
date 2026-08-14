@@ -19,7 +19,9 @@
     "e2e": "npm run e2e -w billion-context-pi",
     "eval": "node evals/replay/launcher.mjs",
     "verify": "npm run typecheck && npm test && npm run build && npm run eval && npm run pack:smoke",
-    "pack:smoke": "node scripts/pack-smoke.mjs"
+    "pack:smoke": "node scripts/pack-smoke.mjs",
+    "scale:history": "npm run build -w acp-kernel && node scripts/history-scale.mjs --output=evals/history-scale/latest.json",
+    "eval:real-agent": "npm run build && tsx scripts/real-agent-eval.ts --output=evals/real-agent/latest.json"
   },
   "engines": {
     "node": ">=22.19.0"

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import { createAcpExtension } from "../src/index.js";
+import { compressionToolWithPlanning } from "./planned-compression.js";
 
 const STATE_FILE = "/tmp/pai-acp-warnings-it.session.json";
 
@@ -45,10 +46,10 @@ function fakeCtx(entries: any[]) {
 
 async function setup(entries: any[]) {
   const { api, handlers } = captureApi();
-  createAcpExtension({ modelContextLimit: 200_000 })(api as any);
+  createAcpExtension({ modelContextLimit: 200_000, compress: { tier1Compressor: "main" } })(api as any);
   const ctx = fakeCtx(entries);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, ctx);
-  const compressTool = api.tools.find((t: any) => t.name === "compress")!;
+  const compressTool = compressionToolWithPlanning(api.tools);
   return { compressTool, ctx };
 }
 

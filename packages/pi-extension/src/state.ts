@@ -10,6 +10,9 @@ import { logInfo, logWarn } from "./log.js";
 
 const STATE_SUFFIX = ".acp.json";
 const STATE_MODE = 0o600;
+const JOURNAL_SUFFIX = ".journal";
+const JOURNAL_COMPACT_ENTRIES = 64;
+const JOURNAL_COMPACT_BYTES = 16 * 1024 * 1024;
 
 export interface LiveRefOrigin {
   rawId: string;
@@ -21,8 +24,14 @@ interface StateCacheSlot {
   liveRefOrigins: LiveRefOrigin[];
 }
 
-interface StoredState extends CompressionState {
+export interface StoredState extends CompressionState {
   liveRefOrigins?: LiveRefOrigin[];
+}
+
+interface StateJournalRecord {
+  version: 1;
+  revision: number;
+  patch: Record<string, unknown>;
 }
 
 function stateFileFor(sessionFile: string | undefined): string | null {
@@ -87,8 +96,9 @@ export class SessionStateStore {
 
     if (file) {
       try {
-        const raw = await fs.readFile(file, "utf8");
-        const parsed = JSON.parse(raw) as unknown;
+        const loaded = await readStateWithJournal(file);
+        const raw = loaded.rawBase;
+        const parsed = loaded.value;
         if (!isStoredState(parsed)) throw new Error("State root is not an ACP state object");
         const schemaVersion = numberValue(parsed.schemaVersion, 1);
         if (schemaVersion > 2) {
@@ -100,6 +110,7 @@ export class SessionStateStore {
         if (migrated) {
           await backupLegacyState(file, raw);
           await persistStateFile(file, state, liveRefOrigins);
+          await fs.rm(file + JOURNAL_SUFFIX, { force: true });
           logInfo("state", { event: "migrated", file, schemaVersion: 2 });
         }
       } catch (error) {
@@ -153,8 +164,10 @@ export class SessionStateStore {
       return structuredClone(next);
     }
     const persisted = await withStateFileLock(file, async () => {
+      let disk: Record<string, unknown> | undefined;
       try {
-        const disk = JSON.parse(await fs.readFile(file, "utf8")) as { schemaVersion?: unknown; revision?: unknown };
+        const loaded = await readStateWithJournal(file);
+        disk = loaded.value as Record<string, unknown>;
         if (typeof disk.schemaVersion === "number" && disk.schemaVersion > 2) {
           throw new FutureSchemaError(`ACP state schema ${disk.schemaVersion} is newer than supported schema 2; refusing overwrite.`);
         }
@@ -165,7 +178,11 @@ export class SessionStateStore {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
       const next = migrateState({ ...preparedState, revision: preparedState.revision + 1 }, sessionId);
-      await persistStateFile(file, next, liveRefOrigins);
+      if (disk && isStoredState(disk)) await appendStateJournal(file, disk, { ...next, liveRefOrigins });
+      else {
+        await fs.rm(file + JOURNAL_SUFFIX, { force: true });
+        await persistStateFile(file, next, liveRefOrigins);
+      }
       return next;
     });
     this.cache.set(key, { state: structuredClone(persisted), liveRefOrigins });
@@ -198,8 +215,7 @@ export class SessionStateStore {
       const parentAcp = stateFileFor(parentJsonl);
       if (!parentAcp) return undefined;
       try {
-        const raw = await fs.readFile(parentAcp, "utf8");
-        const parsed = JSON.parse(raw) as unknown;
+        const parsed = (await readStateWithJournal(parentAcp)).value;
         if (parsed && typeof parsed === "object" && "schemaVersion" in parsed) {
           const schema = (parsed as { schemaVersion?: unknown }).schemaVersion;
           if (typeof schema === "number" && schema > 2) {
@@ -243,6 +259,55 @@ export class SessionStateStore {
       maxDepth: maxChainDepth,
     });
     return undefined;
+  }
+}
+
+export async function readStoredStateSnapshot(file: string): Promise<StoredState> {
+  return (await readStateWithJournal(file)).value as StoredState;
+}
+
+async function readStateWithJournal(file: string): Promise<{ rawBase: string; value: unknown }> {
+  const rawBase = await fs.readFile(file, "utf8");
+  const parsed = JSON.parse(rawBase) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { rawBase, value: parsed };
+  const value = structuredClone(parsed) as Record<string, unknown>;
+  const journal = await fs.readFile(file + JOURNAL_SUFFIX, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw error;
+  });
+  const lines = journal.split("\n");
+  for (let index = 0; index < lines.length - 1; index++) {
+    const line = lines[index]!.trim();
+    if (!line) continue;
+    const record = JSON.parse(line) as StateJournalRecord;
+    if (record.version !== 1 || !record.patch || typeof record.patch !== "object") throw new Error(`Invalid ACP state journal record at line ${index + 1}.`);
+    Object.assign(value, record.patch);
+    value.revision = record.revision;
+  }
+  return { rawBase, value };
+}
+
+async function appendStateJournal(file: string, previous: Record<string, unknown>, next: StoredState): Promise<void> {
+  const nextRecord = next as unknown as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(nextRecord)) {
+    if (JSON.stringify(previous[key]) !== JSON.stringify(value)) patch[key] = value;
+  }
+  const record: StateJournalRecord = { version: 1, revision: next.revision, patch };
+  const journalFile = file + JOURNAL_SUFFIX;
+  const handle = await fs.open(journalFile, "a", STATE_MODE);
+  try {
+    await handle.writeFile(`${JSON.stringify(record)}\n`);
+    await handle.sync();
+  } finally { await handle.close(); }
+  const stat = await fs.stat(journalFile);
+  const lineCount = stat.size > JOURNAL_COMPACT_BYTES / 4
+    ? JOURNAL_COMPACT_ENTRIES
+    : (await fs.readFile(journalFile, "utf8")).split("\n").length - 1;
+  if (stat.size >= JOURNAL_COMPACT_BYTES || lineCount >= JOURNAL_COMPACT_ENTRIES) {
+    await persistStateFile(file, next, next.liveRefOrigins ?? []);
+    await fs.rm(journalFile, { force: true });
+    logInfo("state", { event: "journal-compacted", file, bytes: stat.size, entries: lineCount });
   }
 }
 
@@ -304,6 +369,7 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
       lastActionAt: numberRecord(policy.lastActionAt),
       recentRetrievals: numberRecord(policy.recentRetrievals),
       lastSurvivedTurnId: typeof policy.lastSurvivedTurnId === "string" ? policy.lastSurvivedTurnId : undefined,
+      automaticCooldowns: automaticCooldownRecord(policy.automaticCooldowns),
       tokenCalibration: Object.fromEntries(
         Object.entries(calibration).flatMap(([key, value]) => {
           if (!value || typeof value !== "object") return [];
@@ -315,6 +381,10 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
             anchorProviderTokens: numberValue(item.anchorProviderTokens, numberValue(item.lastProviderTokens, 0)),
             anchorLocalTokens: numberValue(item.anchorLocalTokens, numberValue(item.lastEstimatedTokens, 0)),
             anchorEpoch: numberValue(item.anchorEpoch, numberValue(parsed.currentEpoch, 0)),
+            anchorRequestGeneration: optionalNumber(item.anchorRequestGeneration),
+            anchorPayloadHash: typeof item.anchorPayloadHash === "string" ? item.anchorPayloadHash : undefined,
+            anchorFixedPrefixFingerprint: typeof item.anchorFixedPrefixFingerprint === "string" ? item.anchorFixedPrefixFingerprint : undefined,
+            anchorMediaVerified: typeof item.anchorMediaVerified === "boolean" ? item.anchorMediaVerified : undefined,
             fixedOverheadTokens: numberValue(item.fixedOverheadTokens, 0),
             candidateRatio: optionalNumber(item.candidateRatio),
             candidateSamples: optionalNumber(item.candidateSamples),
@@ -426,26 +496,99 @@ function metadataSignature(state: CompressionState): string {
 async function withStateFileLock<T>(file: string, operation: () => Promise<T>): Promise<T> {
   const lockFile = `${file}.lock`;
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 100; attempt++) {
-    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  const release = await acquireStateFileLock(lockFile);
+  try {
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
+async function acquireStateFileLock(lockFile: string): Promise<() => Promise<void>> {
+  const recoveryFile = `${lockFile}.recovery`;
+  const owner = `${randomUUID()}:${process.pid}`;
+  const startedAt = Date.now();
+  for (;;) {
+    if (await fs.stat(recoveryFile).then(() => true, (error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    })) {
+      if (Date.now() - startedAt > 10_000) throw new Error(`Timed out acquiring ACP state recovery lock ${recoveryFile}.`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      continue;
+    }
     try {
-      handle = await fs.open(lockFile, "wx", STATE_MODE);
-      await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-      await handle.sync();
-      return await operation();
+      const handle = await createStateLock(lockFile, owner);
+      return renewableStateLockRelease(handle, lockFile, owner);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        const stat = await fs.stat(lockFile);
-        if (Date.now() - stat.mtimeMs > 30_000) await fs.rm(lockFile, { force: true });
-      } catch { /* lock owner released between checks */ }
-      await new Promise((resolve) => setTimeout(resolve, 20 + attempt * 2));
-    } finally {
-      await handle?.close().catch(() => undefined);
-      if (handle) await fs.rm(lockFile, { force: true }).catch(() => undefined);
+      const stat = await fs.stat(lockFile).catch(() => undefined);
+      if (stat && Date.now() - stat.mtimeMs > 30_000) {
+        let recovery: Awaited<ReturnType<typeof fs.open>> | undefined;
+        try { recovery = await createStateLock(recoveryFile, owner); }
+        catch (recoveryError) {
+          if ((recoveryError as NodeJS.ErrnoException).code !== "EEXIST") throw recoveryError;
+        }
+        if (recovery) {
+          const releaseRecovery = renewableStateLockRelease(recovery, recoveryFile, owner);
+          try {
+            const current = await fs.readFile(lockFile, "utf8").catch(() => "");
+            const currentStat = await fs.stat(lockFile).catch(() => undefined);
+            if (currentStat && Date.now() - currentStat.mtimeMs > 30_000 && !stateLockOwnerAlive(current)) {
+              await fs.rm(lockFile, { force: true });
+              try {
+                const handle = await createStateLock(lockFile, owner);
+                await releaseRecovery();
+                return renewableStateLockRelease(handle, lockFile, owner);
+              } catch (replacementError) {
+                if ((replacementError as NodeJS.ErrnoException).code !== "EEXIST") throw replacementError;
+              }
+            }
+          } finally { await releaseRecovery(); }
+        }
+      }
+      if (Date.now() - startedAt > 10_000) throw new Error(`Timed out acquiring ACP state lock ${lockFile}.`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
-  throw new Error(`Timed out acquiring ACP state lock ${lockFile}.`);
+}
+
+async function createStateLock(pathname: string, owner: string): Promise<Awaited<ReturnType<typeof fs.open>>> {
+  const handle = await fs.open(pathname, "wx", STATE_MODE);
+  try {
+    await handle.writeFile(`${owner}\n${Date.now()}\n`);
+    await handle.sync();
+    return handle;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await fs.rm(pathname, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+function renewableStateLockRelease(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  pathname: string,
+  owner: string,
+): () => Promise<void> {
+  let released = false;
+  const heartbeat = setInterval(() => { void fs.utimes(pathname, new Date(), new Date()).catch(() => undefined); }, 5_000);
+  heartbeat.unref();
+  return async () => {
+    if (released) return;
+    released = true;
+    clearInterval(heartbeat);
+    await handle.close().catch(() => undefined);
+    const current = await fs.readFile(pathname, "utf8").catch(() => "");
+    if (current.startsWith(`${owner}\n`)) await fs.rm(pathname, { force: true });
+  };
+}
+
+function stateLockOwnerAlive(content: string): boolean {
+  const pid = Number(content.split(":", 2)[1]?.split("\n", 1)[0]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
 }
 
 async function persistStateFile(
@@ -525,6 +668,25 @@ function stringRecord(value: unknown): Record<string, string> {
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   );
+}
+
+function automaticCooldownRecord(value: unknown): CompressionState["policyState"]["automaticCooldowns"] {
+  const record = objectValue(value);
+  return Object.fromEntries(Object.entries(record).flatMap(([key, candidate]) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    const item = candidate as Record<string, unknown>;
+    const sourceHash = typeof item.sourceHash === "string" ? item.sourceHash : "";
+    const policyRevision = typeof item.policyRevision === "string" ? item.policyRevision : "";
+    if (!sourceHash || !policyRevision) return [];
+    return [[key, {
+      failures: numberValue(item.failures, 0),
+      nextRetryAt: numberValue(item.nextRetryAt, 0),
+      circuitOpen: item.circuitOpen === true,
+      warned: item.warned === true,
+      sourceHash,
+      policyRevision,
+    }]];
+  }));
 }
 
 function numberRecord(value: unknown): Record<string, number> {

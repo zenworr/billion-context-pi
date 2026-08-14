@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "generatedAt": "2026-08-14T22:18:14.933Z",
+  "environment": {
+    "node": "v25.0.0",
+    "platform": "linux/x64",
+    "crossProvider": {
+      "status": "unavailable",
+      "reason": "ACP_REAL_CROSS_PROVIDER_MODEL and corresponding provider credential were not supplied; no cross-provider success is claimed."
+    }
+  },
+  "matrix": {
+    "actingFamilies": [
+      "openai-codex"
+    ],
+    "windows": [
+      32000,
+      128000
+    ],
+    "writers": [
+      "main",
+      "configured"
+    ],
+    "tiers": [
+      1
+    ]
+  },
+  "aggregate": {
+    "scenarios": 2,
+    "taskSuccessRate": 0,
+    "validActionRate": 0,
+    "recoveryLoops": 0,
+    "netSavingsTokens": 0,
+    "cacheReadTokens": 135168,
+    "falseConfidenceCount": 1,
+    "fallbackCount": 0
+  },
+  "scenarios": [
+    {
+      "id": "small-main-family-a",
+      "actingModel": "openai-codex/gpt-5.4",
+      "actingFamily": "openai-codex",
+      "writer": "main",
+      "targetTier": 1,
+      "configuredWindow": 32000,
+      "exitCode": 0,
+      "timedOut": false,
+      "taskSuccess": false,
+      "statusCalls": 2,
+      "compressionCalls": 0,
+      "validCompressionActions": 0,
+      "recoveryLoops": 0,
+      "netSavingsTokens": 0,
+      "cacheReadTokens": 41472,
+      "fallbackCount": 0,
+      "falseConfidence": false,
+      "hostCheckpointObserved": false,
+      "stateBlocksCreated": 0
+    },
+    {
+      "id": "medium-configured-family-b",
+      "actingModel": "openai-codex/gpt-5.6-luna",
+      "actingFamily": "openai-codex",
+      "writer": "configured",
+      "targetTier": 1,
+      "configuredWindow": 128000,
+      "exitCode": 0,
+      "timedOut": false,
+      "taskSuccess": false,
+      "statusCalls": 2,
+      "compressionCalls": 1,
+      "validCompressionActions": 0,
+      "recoveryLoops": 0,
+      "netSavingsTokens": 0,
+      "cacheReadTokens": 93696,
+      "fallbackCount": 0,
+      "falseConfidence": true,
+      "hostCheckpointObserved": false,
+      "stateBlocksCreated": 0
+    }
+  ]
+}

@@ -4,6 +4,7 @@ import { defaultCountTokens, type PinRecord } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
 import { forcedCompressionLimit } from "./config.js";
 import { modelCalibrationKey } from "./tokens.js";
+import { parsePublicAcpRef, publicAcpRef } from "./public-refs.js";
 
 const MAX_ACTIVE_PINS = 8;
 const MAX_PINNED_TOKENS = 12_000;
@@ -30,18 +31,20 @@ export function registerPinTool(pi: ExtensionAPI, runtime: AcpRuntime): void {
       const release = await runtime.acquireLock(sid);
       try {
         const { state, coreMessages } = await runtime.stateFor(ctx);
-        const kind = resolvePinKind(state, coreMessages, params.ref);
+        const parsed = parsePublicAcpRef(params.ref);
+        const kind = resolvePinKind(state, coreMessages, parsed.rawRef, parsed.kind);
         if (!kind) throw new Error(`Unknown pin ref: ${params.ref}`);
+        const canonicalRef = publicAcpRef(kind, parsed.rawRef);
         const pin: PinRecord = {
           id: `pin-${state.nextPinId}`,
-          ref: params.ref,
+          ref: canonicalRef,
           mode,
           remainingTurns: turns,
           createdAt: Date.now(),
         };
         const nextPins = [...state.pins.filter((item) => item.ref !== pin.ref), pin].slice(-MAX_ACTIVE_PINS);
         await runtime.save({ ...state, pins: nextPins, nextPinId: state.nextPinId + 1 }, ctx);
-        return { content: [{ type: "text", text: `Pinned ${params.ref} (${mode}) for ${turns} turn${turns === 1 ? "" : "s"}.` }], details: { pin } };
+        return { content: [{ type: "text", text: `Pinned ${canonicalRef} (${mode}) for ${turns} turn${turns === 1 ? "" : "s"}.` }], details: { version: 1, canonicalRef, pin } };
       } finally { release(); }
     },
   });
@@ -68,18 +71,29 @@ export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["s
   };
   for (const pin of state.pins) {
     if (pin.remainingTurns <= 0) continue;
-    const kind = resolvePinKind(state, messages, pin.ref);
+    const parsed = parsePublicAcpRef(pin.ref);
+    const kind = resolvePinKind(state, messages, parsed.rawRef, parsed.kind);
     if (kind === "block") {
-      const block = state.blocks.find((item) => item.blockId === pin.ref);
+      const block = state.blocks.find((item) => item.blockId === parsed.rawRef);
       if (!block) continue;
       const full = block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n");
       const value = pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : full || `[${block.blockId}] Full content is outside the active branch; retrieve with decompress({ blockId: "${block.blockId}" }).`;
       addPart(value, `\n[pin truncated; retrieve ${block.blockId} with decompress]`);
     } else if (kind === "message") {
-      const message = messageByRef.get(pin.ref);
+      const message = messageByRef.get(parsed.rawRef);
       if (message) addPart(`[${pin.ref}] ${message.text ?? ""}`, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
+      else {
+        const rawId = state.messageRefs.byRef[parsed.rawRef];
+        const owner = rawId ? state.blocks.find((block) => block.effectiveMessageIds.some((id) => id.split("#", 1)[0] === rawId.split("#", 1)[0])) : undefined;
+        const checkpoint = rawId ? state.checkpoints.find((item) => item.sourceMessageIds.some((id) => id.split("#", 1)[0] === rawId.split("#", 1)[0])) : undefined;
+        if (owner) addPart(`[${pin.ref}] Historical message is owned by ${publicAcpRef("block", owner.blockId)}.\n${owner.renderedSummary || owner.summary}`, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
+        else if (checkpoint) addPart(`[${pin.ref}] Historical message is owned by ${publicAcpRef("checkpoint", checkpoint.id)}.\n${checkpoint.summary}`, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
+      }
+    } else if (kind === "checkpoint") {
+      const checkpoint = state.checkpoints.find((item) => item.id === parsed.rawRef);
+      if (checkpoint) addPart(`[${pin.ref}] ${checkpoint.summary}`, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
     } else if (kind === "artifact") {
-      const artifact = state.artifacts.find((item) => item.id === pin.ref || item.sha256 === pin.ref);
+      const artifact = state.artifacts.find((item) => item.id === parsed.rawRef || item.sha256 === parsed.rawRef);
       if (artifact) addPart(
         `[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`,
         "\n[pin truncated; retrieve with acp_artifact]",
@@ -123,11 +137,18 @@ function truncateToTokens(value: string, maxTokens: number): string {
   return value.slice(0, low);
 }
 
-type PinKind = "block" | "message" | "artifact";
+type PinKind = "block" | "message" | "checkpoint" | "artifact";
 
-function resolvePinKind(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"], messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"], ref: string): PinKind | undefined {
-  if (state.blocks.some((block) => block.blockId === ref)) return "block";
-  if (state.artifacts.some((artifact) => artifact.id === ref || artifact.sha256 === ref)) return "artifact";
-  if (messages.some((message) => state.messageRefs.byRaw[message.id] === ref)) return "message";
-  return undefined;
+function resolvePinKind(
+  state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"],
+  messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"],
+  ref: string,
+  expected?: PinKind,
+): PinKind | undefined {
+  const kind = state.blocks.some((block) => block.blockId === ref) ? "block"
+    : state.checkpoints.some((checkpoint) => checkpoint.id === ref) ? "checkpoint"
+    : state.artifacts.some((artifact) => artifact.id === ref || artifact.sha256 === ref) ? "artifact"
+    : messages.some((message) => state.messageRefs.byRaw[message.id] === ref) || state.messageRefs.byRef[ref] !== undefined ? "message"
+    : undefined;
+  return expected && kind !== expected ? undefined : kind;
 }

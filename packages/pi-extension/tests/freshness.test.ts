@@ -29,9 +29,11 @@ test("project fingerprint reads current disk content instead of stale host conte
   assert.notEqual(current, changed, "disk content hash drives freshness");
   assert.match(changed ?? "", /new current rule/);
   assert.doesNotMatch(changed ?? "", /still stale/);
+  const staleSystem = `<project_instructions path="${file}">\nstill stale\n</project_instructions>`;
+  assert.match(tracker.patchSystemPrompt(staleSystem), /new current rule/);
+  assert.doesNotMatch(tracker.patchSystemPrompt(staleSystem), /still stale/);
   tracker.queueRuntimeOverlay(changed, "world");
-  assert.match(tracker.consumeRuntimeOverlay() ?? "", /new current rule/);
-  assert.match(tracker.consumeRuntimeOverlay() ?? "", /new current rule/, "override remains active across provider calls");
+  assert.equal(tracker.consumeRuntimeOverlay(), "world", "project changes stay at system priority, not the runtime user suffix");
   assert.equal(tracker.projectOverlay([{ path: file, content: "new current rule\n" }]), undefined, "override clears after Pi catches up");
 });
 

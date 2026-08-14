@@ -38,6 +38,13 @@ export function modelCalibrationKey(model: { provider?: string; id?: string } | 
  * Update tokenizer density from an anchored delta. `localTokens` must describe
  * the exact previous provider projection represented by `providerTokens`.
  */
+export interface CalibrationRequestIdentity {
+  requestGeneration: number;
+  payloadHash: string;
+  fixedPrefixFingerprint: string;
+  mediaVerified: boolean;
+}
+
 export function updateTokenCalibration(
   state: CompressionState,
   modelKey: string,
@@ -45,10 +52,19 @@ export function updateTokenCalibration(
   providerTokens: number | null | undefined,
   epoch = state.currentEpoch,
   now = Date.now(),
+  identity?: CalibrationRequestIdentity,
 ): TokenCalibrationState | undefined {
   if (!providerTokens || providerTokens <= 0 || localTokens <= 0) return state.policyState.tokenCalibration[modelKey];
   const previous = state.policyState.tokenCalibration[modelKey];
-  if (!previous || previous.anchorEpoch !== epoch || providerTokens <= previous.anchorProviderTokens || localTokens <= previous.anchorLocalTokens) {
+  if (previous && providerTokens === previous.lastProviderTokens && localTokens === previous.lastEstimatedTokens
+    && (!identity || identity.requestGeneration === previous.anchorRequestGeneration)) return previous;
+  const identityChanged = Boolean(previous && identity && (
+    previous.anchorFixedPrefixFingerprint !== identity.fixedPrefixFingerprint
+    || previous.anchorMediaVerified !== identity.mediaVerified
+    || previous.anchorRequestGeneration === undefined
+    || identity.requestGeneration <= previous.anchorRequestGeneration
+  ));
+  if (!previous || previous.anchorEpoch !== epoch || identityChanged || providerTokens <= previous.anchorProviderTokens || localTokens <= previous.anchorLocalTokens) {
     const anchored: TokenCalibrationState = {
       samples: 0,
       ratio: 1,
@@ -56,6 +72,10 @@ export function updateTokenCalibration(
       anchorProviderTokens: providerTokens,
       anchorLocalTokens: localTokens,
       anchorEpoch: epoch,
+      anchorRequestGeneration: identity?.requestGeneration,
+      anchorPayloadHash: identity?.payloadHash,
+      anchorFixedPrefixFingerprint: identity?.fixedPrefixFingerprint,
+      anchorMediaVerified: identity?.mediaVerified,
       fixedOverheadTokens: Math.max(0, providerTokens - localTokens),
       lastProviderTokens: providerTokens,
       lastEstimatedTokens: localTokens,
@@ -67,7 +87,7 @@ export function updateTokenCalibration(
 
   const deltaProvider = providerTokens - previous.anchorProviderTokens;
   const deltaLocal = localTokens - previous.anchorLocalTokens;
-  if (deltaLocal < MIN_CALIBRATION_DELTA_TOKENS || deltaProvider <= 0) return previous;
+  if (identity?.mediaVerified === false || deltaLocal < MIN_CALIBRATION_DELTA_TOKENS || deltaProvider <= 0) return previous;
   const observed = clamp(deltaProvider / deltaLocal, MIN_DENSITY, MAX_DENSITY);
   const candidate = previous.candidateRatio ?? observed;
   const hadCandidate = previous.candidateRatio !== undefined;
@@ -85,6 +105,10 @@ export function updateTokenCalibration(
     anchorProviderTokens: providerTokens,
     anchorLocalTokens: localTokens,
     anchorEpoch: epoch,
+    anchorRequestGeneration: identity?.requestGeneration,
+    anchorPayloadHash: identity?.payloadHash,
+    anchorFixedPrefixFingerprint: identity?.fixedPrefixFingerprint,
+    anchorMediaVerified: identity?.mediaVerified,
     fixedOverheadTokens: Math.max(0, Math.round(providerTokens - localTokens * ratio)),
     candidateRatio,
     candidateSamples,

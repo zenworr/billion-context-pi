@@ -26,8 +26,10 @@ export {
   refToIndex,
   refForRaw,
   rawForRef,
+  rebuildRefIndex,
   BLOCKED_REF,
 } from "./refs.js";
+export type { AssignRefsOptions, AssignRefsResult } from "./refs.js";
 export { prune, SUMMARY_HEADER } from "./prune.js";
 export { syncBlocks } from "./sync.js";
 export { resolveBoundaries, parseBoundary, BoundaryNotFoundError } from "./boundaries.js";

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Audit the actual serialized provider request, reset calibration on fixed-prefix changes, and keep changed project instructions at system priority.
+- Add one-use `plan_compression` transactions, source-support validation, exact net-value/cost budgets, configured-writer summary rejection, and bounded recovery circuits.
+- Add aggregate parallel-tool reservations, durable reasoning artifacts, stable public ACP refs, persistent search/cooldown state, owned renewable leases, and append-only state journals.
+- Replace stable redaction digests with per-request opaque placeholders and separate raw/transfer/manifest provenance; fail closed on invalid project transfer consent.
+- Add real-agent and million-message evidence harnesses plus live Pi CI smoke coverage.
+
 - Harden the second-round architecture: owned-tail runtime and quota locks, fileless transactional state, monotonic wide refs, direct checkpoint ancestry, transactional manual/native checkpoint ownership, turn-based survival, and branch-aware epochs.
 - Protect the first request, current turn, media, pins, reasoning, and complete provider protocol groups; use one final-request projection for status, hard gating, and host-compaction decisions.
 - Reinject changed project instructions byte-for-byte, keep failed compression diagnostics visible, validate nested configuration, and use purpose-specific thinking levels.

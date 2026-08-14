@@ -34,9 +34,23 @@ if (!statePath || !scenarioPath) {
     process.exit(2);
 }
 
-const state = readJson(statePath);
+const state = readStateWithJournal(statePath);
 const scenario = readJson(scenarioPath);
 const expect = scenario.verify || {};
+
+function readStateWithJournal(path) {
+    const state = readJson(path);
+    const journalPath = path + ".journal";
+    if (!existsSync(journalPath)) return state;
+    const lines = readFileSync(journalPath, "utf-8").split("\n");
+    for (let index = 0; index < lines.length - 1; index++) {
+        if (!lines[index].trim()) continue;
+        const record = JSON.parse(lines[index]);
+        if (record.version !== 1 || !record.patch) throw new Error(`Invalid state journal line ${index + 1}`);
+        Object.assign(state, record.patch, { revision: record.revision });
+    }
+    return state;
+}
 
 function readObservations() {
     if (!existsSync(observationsPath)) return [];

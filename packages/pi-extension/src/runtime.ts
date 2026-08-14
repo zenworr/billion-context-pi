@@ -15,6 +15,7 @@ import { SessionStateStore, type LiveRefOrigin } from "./state.js";
 import { logInfo, logWarn } from "./log.js";
 import { findUniqueLongestRun, type MatchRange } from "./sequence-match.js";
 import { reconcileArtifactSources } from "./artifact-store.js";
+import type { ProviderPayloadAudit } from "./provider-audit.js";
 
 type SessionEntrySource = {
   buildContextEntries?: () => SessionEntry[];
@@ -51,6 +52,29 @@ export interface ProjectionSnapshot {
   projectedMessages: number;
   changed: boolean;
   recordedAt: number;
+  authoritative?: boolean;
+  requestGeneration?: number;
+  payloadHash?: string;
+  toolSchemaFingerprint?: string;
+  systemPromptFingerprint?: string;
+  fixedPrefixFingerprint?: string;
+  mediaTokens?: number;
+  mediaVerified?: boolean;
+}
+
+export interface ProviderAuditSnapshot extends ProviderPayloadAudit {
+  modelKey: string;
+  contextWindow: number;
+  requestGeneration: number;
+  recordedAt: number;
+}
+
+export interface CompressionRecoveryState {
+  failures: number;
+  actionUsed: boolean;
+  circuitOpen: boolean;
+  noValidRange: boolean;
+  lastAction?: string;
 }
 
 export interface AcpRuntime {
@@ -60,14 +84,23 @@ export interface AcpRuntime {
   setAdapter(adapter: AdapterConfig): void;
   prompts: Prompts;
   setPrompts(prompts: Prompts): void;
+  beginAgentPolicyRun(sessionId: string): void;
+  endAgentPolicyRun(sessionId: string): void;
+  agentPolicyRunActive(sessionId: string): boolean;
   markNudgeShown(turnKey: string): void;
   nudgeShownFor(turnKey: string): boolean;
   clearNudgeTracking(): void;
   recordContextTokens(sessionId: string, tokens: number): void;
   observedContextTokens(sessionId: string): number | undefined;
   clearContextTokens(sessionId?: string): void;
-  relaxCompressionGate(sessionId: string, durationMs?: number): void;
-  compressionGateRelaxed(sessionId: string): boolean;
+  beginProviderCycle(sessionId: string): void;
+  allowRecoveryAction(sessionId: string, toolName: string): boolean;
+  recordCompressionFailure(sessionId: string, noValidRange?: boolean): CompressionRecoveryState;
+  clearCompressionRecovery(sessionId: string): void;
+  compressionRecoveryFor(sessionId: string): CompressionRecoveryState;
+  recordProviderAudit(sessionId: string, audit: Omit<ProviderAuditSnapshot, "requestGeneration" | "recordedAt">): ProviderAuditSnapshot;
+  providerAuditFor(sessionId: string, requireFresh?: boolean): ProviderAuditSnapshot | undefined;
+  markProviderMutation(sessionId: string): void;
   metadataTurnsDue(sessionId: string, cadence?: number): number;
   liveContextLimit(ctx: ExtensionContext): number;
   configFor(ctx: ExtensionContext): Config;
@@ -243,8 +276,11 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   const nudgeShownTurns = new Set<string>();
   const projections = new Map<string, ProjectionSnapshot>();
   const observedTokensBySession = new Map<string, number>();
-  const compressionGateRelaxedUntil = new Map<string, number>();
+  const recoveryBySession = new Map<string, CompressionRecoveryState>();
+  const providerAudits = new Map<string, ProviderAuditSnapshot>();
+  const requestGenerations = new Map<string, number>();
   const metadataTurns = new Map<string, number>();
+  const activePolicyRuns = new Set<string>();
 
   async function acquireLock(sid: string): Promise<() => void> {
     const previous = locks.get(sid) ?? Promise.resolve();
@@ -311,6 +347,9 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     setAdapter: (adapterValue) => { adapterRef = adapterValue; },
     get prompts() { return promptsRef; },
     setPrompts: (promptsValue) => { promptsRef = promptsValue; },
+    beginAgentPolicyRun: (sessionId) => { activePolicyRuns.add(sessionId); },
+    endAgentPolicyRun: (sessionId) => { activePolicyRuns.delete(sessionId); },
+    agentPolicyRunActive: (sessionId) => activePolicyRuns.has(sessionId),
     markNudgeShown: (turnKey) => { nudgeShownTurns.add(turnKey); },
     nudgeShownFor: (turnKey) => nudgeShownTurns.has(turnKey),
     clearNudgeTracking: () => { nudgeShownTurns.clear(); },
@@ -322,19 +361,57 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
       if (sessionId === undefined) {
         observedTokensBySession.clear();
         projections.clear();
-        compressionGateRelaxedUntil.clear();
+        recoveryBySession.clear();
+        providerAudits.clear();
+        requestGenerations.clear();
         metadataTurns.clear();
+        activePolicyRuns.clear();
       } else {
         observedTokensBySession.delete(sessionId);
         projections.delete(sessionId);
-        compressionGateRelaxedUntil.delete(sessionId);
+        recoveryBySession.delete(sessionId);
+        providerAudits.delete(sessionId);
+        requestGenerations.delete(sessionId);
         metadataTurns.delete(sessionId);
+        activePolicyRuns.delete(sessionId);
       }
     },
-    relaxCompressionGate: (sessionId, durationMs = 60_000) => {
-      compressionGateRelaxedUntil.set(sessionId, Date.now() + Math.max(1_000, durationMs));
+    beginProviderCycle: (sessionId) => {
+      const current = recoveryBySession.get(sessionId);
+      if (current) recoveryBySession.set(sessionId, { ...current, actionUsed: false });
     },
-    compressionGateRelaxed: (sessionId) => (compressionGateRelaxedUntil.get(sessionId) ?? 0) > Date.now(),
+    allowRecoveryAction: (sessionId, toolName) => {
+      const current = recoveryBySession.get(sessionId) ?? { failures: 0, actionUsed: false, circuitOpen: false, noValidRange: false };
+      if (current.actionUsed) return false;
+      if ((current.circuitOpen || current.noValidRange) && toolName === "compress") return false;
+      const allowed = current.failures === 0 ? toolName === "compress" || toolName === "acp_status" : toolName !== "compress" || !current.circuitOpen;
+      if (allowed) recoveryBySession.set(sessionId, { ...current, actionUsed: true, lastAction: toolName });
+      return allowed;
+    },
+    recordCompressionFailure: (sessionId, noValidRange = false) => {
+      const current = recoveryBySession.get(sessionId) ?? { failures: 0, actionUsed: false, circuitOpen: false, noValidRange: false };
+      const failures = current.failures + 1;
+      const next = { ...current, failures, noValidRange: current.noValidRange || noValidRange, circuitOpen: failures >= 2 || current.noValidRange || noValidRange, actionUsed: false };
+      recoveryBySession.set(sessionId, next);
+      return { ...next };
+    },
+    clearCompressionRecovery: (sessionId) => { recoveryBySession.delete(sessionId); },
+    compressionRecoveryFor: (sessionId) => ({ ...(recoveryBySession.get(sessionId) ?? { failures: 0, actionUsed: false, circuitOpen: false, noValidRange: false }) }),
+    recordProviderAudit: (sessionId, audit) => {
+      const requestGeneration = requestGenerations.get(sessionId) ?? 0;
+      const snapshot = { ...audit, requestGeneration, recordedAt: Date.now() };
+      providerAudits.set(sessionId, snapshot);
+      return snapshot;
+    },
+    providerAuditFor: (sessionId, requireFresh = true) => {
+      const audit = providerAudits.get(sessionId);
+      if (!audit) return undefined;
+      if (requireFresh && audit.requestGeneration !== (requestGenerations.get(sessionId) ?? 0)) return undefined;
+      return audit;
+    },
+    markProviderMutation: (sessionId) => {
+      requestGenerations.set(sessionId, (requestGenerations.get(sessionId) ?? 0) + 1);
+    },
     metadataTurnsDue: (sessionId, cadence = 3) => {
       const turns = (metadataTurns.get(sessionId) ?? 0) + 1;
       if (turns < cadence) { metadataTurns.set(sessionId, turns); return 0; }

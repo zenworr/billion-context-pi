@@ -125,7 +125,15 @@ All keys below are currently **ACTIVE**.
 | `compress.checkpointCompressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Full checkpoint writer after selective rescue is insufficient. |
 | `compress.branchSummaryCompressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tree/branch summary writer. |
 | `compress.allowCrossProvider` | boolean | `false` | 🟢 ACTIVE | First consent for transfer to another provider. |
-| `compress.acknowledgeCrossProviderDataTransfer` | boolean | `false` | 🟢 ACTIVE | Second explicit consent; both settings are required. |
+| `compress.acknowledgeCrossProviderDataTransfer` | boolean | `false` | 🟢 ACTIVE | Second explicit consent; both settings must be valid in project config. |
+| `compress.maxRangesPerCall` | integer | `4` | 🟢 ACTIVE | Maximum atomic ranges in one plan/commit. |
+| `compress.maxModelCalls` | integer | `6` | 🟢 ACTIVE | Maximum paid model calls per compression transaction. |
+| `compress.maxInputTokens` | integer | `400000` | 🟢 ACTIVE | Maximum aggregate model input tokens. |
+| `compress.maxOutputTokens` | integer | `40000` | 🟢 ACTIVE | Maximum aggregate model output tokens. |
+| `compress.maxDurationMs` | integer | `60000` | 🟢 ACTIVE | Total model-generation deadline. |
+| `compress.maxCostUsd` | number | `5` | 🟢 ACTIVE | Maximum observed model cost before commit. |
+| `compress.minimumNetSavingsTokens` | integer | `256` | 🟢 ACTIVE | Minimum exact compiled token reduction. |
+| `compress.minimumNetSavingsPercent` | number | `0.05` | 🟢 ACTIVE | Minimum exact compiled percentage reduction. |
 
 **Prompts keys**
 
@@ -151,9 +159,9 @@ All keys below are currently **ACTIVE**.
 
 Configured compression runs in an isolated, no-tools request. Every request is conservatively estimated and split so its input remains below 220,000 tokens and below the selected model's safe input budget. Cross-provider transfer is blocked unless both consent keys are `true`; common secrets and configured secret patterns are redacted before transfer.
 
-Top-level `budget` controls `targetActiveTokens`, context percentages, `outputReserveTokens`, and `safetyMarginTokens`. The hard tool gate is derived per active model from the compiled provider projection and these reserves; it is not a fixed 204K threshold. The gate keeps bounded ACP recovery tools available and relaxes after a failed compression. Host compaction remains the checkpoint and overflow recovery path.
+Top-level `budget` controls `targetActiveTokens`, context percentages, `outputReserveTokens`, and `safetyMarginTokens`. The hard tool gate is derived from the actual provider-serialized payload audit plus these reserves; it is not a fixed threshold. Parallel calls reserve one aggregate output budget. A failed compression permits at most one bounded recovery action in that provider cycle; repeated or range-invalid failures open a circuit to host checkpoint recovery.
 
-Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`, default `"preserve"`). `safe-only` clears only explicitly unsigned, provider-agnostic plaintext reasoning after ACP confirms a complete companion response; opaque, encrypted, signed, current-turn, incomplete, or provider-specific reasoning is preserved. Cleared tool output is retrievable with `acp_artifact`; inline retrieval is byte-bounded and supports `offset`/`limit`. Artifacts are limited by default to 50 MiB each, 500 MiB per session, and 2 GiB globally. Quota updates use an inter-process lock and a bounded persistent index. If durable storage fails, ACP does not apply an additional irreversible cap. Fork shutdown keeps inherited artifact paths valid. Orphaned session files are removed at startup or explicitly with `/acp artifacts-cleanup`. `pin_context` is capped at eight pins and a token-estimated 48K-character total payload.
+Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`, default `"preserve"`). `safe-only` clears only explicitly unsigned, provider-agnostic plaintext reasoning after ACP confirms a complete companion response and durable reasoning artifact; opaque, encrypted, signed, current-turn, incomplete, or provider-specific reasoning is preserved. Cleared tool output is retrievable with `acp_artifact`; inline retrieval is byte-bounded and supports `offset`/`limit`. Artifacts are limited by default to 50 MiB each, 500 MiB per session, and 2 GiB globally. Quota updates use an inter-process lock and a bounded persistent index. If durable storage fails, ACP does not apply an additional irreversible cap. Fork shutdown keeps inherited artifact paths valid. Orphaned session files are removed at startup or explicitly with `/acp artifacts-cleanup`. `pin_context` is capped at eight pins and a token-estimated 48K-character total payload.
 
 Top-level `memory.mode` is `"off"`, `"session"`, or `"project"`. Project files are written only after an explicit `/acp promote bN`; `automaticPromotion` must remain `false`.
 

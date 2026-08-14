@@ -42,6 +42,8 @@ export interface ModelCompressionInput {
   replaceInstructions?: boolean;
   /** Hard ceiling for each isolated request, including its system prompt and JSON envelope. */
   maxInputTokens?: number;
+  /** Reserve policy budget immediately before each actual provider request. */
+  beforeCall?: (estimatedInputTokens: number, maxOutputTokens: number) => void;
 }
 
 export function estimateCompressionInputTokens(input: Pick<ModelCompressionInput, "tier" | "source" | "prompts" | "summaryMaxChars" | "trustedInstructions" | "replaceInstructions">): number {
@@ -57,18 +59,32 @@ export async function compressWithModel(input: ModelCompressionInput): Promise<M
   const outputReserve = Math.max(512, Math.min(8192, Math.ceil(input.summaryMaxChars / 3)));
   const effectiveInputLimit = Math.min(inputLimit, Math.max(1, input.model.contextWindow - outputReserve));
   const chunks = splitCompressionSource(input, effectiveInputLimit);
-  if (chunks.length === 1) return completeCompression(input, chunks[0]!, inputLimit);
-
   let usage: CompressionUsage | undefined;
+  const run = async (request: ModelCompressionInput, source: string, limit: number): Promise<ModelCompressionResult> => {
+    try {
+      const result = await completeCompression(request, source, limit);
+      usage = addCompressionUsage(usage, result.usage);
+      return result;
+    } catch (error) {
+      const failedUsage = compressionErrorUsage(error);
+      if (failedUsage) usage = addCompressionUsage(usage, failedUsage);
+      if (usage) throw new CompressionModelError(error instanceof Error ? error.message : String(error), usage);
+      throw error;
+    }
+  };
+  if (chunks.length === 1) {
+    const result = await run(input, chunks[0]!, inputLimit);
+    return { ...result, usage: usage! };
+  }
+
   const summaries: string[] = [];
   for (let index = 0; index < chunks.length; index++) {
     if (input.signal?.aborted) throw input.signal.reason ?? new Error("Compression was aborted.");
-    const chunkResult = await completeCompression(
+    const chunkResult = await run(
       { ...input, summaryMaxChars: Math.min(input.summaryMaxChars, 20_000) },
       `Chunk ${index + 1}/${chunks.length}. Preserve facts and continuity for final synthesis.\n\n${chunks[index]!}`,
       effectiveInputLimit,
     );
-    usage = addCompressionUsage(usage, chunkResult.usage);
     summaries.push(`Source chunk ${index + 1}/${chunks.length}:\n${chunkResult.summary}`);
   }
 
@@ -77,12 +93,11 @@ export async function compressWithModel(input: ModelCompressionInput): Promise<M
     const reductionChunks = splitCompressionSource({ ...input, source: synthesis }, effectiveInputLimit);
     const reduced: string[] = [];
     for (let index = 0; index < reductionChunks.length; index++) {
-      const reduction = await completeCompression(
+      const reduction = await run(
         { ...input, summaryMaxChars: Math.min(input.summaryMaxChars, 20_000) },
         `Intermediate synthesis ${index + 1}/${reductionChunks.length}. Preserve exact facts for the final synthesis.\n\n${reductionChunks[index]!}`,
         effectiveInputLimit,
       );
-      usage = addCompressionUsage(usage, reduction.usage);
       reduced.push(reduction.summary);
     }
     const next = reduced.join("\n\n");
@@ -91,8 +106,8 @@ export async function compressWithModel(input: ModelCompressionInput): Promise<M
     }
     synthesis = next;
   }
-  const final = await completeCompression(input, synthesis, effectiveInputLimit);
-  return { ...final, usage: addCompressionUsage(usage, final.usage) };
+  const final = await run(input, synthesis, effectiveInputLimit);
+  return { ...final, usage: usage! };
 }
 
 async function completeCompression(input: ModelCompressionInput, source: string, inputLimit: number): Promise<ModelCompressionResult> {
@@ -111,6 +126,7 @@ async function completeCompression(input: ModelCompressionInput, source: string,
     throw new CompressionModelError(`Selected compression input needs approximately ${estimatedInputTokens} tokens, exceeding the ${Math.min(inputLimit, modelInputLimit)}-token safe input budget for ${input.model.provider}/${input.model.id}.`);
   }
   const reasoning = normalizeThinkingLevel(input.model, input.thinkingLevel);
+  input.beforeCall?.(estimatedInputTokens, maxTokens);
   const response = await registry.complete(
     input.model,
     {

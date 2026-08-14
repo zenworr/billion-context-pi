@@ -54,9 +54,11 @@ const NUDGE_PHRASES = [
     "since last nudge",
     "Tier 2 Trigger",
     "Tier 3 Trigger",
+    "ACP compression action",
 ];
 
 let totalCompressionsEmitted = 0;
+let pendingCompression = null;
 
 function log(msg) {
     process.stderr.write(`[fake-llm] ${msg}\n`);
@@ -191,6 +193,15 @@ function resolveRange(refs, range) {
     return [start, end];
 }
 
+function resolveBatchRange(refs, range) {
+    const [startIdx, endIdx] = range;
+    const start = refs[Math.min(startIdx, refs.length - 1)];
+    const nextUser = refs[Math.min(endIdx + 1, refs.length - 1)];
+    const nextIndex = Number(nextUser.slice(1));
+    const end = `m${String(Math.max(Number(start.slice(1)), nextIndex - 1)).padStart(5, "0")}`;
+    return [start, end];
+}
+
 // --- Response builders (SSE streaming) ---
 
 function sse(res, model, chunks, usage) {
@@ -296,6 +307,15 @@ function handleTextStep(res, model, step, inputTokens) {
     textSSE(res, model, step.text || "Done.", inputTokens);
 }
 
+function emitCompressionPlan(res, model, args, inputTokens) {
+    pendingCompression = args;
+    const planArgs = {
+        content: args.content.map(({ startId, endId, topic }) => ({ startId, endId, ...(topic ? { topic } : {}) })),
+    };
+    log(`  -> plan_compression: ${planArgs.content.length} range(s)`);
+    toolUseSSE(res, model, "plan_compression", planArgs, inputTokens);
+}
+
 function handleCompressStep(res, model, messages, step, inputTokens) {
     const refs = parseMessageRefs(messages);
     if (refs.length === 0) {
@@ -307,11 +327,11 @@ function handleCompressStep(res, model, messages, step, inputTokens) {
 
     if (step.ranges && step.ranges.length > 0) {
         const content = step.ranges.map((r) => {
-            const [startId, endId] = resolveRange(refs, r.range || "all");
+            const [startId, endId] = Array.isArray(r.range) ? resolveBatchRange(refs, r.range) : resolveRange(refs, r.range || "all");
             return { topic: r.topic || "Batch range", startId, endId, summary: r.summary };
         });
         log(`  -> batch compress: ${content.length} ranges`);
-        compressSSE(res, model, { topic: "Batch compression", content }, inputTokens);
+        emitCompressionPlan(res, model, { topic: "Batch compression", content }, inputTokens);
         return;
     }
 
@@ -324,7 +344,7 @@ function handleCompressStep(res, model, messages, step, inputTokens) {
     };
     if (step.summaryMaxChars) entry.summaryMaxChars = step.summaryMaxChars;
     log(`  -> compress: ${startId}..${endId} summary=${(step.summary || "").length} chars`);
-    compressSSE(res, model, { content: [entry] }, inputTokens);
+    emitCompressionPlan(res, model, { content: [entry] }, inputTokens);
 }
 
 function handleNudgeCompressStep(res, model, messages, step, inputTokens) {
@@ -342,11 +362,11 @@ function handleNudgeCompressStep(res, model, messages, step, inputTokens) {
         return;
     }
     const [startId, endId] = resolveRange(refs, step.range || "all");
-    compressSSE(res, model, {
+    emitCompressionPlan(res, model, {
         content: [{
             topic: step.topic || "Nudge-triggered compression",
             startId, endId,
-            summary: step.summary || "Summary of compressed content from nudge-triggered E2E test.",
+            summary: "The compressed source retains the prior data-ingestion and stream-processing architecture discussion.",
         }],
     }, inputTokens);
 }
@@ -370,7 +390,7 @@ function handleAutonomousNudgeStep(res, model, messages, step, inputTokens) {
             return;
         }
         const [startId, endId] = resolveRange(refs, step.range || "all");
-        compressSSE(res, model, {
+        emitCompressionPlan(res, model, {
             content: [{ topic: step.topic || "Autonomous compression", startId, endId, summary: step.summary || "Compressed autonomous work output." }],
         }, inputTokens);
         return;
@@ -424,6 +444,18 @@ function handleRequest(req, res, body) {
 
     const nudgeDetected = detectNudge(messages);
     const visibleCompressCount = countCompressCalls(messages);
+    if (pendingCompression) {
+        const transactionIds = [...messages.map((message) => extractMessageText(message)).join("\n").matchAll(/\bcp_[0-9a-f-]{36}\b/gi)];
+        const transactionId = transactionIds.at(-1)?.[0];
+        if (transactionId) {
+            const args = { ...pendingCompression, transactionId };
+            pendingCompression = null;
+            log(`  -> compress commit: transaction=${transactionId}`);
+            recordObservation({ turn: -2, inputTokens, messageCount: messages.length, compressCallCount: visibleCompressCount, nudgeDetected, isAuxiliary: false });
+            compressSSE(res, model, args, inputTokens);
+            return;
+        }
+    }
     const turnIdx = incrementCounter(TURN_COUNTER);
     const step = (scenario.turns || [])[turnIdx - 1];
 

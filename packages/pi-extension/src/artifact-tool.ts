@@ -10,6 +10,7 @@ import {
 } from "./artifact-store.js";
 import { debug, logError, logInfo, logThrow } from "./log.js";
 import { forcedCompressionLimit } from "./config.js";
+import { parsePublicAcpRef, publicAcpRef } from "./public-refs.js";
 
 const AUTO_DIR = join(homedir() || tmpdir(), ".cache", "pi", "acp-artifacts");
 const PREVIEW_CHARS = 600;
@@ -40,7 +41,8 @@ export function makeArtifactTool(runtime: AcpRuntime): ToolDefinition<typeof Art
       const args = params as ArtifactArgs;
       try {
         const text = await handleArtifact(args, runtime, ctx);
-        return { details: undefined, content: [{ type: "text", text }] };
+        const parsed = parsePublicAcpRef(args.id);
+        return { details: { version: 1, canonicalRef: publicAcpRef("artifact", parsed.rawRef), offset: args.offset ?? 0, limit: args.limit }, content: [{ type: "text", text }] };
       } catch (error) {
         logThrow("artifact", error, { sid: ctx.sessionManager.getSessionId(), artifactId: args.id });
         return {
@@ -58,7 +60,7 @@ async function handleArtifact(
   ctx: Parameters<ReturnType<typeof makeArtifactTool>["execute"]>[4],
 ): Promise<string> {
   const { state } = await runtime.stateFor(ctx);
-  const artifactId = args.id.trim();
+  const artifactId = parsePublicAcpRef(args.id.trim()).rawRef;
   const record = state.artifacts.find((artifact) => artifact.id === artifactId);
   if (!record) {
     const available = state.artifacts.filter((artifact) => artifact.retrievable).map((artifact) => artifact.id);

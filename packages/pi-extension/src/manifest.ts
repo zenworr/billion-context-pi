@@ -12,7 +12,7 @@ import type {
   StructuredSummary,
 } from "acp-kernel";
 
-const PATH_PATTERN = /(?:^|[\s`"'(])((?:\.{0,2}\/|\/|~\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+)(?=$|[\s`"'),:;])/gm;
+const PATH_PATTERN = /(?:^|[\s`"'(])((?:\.{0,2}\/|\/|~\/)?(?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@-]+\/?)(?=$|[\s`"'),:;])/gm;
 const SYMBOL_PATTERN = /\b(?:class|interface|type|function|const|let|var|enum|namespace)\s+([A-Za-z_$][\w$]*)/g;
 const ERROR_PATTERN = /(?:^|\n)([^\n]*(?:Error|error|failed|failure|exception|exceeded|ENOENT|EACCES|HTTP\s+\d{3})[^\n]*)/g;
 const NUMBER_ID_PATTERN = /(?:#[0-9]+|\b(?:[a-f0-9]{7,40}|[A-Z][A-Z0-9_]*-\d+|\d+(?:\.\d+){1,3}|\d[\d_,]*(?:ms|s|MB|GB|KB|tokens?|%)?)\b)/g;
@@ -129,7 +129,11 @@ export function validateAndRepairSummary(input: {
   summaryMaxChars?: number;
 }): ManifestValidation {
   const summary = input.summary.trim();
-  const contradiction = findSummaryContradiction(summary, input.manifest.semanticFacts);
+  const unsupported = unsupportedExactClaims(summary, input.manifest);
+  if (unsupported.length > 0) {
+    throw new Error(`Summary contains source-unsupported exact claims: ${unsupported.slice(0, 8).map((claim) => JSON.stringify(claim)).join(", ")}. Prefix genuine commentary with "Inferred:" to keep it non-authoritative.`);
+  }
+  const contradiction = findSummaryContradiction(authoritativeSummaryText(summary), input.manifest.semanticFacts);
   if (contradiction) {
     throw new Error(`Summary contradicts source fact: "${contradiction.left}" with "${contradiction.right}".`);
   }
@@ -167,6 +171,27 @@ export function validateAndRepairSummary(input: {
   };
 }
 
+export function renderAuthoritativeSummary(summary: StructuredSummary): string {
+  const sections: string[] = ["<acp-authoritative-summary>"];
+  const add = (title: string, values: string[]): void => {
+    if (values.length > 0) sections.push(`## ${title}\n${values.map((value) => `- ${value}`).join("\n")}`);
+  };
+  add("Objectives", summary.objective);
+  add("Requirements", summary.userRequirements.map((item) => item.text));
+  add("Decisions", summary.decisions.map((item) => item.rationale ? `${item.decision} — ${item.rationale}` : item.decision));
+  add("Completed", summary.workState.completed);
+  add("Active", summary.workState.active);
+  add("Blocked or open", summary.workState.blocked);
+  add("Next", summary.workState.next);
+  add("Files", summary.files.map((item) => `${item.path} (${item.status})`));
+  add("Commands", summary.commands.map((item) => `${item.command} — ${item.result}`));
+  add("Errors", summary.errors.map((item) => item.exactText));
+  add("Facts", summary.facts);
+  add("Retrieval cues", summary.retrievalCues);
+  sections.push("</acp-authoritative-summary>");
+  return sections.join("\n\n");
+}
+
 export function structuredSummaryFromRendered(
   renderedSummary: string,
   manifest: CompressionManifest,
@@ -174,17 +199,11 @@ export function structuredSummaryFromRendered(
   tier: 1 | 2 | 3 = 1,
 ): StructuredSummary {
   const source = semanticFactsForTier(manifest.semanticFacts ?? emptySemanticFacts(), tier);
-  const renderedSegments = splitText(renderedSummary).map((text) => ({
-    text,
-    sourceRefs: [],
-    role: "assistant" as const,
-  }));
-  const rendered = extractSemanticFacts(
-    renderedSegments,
-    unique([...manifest.paths, ...matches(renderedSummary, PATH_PATTERN, 1)]),
-    unique([...manifest.commands, ...matches(renderedSummary, COMMAND_PATTERN, 1)]),
-    unique([...manifest.errorStrings, ...matches(renderedSummary, ERROR_PATTERN, 1).map((value) => value.trim())]),
-  );
+  // Structured state is authoritative and therefore comes only from the
+  // deterministic source manifest. Model prose, including explicitly marked
+  // inferred commentary, remains searchable in renderedSummary but cannot
+  // create requirements, decisions, work claims, paths, commands, or errors.
+  const rendered = emptySemanticFacts();
   const requirements = mergeFacts(source.requirements, rendered.requirements);
   for (const text of preserve) mergeFactInto(requirements, { text, sourceRefs: manifest.userMessageRefs });
   const files = mergeFiles(source.files, rendered.files);
@@ -764,6 +783,70 @@ function dedupeRequired(facts: RequiredSemanticFact[]): RequiredSemanticFact[] {
     seen.add(key);
     return true;
   });
+}
+
+function authoritativeSummaryText(summary: string): string {
+  return summary.split("\n")
+    .filter((line) => !/^\s*(?:[-*]\s*)?(?:inferred|non-authoritative commentary)\s*:/i.test(line))
+    .join("\n");
+}
+
+function unsupportedExactClaims(summary: string, manifest: CompressionManifest): string[] {
+  const authoritative = authoritativeSummaryText(summary);
+  const exactClaims = unique([
+    ...matches(authoritative, PATH_PATTERN, 1).filter(isLikelyPathClaim),
+    ...matches(authoritative, COMMAND_PATTERN, 1),
+    ...matches(authoritative, ERROR_PATTERN, 1).map((value) => value.trim()),
+    ...matches(authoritative, NUMBER_ID_PATTERN, 0),
+    ...matches(authoritative, /\b(?:m|b|c|a)\d{3,}\b/g, 0),
+  ]);
+  const supportedExact = unique([
+    ...manifest.sourceRefs,
+    ...manifest.paths,
+    ...manifest.commands,
+    ...manifest.errorStrings,
+    ...manifest.numbersAndIds,
+    ...manifest.symbols,
+  ]);
+  const unsupported = exactClaims.filter((claim) => {
+    if (/^\d+(?:,\d+)+$/.test(claim) && claim.split(",").every((part) => manifest.numbersAndIds.some((source) => normalizeText(source) === part))) return false;
+    return !supportedExact.some((source) => {
+      const normalizedClaim = normalizeText(claim.replace(/[/.]+$/, ""));
+      const normalizedSource = normalizeText(source.replace(/[/.]+$/, ""));
+      return normalizedClaim === normalizedSource
+        || (normalizedClaim.length >= 3 && normalizedSource.startsWith(normalizedClaim) && /^[a-z%]+$/i.test(normalizedSource.slice(normalizedClaim.length)))
+        || (normalizedClaim.length >= 8 && normalizedSource.includes(normalizedClaim))
+        || (normalizedSource.length >= 8 && normalizedClaim.includes(normalizedSource));
+    });
+  });
+
+  const semantic = manifest.semanticFacts;
+  if (semantic) {
+    const sourceClaims = [
+      ...semantic.objectives.map((fact) => fact.text),
+      ...semantic.requirements.map((fact) => fact.text),
+      ...semantic.decisions.map((fact) => decisionText(fact)),
+      ...semantic.completed.map((fact) => fact.text),
+      ...semantic.active.map((fact) => fact.text),
+      ...semantic.blocked.map((fact) => fact.text),
+      ...semantic.openQuestions.map((fact) => fact.text),
+      ...semantic.nextSteps.map((fact) => fact.text),
+      ...semantic.facts.map((fact) => fact.text),
+    ];
+    for (const line of authoritative.split("\n")) {
+      const match = line.match(/^\s*(?:[-*]\s*)?(?:objective|requirement|decision|completed|active|blocked|open question|next step|fact|outcome|result)\s*:\s*(.+)$/i);
+      if (!match?.[1]) continue;
+      const claim = match[1].trim();
+      if (!sourceClaims.some((source) => includesFact(source, claim) || includesFact(claim, source))) unsupported.push(claim);
+    }
+  }
+  return unique(unsupported);
+}
+
+function isLikelyPathClaim(value: string): boolean {
+  if (/^(?:\/|\.\.\/|\.\/|~\/)/.test(value)) return true;
+  if (/^(?:src|docs|tests?|packages?|config|deploy|scripts?|migrations?|evals?)\//.test(value)) return true;
+  return false;
 }
 
 function unique(values: string[]): string[] {

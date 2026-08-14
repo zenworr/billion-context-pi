@@ -19,6 +19,8 @@ export const DEFAULT_MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 export const DEFAULT_MAX_SESSION_ARTIFACT_BYTES = 500 * 1024 * 1024;
 export const DEFAULT_MAX_GLOBAL_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 
+const artifactIntegrityCache = new Map<string, { identity: string; sha256: string; bytes: number }>();
+
 export interface SpoolArtifactInput {
   sessionId: string;
   sourceMessageId: string;
@@ -319,6 +321,7 @@ async function acquireArtifactQuotaLock(root: string): Promise<() => Promise<voi
           }
         }
       }
+      if (Date.now() - startedAt > 5_000) throw new Error("Artifact quota lock timed out; preserving canonical output without an ACP cap.");
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
   }
@@ -339,9 +342,12 @@ async function createOwnedLock(path: string, owner: string): Promise<Awaited<Ret
 
 function ownedLockRelease(handle: Awaited<ReturnType<typeof fs.open>>, path: string, owner: string): () => Promise<void> {
   let released = false;
+  const heartbeat = setInterval(() => { void fs.utimes(path, new Date(), new Date()).catch(() => undefined); }, 30_000);
+  heartbeat.unref();
   return async () => {
     if (released) return;
     released = true;
+    clearInterval(heartbeat);
     await handle.close().catch(() => undefined);
     const current = await fs.readFile(path, "utf8").catch(() => "");
     if (current.startsWith(`${owner}\n`)) await fs.rm(path, { force: true });
@@ -386,6 +392,7 @@ export async function readArtifact(record: ArtifactRecord): Promise<Buffer> {
       : await fs.readFile(record.localPath);
     const digest = createHash("sha256").update(content).digest("hex");
     if (digest !== record.sha256 || content.byteLength !== record.bytes) throw new Error("hash or size mismatch");
+    await cacheArtifactIntegrity(record);
     return content;
   } catch (error) {
     throw new Error(`Artifact ${record.id} failed integrity verification: ${error instanceof Error ? error.message : String(error)}`);
@@ -394,6 +401,7 @@ export async function readArtifact(record: ArtifactRecord): Promise<Buffer> {
 
 export async function readArtifactSlice(record: ArtifactRecord, offset: number, limit: number): Promise<Buffer> {
   if (!record.retrievable) throw new Error(`Artifact ${record.id} is marked unavailable.`);
+  if (await hasCachedArtifactIntegrity(record)) return readVerifiedArtifactSlice(record, offset, limit);
   const hash = createHash("sha256");
   const chunks: Buffer[] = [];
   let position = 0;
@@ -410,6 +418,57 @@ export async function readArtifactSlice(record: ArtifactRecord, offset: number, 
   if (record.localPath.endsWith(".gz")) await pipeline(createReadStream(record.localPath), createGunzip(), sink);
   else await pipeline(createReadStream(record.localPath), sink);
   if (hash.digest("hex") !== record.sha256 || bytes !== record.bytes) throw new Error(`Artifact ${record.id} failed integrity verification.`);
+  await cacheArtifactIntegrity(record);
+  return Buffer.concat(chunks);
+}
+
+async function artifactFileIdentity(pathname: string): Promise<string> {
+  const stat = await fs.stat(pathname);
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+}
+
+async function cacheArtifactIntegrity(record: ArtifactRecord): Promise<void> {
+  artifactIntegrityCache.set(record.localPath, {
+    identity: await artifactFileIdentity(record.localPath),
+    sha256: record.sha256,
+    bytes: record.bytes,
+  });
+  while (artifactIntegrityCache.size > 1_024) artifactIntegrityCache.delete(artifactIntegrityCache.keys().next().value!);
+}
+
+async function hasCachedArtifactIntegrity(record: ArtifactRecord): Promise<boolean> {
+  const cached = artifactIntegrityCache.get(record.localPath);
+  return Boolean(cached && cached.sha256 === record.sha256 && cached.bytes === record.bytes
+    && cached.identity === await artifactFileIdentity(record.localPath));
+}
+
+async function readVerifiedArtifactSlice(record: ArtifactRecord, offset: number, limit: number): Promise<Buffer> {
+  if (!record.localPath.endsWith(".gz")) {
+    const handle = await fs.open(record.localPath, "r");
+    try {
+      const length = Math.max(0, Math.min(limit, record.bytes - offset));
+      const buffer = Buffer.alloc(length);
+      const read = await handle.read(buffer, 0, length, offset);
+      return buffer.subarray(0, read.bytesRead);
+    } finally { await handle.close(); }
+  }
+  const chunks: Buffer[] = [];
+  let position = 0;
+  const input = createReadStream(record.localPath);
+  const output = input.pipe(createGunzip());
+  try {
+    for await (const value of output) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      const start = Math.max(0, offset - position);
+      const end = Math.min(chunk.byteLength, offset + limit - position);
+      if (end > start) chunks.push(Buffer.from(chunk.subarray(start, end)));
+      position += chunk.byteLength;
+      if (position >= offset + limit) break;
+    }
+  } finally {
+    output.destroy();
+    input.destroy();
+  }
   return Buffer.concat(chunks);
 }
 

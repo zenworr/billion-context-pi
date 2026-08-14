@@ -323,7 +323,7 @@ async function statusReport(runtime: AcpRuntime, ctx: ExtensionCommandContext): 
 
   if (activeBlocksList.length > 0) {
     lines.push("");
-    lines.push(`Blocks: ${activeBlocksList.length} active / ${totalBlocksList.length} total (${fmtTokens(state.stats.tokensCompressed)} tokens compressed)`);
+    lines.push(`Blocks: ${activeBlocksList.length} active / ${totalBlocksList.length} total (${fmtTokens(state.stats.netTokensReclaimed ?? 0)} net tokens reclaimed; ${fmtTokens(state.stats.grossSourceTokens ?? state.stats.tokensCompressed)} gross source tokens)`);
     for (const b of activeBlocksList) {
       const topic = b.topic ? `: ${b.topic}` : "";
       const summaryTok = defaultCountTokens(b.summary || "");
@@ -332,7 +332,7 @@ async function statusReport(runtime: AcpRuntime, ctx: ExtensionCommandContext): 
     }
   } else if (totalBlocksList.length > 0) {
     lines.push("");
-    lines.push(`Blocks: 0 active / ${totalBlocksList.length} total (${fmtTokens(state.stats.tokensCompressed)} tokens compressed)`);
+    lines.push(`Blocks: 0 active / ${totalBlocksList.length} total (${fmtTokens(state.stats.netTokensReclaimed ?? 0)} net tokens reclaimed; ${fmtTokens(state.stats.grossSourceTokens ?? state.stats.tokensCompressed)} gross source tokens)`);
   } else {
     lines.push("");
     lines.push("Blocks: none (nothing compressed yet)");

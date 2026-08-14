@@ -66,6 +66,15 @@ export interface CompressConfig {
   checkpointCompressor?: CompressorMode;
   /** Summary writer for branch/tree checkpoints. Default: main (host compactor). */
   branchSummaryCompressor?: CompressorMode;
+  /** Hard paid-call and value budgets. */
+  maxRangesPerCall?: number;
+  maxModelCalls?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxDurationMs?: number;
+  maxCostUsd?: number;
+  minimumNetSavingsTokens?: number;
+  minimumNetSavingsPercent?: number;
 }
 
 export interface BudgetConfig {
