@@ -10,6 +10,7 @@ export function createInitialState(sessionId = ""): CompressionState {
     currentEpoch: 0,
     blocks: [],
     messageRefs: { byRaw: {}, byRef: {} },
+    nextMessageRefId: "1",
     tokenSnapshots: {},
     artifacts: [],
     checkpoints: [],

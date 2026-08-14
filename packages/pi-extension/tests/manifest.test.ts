@@ -144,6 +144,14 @@ test("semantic validation retains requirements and unresolved work at Tier 3", (
   assert.match(validation.renderedSummary, /Next step: Verify fallback behavior\./);
 });
 
+test("Tier 2 and Tier 3 retain shipped outcomes classified as durable facts", () => {
+  const source = manifest([{ id: "assistant-1", role: "assistant", contentType: "text", text: "Fact: v1.13.0 shipped with the security milestone." }]);
+  for (const tier of [2, 3] as const) {
+    const validation = validateAndRepairSummary({ summary: "Release history.", manifest: source, sourceTokens: 100, tier });
+    assert.match(validation.renderedSummary, /Durable fact: v1\.13\.0 shipped with the security milestone\./);
+  }
+});
+
 test("merged manifests expose contradictions across child blocks", () => {
   const disabled = manifest([{ id: "user-1", role: "user", contentType: "text", text: "Constraint: Cache must remain disabled." }]);
   const enabled = manifest([{ id: "user-2", role: "user", contentType: "text", text: "Requirement: Cache must remain enabled." }]);

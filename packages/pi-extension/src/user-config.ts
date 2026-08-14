@@ -37,23 +37,36 @@ export async function loadUserConfig(cwd: string): Promise<UserAcpConfig> {
     try {
       const raw = await fs.readFile(file, "utf8");
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        const known = pickKnown(parsed as Record<string, unknown>);
-        const previousCompress = validCompressConfig(merged.compress);
-        const previousClearing = validClearingConfig(merged.clearing);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const candidate = parsed as Record<string, unknown>;
+        for (const diagnostic of configDiagnostics(candidate)) {
+          logWarn("config", { event: "invalid-value", file, path: diagnostic.path, reason: diagnostic.reason });
+        }
+        const known = pickKnown(candidate);
+        const previous = { ...merged };
         Object.assign(merged, known);
+        const previousCompress = validCompressConfig(previous.compress);
         const nextCompress = validCompressConfig(known.compress);
+        const combinedCompress = validCompressConfig({ ...previousCompress, ...nextCompress });
+        if (previousCompress || nextCompress) merged.compress = combinedCompress ?? previousCompress;
+        const previousClearing = validClearingConfig(previous.clearing);
         const nextClearing = validClearingConfig(known.clearing);
-        if (previousCompress || nextCompress) merged.compress = { ...previousCompress, ...nextCompress };
         if (previousClearing || nextClearing) {
           merged.clearing = {
             ...previousClearing,
             ...nextClearing,
-            excludeTools: [
-              ...(previousClearing?.excludeTools ?? []),
-              ...(nextClearing?.excludeTools ?? []),
-            ],
+            excludeTools: [...(previousClearing?.excludeTools ?? []), ...(nextClearing?.excludeTools ?? [])],
           };
+        }
+        const mergeValidated = <T extends object>(prior: T | undefined, next: T | undefined, validate: (value: unknown) => T | undefined): T | undefined =>
+          prior || next ? validate({ ...prior, ...next }) ?? prior : undefined;
+        merged.budget = mergeValidated(validBudgetConfig(previous.budget), validBudgetConfig(known.budget), validBudgetConfig);
+        merged.memory = mergeValidated(validMemoryConfig(previous.memory), validMemoryConfig(known.memory), validMemoryConfig);
+        merged.artifacts = mergeValidated(validArtifactConfig(previous.artifacts), validArtifactConfig(known.artifacts), validArtifactConfig);
+        merged.optimization = mergeValidated(validOptimizationConfig(previous.optimization), validOptimizationConfig(known.optimization), validOptimizationConfig);
+        if (previous.prompts || known.prompts) merged.prompts = { ...previous.prompts, ...known.prompts };
+        if (previous.delegate && typeof previous.delegate === "object" && known.delegate && typeof known.delegate === "object") {
+          merged.delegate = { ...previous.delegate, ...known.delegate };
         }
         debug.event("config-loaded", { file });
       }
@@ -100,32 +113,155 @@ async function updateCompressionConfigAt(dir: string, patch: Partial<CompressCon
   return file;
 }
 function validCompressConfig(value: unknown): CompressConfig | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as CompressConfig
-    : undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const out: CompressConfig = {};
+  for (const key of ["maxContextLimit", "emergencyThresholdPercent"] as const) {
+    const item = input[key];
+    if (percentRatio(item) !== undefined) out[key] = item as number | string;
+  }
+  if (typeof input.nudgeGrowthTokens === "number" && Number.isSafeInteger(input.nudgeGrowthTokens) && input.nudgeGrowthTokens >= 0) out.nudgeGrowthTokens = input.nudgeGrowthTokens;
+  if (typeof input.model === "string" && /^[^/\s]+\/.+/.test(input.model)) out.model = input.model;
+  const thinking = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  for (const key of ["thinkingLevel", "tier2ThinkingLevel", "tier3ThinkingLevel", "checkpointThinkingLevel", "branchThinkingLevel"] as const) {
+    if (typeof input[key] === "string" && thinking.has(input[key])) out[key] = input[key] as NonNullable<CompressConfig[typeof key]>;
+  }
+  const modes = new Set(["main", "configured"]);
+  for (const key of ["tier1Compressor", "tier2Compressor", "tier3Compressor", "checkpointCompressor", "branchSummaryCompressor"] as const) {
+    if (typeof input[key] === "string" && modes.has(input[key])) out[key] = input[key] as NonNullable<CompressConfig[typeof key]>;
+  }
+  for (const key of ["allowCrossProvider", "acknowledgeCrossProviderDataTransfer"] as const) {
+    if (typeof input[key] === "boolean") out[key] = input[key];
+  }
+  if (Array.isArray(input.secretPatterns) && input.secretPatterns.every((item) => typeof item === "string")) out.secretPatterns = input.secretPatterns;
+  const maxContext = percentRatio(out.maxContextLimit);
+  const emergency = percentRatio(out.emergencyThresholdPercent);
+  if (maxContext !== undefined && emergency !== undefined && maxContext > emergency) return undefined;
+  return out;
 }
 
 function validClearingConfig(value: unknown): Partial<ClearingConfig> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Partial<ClearingConfig>
-    : undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const out: Partial<ClearingConfig> = {};
+  if (typeof input.enabled === "boolean") out.enabled = input.enabled;
+  for (const key of ["keepRecentToolUses", "clearAtLeastTokens"] as const) {
+    if (typeof input[key] === "number" && Number.isSafeInteger(input[key]) && input[key] >= 0) out[key] = input[key];
+  }
+  if (Array.isArray(input.excludeTools) && input.excludeTools.every((item) => typeof item === "string")) out.excludeTools = input.excludeTools;
+  if (input.reasoning === "preserve" || input.reasoning === "safe-only") out.reasoning = input.reasoning;
+  return out;
 }
 
 function join(... parts: string[]): string {
   return path.join(...parts);
 }
 
-const KNOWN = new Set([
-  "debug", "autoUpdate", "modelContextLimit",
-  "toolBashDefaultTimeout", "toolOutputMaxBytes",
-  "delegate", "clearing", "compress", "budget", "memory", "artifacts", "optimization", "displayUsage",
-  "prompts", "acknowledgePromptsRisk",
+interface ConfigDiagnostic { path: string; reason: "unknown key" | "invalid value" | "invalid cross-field relationship" }
+
+const CONFIG_KEYS = new Set([
+  "debug", "autoUpdate", "modelContextLimit", "toolBashDefaultTimeout", "toolOutputMaxBytes",
+  "delegate", "clearing", "compress", "budget", "memory", "artifacts", "optimization",
+  "displayUsage", "prompts", "acknowledgePromptsRisk",
 ]);
+const NESTED_KEYS: Record<string, readonly string[]> = {
+  delegate: ["enabled", "displayUsage"],
+  clearing: ["enabled", "keepRecentToolUses", "clearAtLeastTokens", "excludeTools", "reasoning"],
+  compress: ["maxContextLimit", "emergencyThresholdPercent", "nudgeGrowthTokens", "model", "thinkingLevel", "tier2ThinkingLevel", "tier3ThinkingLevel", "checkpointThinkingLevel", "branchThinkingLevel", "tier1Compressor", "tier2Compressor", "tier3Compressor", "checkpointCompressor", "branchSummaryCompressor", "allowCrossProvider", "acknowledgeCrossProviderDataTransfer", "secretPatterns"],
+  budget: ["targetActiveTokens", "targetContextPercent", "hardContextPercent", "emergencyContextPercent", "outputReserveTokens", "safetyMarginTokens"],
+  memory: ["mode", "projectDirectory", "automaticPromotion"],
+  artifacts: ["maxArtifactBytes", "maxSessionBytes", "maxGlobalBytes", "lifecycle"],
+  optimization: ["automaticDistillation", "shadowCompaction", "telemetry", "costAwareRouting", "qualityAdaptation", "minimumBlocks", "minimumSourceTokens", "minimumSurvivalTurns", "maxReplans", "fallbackAfterFailures", "maxAdaptiveThinking"],
+  prompts: ["compressPhilosophy", "howToCompressRules", "tier2DistillRules", "tier3CondenseRules"],
+};
+
+function configDiagnostics(parsed: Record<string, unknown>): ConfigDiagnostic[] {
+  const diagnostics: ConfigDiagnostic[] = [];
+  for (const key of Object.keys(parsed)) {
+    if (!CONFIG_KEYS.has(key)) diagnostics.push({ path: key, reason: "unknown key" });
+  }
+  const validators: Record<string, (value: unknown) => Record<string, unknown> | undefined> = {
+    clearing: (value) => validClearingConfig(value) as Record<string, unknown> | undefined,
+    compress: (value) => validCompressConfig(value) as Record<string, unknown> | undefined,
+    budget: (value) => validBudgetConfig(value) as Record<string, unknown> | undefined,
+    memory: (value) => validMemoryConfig(value) as Record<string, unknown> | undefined,
+    artifacts: (value) => validArtifactConfig(value) as Record<string, unknown> | undefined,
+    optimization: (value) => validOptimizationConfig(value) as Record<string, unknown> | undefined,
+  };
+  for (const [section, keys] of Object.entries(NESTED_KEYS)) {
+    const raw = parsed[section];
+    if (raw === undefined) continue;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      diagnostics.push({ path: section, reason: "invalid value" });
+      continue;
+    }
+    const object = raw as Record<string, unknown>;
+    const allowed = new Set(keys);
+    for (const key of Object.keys(object)) {
+      if (!allowed.has(key)) diagnostics.push({ path: `${section}.${key}`, reason: "unknown key" });
+    }
+    if (section === "delegate") {
+      for (const key of keys) {
+        if (!(key in object)) continue;
+        const valid = key === "enabled" ? typeof object[key] === "boolean" : object[key] === "merged" || object[key] === "separate";
+        if (!valid) diagnostics.push({ path: `${section}.${key}`, reason: "invalid value" });
+      }
+      continue;
+    }
+    if (section === "prompts") {
+      for (const key of keys) if (key in object && typeof object[key] !== "string") diagnostics.push({ path: `${section}.${key}`, reason: "invalid value" });
+      continue;
+    }
+    const valid = validators[section]?.(raw);
+    if (!valid) {
+      diagnostics.push({ path: section, reason: "invalid cross-field relationship" });
+      continue;
+    }
+    for (const key of keys) {
+      if (key in object && !(key in valid)) diagnostics.push({ path: `${section}.${key}`, reason: "invalid value" });
+    }
+  }
+  const known = pickKnownWithoutDiagnostics(parsed);
+  for (const key of ["debug", "autoUpdate", "modelContextLimit", "toolBashDefaultTimeout", "toolOutputMaxBytes", "displayUsage", "acknowledgePromptsRisk"] as const) {
+    if (key in parsed && known[key] === undefined) diagnostics.push({ path: key, reason: "invalid value" });
+  }
+  if ("delegate" in parsed && typeof parsed.delegate !== "boolean" && (!parsed.delegate || typeof parsed.delegate !== "object" || Array.isArray(parsed.delegate))) {
+    diagnostics.push({ path: "delegate", reason: "invalid value" });
+  }
+  return diagnostics;
+}
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
+  return pickKnownWithoutDiagnostics(parsed);
+}
+
+function pickKnownWithoutDiagnostics(parsed: Record<string, unknown>): UserAcpConfig {
   const out: UserAcpConfig = {};
-  for (const [k, v] of Object.entries(parsed)) {
-    if (KNOWN.has(k)) (out as Record<string, unknown>)[k] = v;
+  if (typeof parsed.modelContextLimit === "number" && Number.isFinite(parsed.modelContextLimit) && parsed.modelContextLimit > 0) out.modelContextLimit = parsed.modelContextLimit;
+  for (const key of ["toolBashDefaultTimeout", "toolOutputMaxBytes"] as const) {
+    const value = parsed[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) out[key] = value;
+  }
+  if (typeof parsed.debug === "boolean") out.debug = parsed.debug;
+  if (typeof parsed.autoUpdate === "boolean") out.autoUpdate = parsed.autoUpdate;
+  if (typeof parsed.acknowledgePromptsRisk === "boolean") out.acknowledgePromptsRisk = parsed.acknowledgePromptsRisk;
+  if (parsed.displayUsage === "merged" || parsed.displayUsage === "separate") out.displayUsage = parsed.displayUsage;
+  if (typeof parsed.delegate === "boolean") out.delegate = parsed.delegate;
+  else if (parsed.delegate && typeof parsed.delegate === "object" && !Array.isArray(parsed.delegate)) {
+    const value = parsed.delegate as Record<string, unknown>;
+    out.delegate = {
+      ...(typeof value.enabled === "boolean" ? { enabled: value.enabled } : {}),
+      ...(value.displayUsage === "merged" || value.displayUsage === "separate" ? { displayUsage: value.displayUsage } : {}),
+    };
+  }
+  out.compress = validCompressConfig(parsed.compress);
+  out.clearing = validClearingConfig(parsed.clearing);
+  out.budget = validBudgetConfig(parsed.budget);
+  out.memory = validMemoryConfig(parsed.memory);
+  out.artifacts = validArtifactConfig(parsed.artifacts);
+  out.optimization = validOptimizationConfig(parsed.optimization);
+  if (parsed.prompts && typeof parsed.prompts === "object" && !Array.isArray(parsed.prompts)) {
+    out.prompts = Object.fromEntries(Object.entries(parsed.prompts as Record<string, unknown>).filter(([, value]) => typeof value === "string")) as Partial<Prompts>;
   }
   return out;
 }
@@ -133,17 +269,23 @@ function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
 /** Merge user config onto an adapter config: user config wins for the keys it
  *  sets. Used at session_start to apply runtime-discovered config. */
 export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): AdapterConfig {
-  const compress = {
+  const compress = validCompressConfig({
     ...validCompressConfig(adapter.compress),
     ...validCompressConfig(user.compress),
-  };
+  }) ?? validCompressConfig(adapter.compress) ?? {};
   const optimization = {
     ...validOptimizationConfig(adapter.optimization),
     ...validOptimizationConfig(user.optimization),
   };
-  const budget = { ...validBudgetConfig(adapter.budget), ...validBudgetConfig(user.budget) };
+  const requestedBudget = validBudgetConfig({ ...validBudgetConfig(adapter.budget), ...validBudgetConfig(user.budget) });
+  const contextWindow = user.modelContextLimit ?? adapter.modelContextLimit;
+  const budget = requestedBudget && (contextWindow === undefined
+    || (requestedBudget.outputReserveTokens ?? 0) + (requestedBudget.safetyMarginTokens ?? 0) < contextWindow)
+    ? requestedBudget
+    : validBudgetConfig(adapter.budget) ?? {};
   const memory = { ...validMemoryConfig(adapter.memory), ...validMemoryConfig(user.memory) };
-  const artifacts = { ...validArtifactConfig(adapter.artifacts), ...validArtifactConfig(user.artifacts) };
+  const artifacts = validArtifactConfig({ ...validArtifactConfig(adapter.artifacts), ...validArtifactConfig(user.artifacts) })
+    ?? validArtifactConfig(adapter.artifacts) ?? {};
   const adapterClearing = validClearingConfig(adapter.clearing);
   const userClearing = validClearingConfig(user.clearing);
   const clearing = {
@@ -169,13 +311,29 @@ export function applyUserConfig(adapter: AdapterConfig, user: UserAcpConfig): Ad
   };
 }
 
+function percentRatio(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 && value <= 1 ? value : undefined;
+  if (typeof value !== "string" || !/^\d+(?:\.\d+)?%$/.test(value)) return undefined;
+  const ratio = Number.parseFloat(value) / 100;
+  return Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : undefined;
+}
+
 function validBudgetConfig(value: unknown): BudgetConfig | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const candidate = value as Record<string, unknown>;
   const result: BudgetConfig = {};
-  for (const key of ["targetActiveTokens", "targetContextPercent", "hardContextPercent", "emergencyContextPercent", "outputReserveTokens", "safetyMarginTokens"] as const) {
-    if (typeof candidate[key] === "number" && Number.isFinite(candidate[key]) && candidate[key] >= 0) result[key] = candidate[key];
+  for (const key of ["targetActiveTokens", "outputReserveTokens", "safetyMarginTokens"] as const) {
+    if (typeof candidate[key] === "number" && Number.isSafeInteger(candidate[key]) && candidate[key] >= 0) result[key] = candidate[key];
   }
+  for (const key of ["targetContextPercent", "hardContextPercent", "emergencyContextPercent"] as const) {
+    if (typeof candidate[key] === "number" && Number.isFinite(candidate[key]) && candidate[key] > 0 && candidate[key] <= 1) result[key] = candidate[key];
+  }
+  const target = result.targetContextPercent;
+  const hard = result.hardContextPercent;
+  const emergency = result.emergencyContextPercent;
+  if ((target !== undefined && hard !== undefined && target > hard)
+    || (hard !== undefined && emergency !== undefined && hard > emergency)
+    || (target !== undefined && emergency !== undefined && target > emergency)) return undefined;
   return result;
 }
 
@@ -187,6 +345,9 @@ function validArtifactConfig(value: unknown): ArtifactConfig | undefined {
     if (typeof candidate[key] === "number" && Number.isFinite(candidate[key]) && candidate[key] > 0) result[key] = candidate[key];
   }
   if (candidate.lifecycle === "retain" || candidate.lifecycle === "session") result.lifecycle = candidate.lifecycle;
+  if ((result.maxArtifactBytes !== undefined && result.maxSessionBytes !== undefined && result.maxArtifactBytes > result.maxSessionBytes)
+    || (result.maxSessionBytes !== undefined && result.maxGlobalBytes !== undefined && result.maxSessionBytes > result.maxGlobalBytes)
+    || (result.maxArtifactBytes !== undefined && result.maxGlobalBytes !== undefined && result.maxArtifactBytes > result.maxGlobalBytes)) return undefined;
   return result;
 }
 
@@ -202,7 +363,17 @@ function validMemoryConfig(value: unknown): MemoryConfig | undefined {
 }
 
 function validOptimizationConfig(value: unknown): OptimizationConfig | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as OptimizationConfig
-    : undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const out: OptimizationConfig = {};
+  for (const key of ["automaticDistillation", "shadowCompaction", "telemetry", "costAwareRouting", "qualityAdaptation"] as const) {
+    if (typeof input[key] === "boolean") out[key] = input[key];
+  }
+  for (const key of ["minimumBlocks", "minimumSourceTokens", "minimumSurvivalTurns", "maxReplans", "fallbackAfterFailures"] as const) {
+    if (typeof input[key] === "number" && Number.isSafeInteger(input[key]) && input[key] >= 0) out[key] = input[key];
+  }
+  if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(input.maxAdaptiveThinking))) {
+    out.maxAdaptiveThinking = input.maxAdaptiveThinking as NonNullable<OptimizationConfig["maxAdaptiveThinking"]>;
+  }
+  return out;
 }

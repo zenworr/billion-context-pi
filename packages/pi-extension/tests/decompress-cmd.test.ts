@@ -61,6 +61,7 @@ test("/acp-decompress returns a block's content and stays repeatable (append mod
   // before m00001, and with 6 fillers m00001 is outside last-5 (Rule 1).
   const filler = (n: string) => `filler ${n} `.repeat(400);
   const entries = [
+    userMsg("e0", "Protected initial request."),
     userMsg("e1", longText),
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -76,7 +77,7 @@ test("/acp-decompress returns a block's content and stays repeatable (append mod
   const compressTool = api.tools.find((t: any) => t.name === "compress")!;
   const compressRes = await compressTool.execute(
     "tc1",
-    { content: [{ startId: "m00001", endId: "m00001", summary: "This range contained a detailed user message discussing the initial context for the session." }] },
+    { content: [{ startId: "m00002", endId: "m00002", summary: "This range contained a detailed user message discussing the initial context for the session." }] },
     undefined,
     undefined,
     ctx,

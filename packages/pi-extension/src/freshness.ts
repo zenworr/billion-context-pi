@@ -2,11 +2,13 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { readFileSync, statSync } from "node:fs";
+import { dirname, join, parse } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export interface ProjectContextFile {
   path: string;
   content: string;
+  deleted?: boolean;
 }
 
 export interface ContextFileFingerprint {
@@ -16,82 +18,116 @@ export interface ContextFileFingerprint {
   hash: string;
 }
 
+const PROJECT_INSTRUCTION_NAMES = ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"] as const;
 const MAX_WORLD_PATHS_PER_SECTION = 200;
 const MAX_WORLD_PATH_CHARS = 512;
 const execFileAsync = promisify(execFile);
 
 export interface WorldState {
   cwd: string;
+  available: boolean;
+  error?: string;
   repoRoot?: string;
   branch?: string;
   staged: string[];
   modified: string[];
   untracked: string[];
+  counts: { staged: number; modified: number; untracked: number };
+  omitted: { staged: number; modified: number; untracked: number };
+  statusDigest: string;
 }
 
 export class FreshnessTracker {
-  private fingerprints = new Map<string, string>();
-  private forceRefresh = true;
-  private pendingRuntimeOverlay: string | undefined;
+  private pendingWorldOverlay: string | undefined;
+  private authoritativeProjectOverlay: string | undefined;
   private lastWorldHash = "";
+  private hostProjectFiles: ProjectContextFile[] = [];
+  private baselineDiskPaths = new Set<string>();
+  private projectCwd: string | undefined;
   private currentProjectFiles: ProjectContextFile[] = [];
 
-  invalidate(): void { this.forceRefresh = true; }
+  invalidate(): void { this.authoritativeProjectOverlay = undefined; }
 
   queueRuntimeOverlay(project: string | undefined, world: string): void {
+    if (project !== undefined) this.authoritativeProjectOverlay = project;
     const worldHash = createHash("sha256").update(world).digest("hex");
-    const worldChanged = worldHash !== this.lastWorldHash;
+    if (worldHash !== this.lastWorldHash) this.pendingWorldOverlay = world;
     this.lastWorldHash = worldHash;
-    const parts = [project, worldChanged ? world : undefined].filter((value): value is string => Boolean(value));
-    if (parts.length > 0) this.pendingRuntimeOverlay = parts.join("\n\n");
+  }
+
+  previewRuntimeOverlay(): string | undefined {
+    const parts = [this.authoritativeProjectOverlay, this.pendingWorldOverlay].filter((value): value is string => Boolean(value));
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
   }
 
   consumeRuntimeOverlay(): string | undefined {
-    const overlay = this.pendingRuntimeOverlay;
-    this.pendingRuntimeOverlay = undefined;
-    return overlay;
+    const world = this.pendingWorldOverlay;
+    this.pendingWorldOverlay = undefined;
+    const parts = [this.authoritativeProjectOverlay, world].filter((value): value is string => Boolean(value));
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
   }
 
   branchProjectContext(): string | undefined {
     if (this.currentProjectFiles.length === 0) return undefined;
     return this.currentProjectFiles
+      .filter((file) => !file.deleted)
       .map((file) => `--- ${file.path} ---\n${file.content}`)
       .join("\n\n");
   }
 
-  projectOverlay(files: ProjectContextFile[]): string | undefined {
-    const current = files.map(currentProjectFile).sort((left, right) => left.path.localeCompare(right.path));
+  projectOverlay(files: ProjectContextFile[], cwd?: string): string | undefined {
+    this.hostProjectFiles = files.slice().sort((left, right) => left.path.localeCompare(right.path));
+    this.baselineDiskPaths = new Set(this.hostProjectFiles.filter((file) => fileExists(file.path)).map((file) => file.path));
+    this.projectCwd = cwd;
+    return this.refreshProjectOverlay();
+  }
+
+  /** Re-read and rediscover instruction files after a mutating tool. */
+  refreshProjectOverlay(): string | undefined {
+    const hostPaths = new Set(this.hostProjectFiles.map((file) => file.path));
+    const current = [
+      ...this.hostProjectFiles.map((file) => currentProjectFile(file, this.baselineDiskPaths.has(file.path))),
+      ...discoverProjectFiles(this.projectCwd, this.hostProjectFiles).filter((file) => !hostPaths.has(file.path)),
+    ].sort((left, right) => left.path.localeCompare(right.path));
     this.currentProjectFiles = current;
-    const next = new Map<string, string>();
+    const hostByPath = new Map(this.hostProjectFiles.map((file) => [file.path, createHash("sha256").update(file.content).digest("hex")]));
     const records = current.map((file) => fingerprint(file));
-    for (const record of records) next.set(record.path, JSON.stringify(record));
-    const changed = this.forceRefresh || next.size !== this.fingerprints.size
-      || [...next].some(([path, value]) => this.fingerprints.get(path) !== value);
-    this.fingerprints = next;
-    this.forceRefresh = false;
-    if (!changed) return undefined;
-    const body = records.sort((a, b) => a.path.localeCompare(b.path))
-      .map((record) => `${record.path} sha256=${record.hash} mtimeMs=${record.mtimeMs} bytes=${record.size}`)
-      .join("\n");
-    return `<acp-project-freshness>\nProject instruction files changed. Pi's current host-provided project context is authoritative; historical summaries are not.\n${body}\n</acp-project-freshness>`;
+    const overrides = current.filter((file, index) => hostByPath.get(file.path) !== records[index]!.hash);
+    if (overrides.length === 0) {
+      this.authoritativeProjectOverlay = undefined;
+      return undefined;
+    }
+    const body = overrides.map((file) => {
+      const record = records.find((candidate) => candidate.path === file.path)!;
+      if (file.deleted) return `<acp-authoritative-project-context path=${JSON.stringify(file.path)} deleted="true">\nThis instruction file was deleted on disk. Ignore stale host copies.\n</acp-authoritative-project-context>`;
+      return `<acp-authoritative-project-context path=${JSON.stringify(file.path)} sha256=${JSON.stringify(record.hash)}>\n${file.content}\n</acp-authoritative-project-context>`;
+    }).join("\n\n");
+    this.authoritativeProjectOverlay = `<acp-project-freshness>\nProject instruction files changed on disk. The full contents below override stale host copies until Pi reloads them.\n${body}\n</acp-project-freshness>`;
+    return this.authoritativeProjectOverlay;
   }
 }
 
 export function captureWorldState(cwd: string): WorldState {
-  const root = git(cwd, ["rev-parse", "--show-toplevel"]);
-  if (!root) return { cwd, staged: [], modified: [], untracked: [] };
-  const branch = git(root, ["branch", "--show-current"]) || undefined;
-  return parseWorldState(cwd, root, branch, gitRaw(root, ["status", "--porcelain=v1", "-z"]));
+  const rootResult = gitRawChecked(cwd, ["rev-parse", "--show-toplevel"]);
+  const root = rootResult.output.trim();
+  if (!rootResult.ok || !root) return unavailableWorldState(cwd, "Git repository state is unavailable.");
+  const branch = gitRawChecked(root, ["branch", "--show-current"]).output.trim() || undefined;
+  const status = gitRawChecked(root, ["status", "--porcelain=v1", "-z"]);
+  if (!status.ok) return unavailableWorldState(cwd, "Git status failed or exceeded its bounded output limit.", root, branch);
+  return parseWorldState(cwd, root, branch, status.output);
 }
 
 export async function captureWorldStateAsync(cwd: string): Promise<WorldState> {
-  const root = (await gitRawAsync(cwd, ["rev-parse", "--show-toplevel"])).trim();
-  if (!root) return { cwd, staged: [], modified: [], untracked: [] };
-  const [branchText, status] = await Promise.all([
-    gitRawAsync(root, ["branch", "--show-current"]),
-    gitRawAsync(root, ["status", "--porcelain=v1", "-z"]),
+  const rootResult = await gitRawAsyncChecked(cwd, ["rev-parse", "--show-toplevel"]);
+  const root = rootResult.output.trim();
+  if (!rootResult.ok || !root) return unavailableWorldState(cwd, "Git repository state is unavailable.");
+  const [branchResult, status] = await Promise.all([
+    gitRawAsyncChecked(root, ["branch", "--show-current"]),
+    gitRawAsyncChecked(root, ["status", "--porcelain=v1", "-z"]),
   ]);
-  return parseWorldState(cwd, root, branchText.trim() || undefined, status);
+  const branch = branchResult.output.trim() || undefined;
+  if (!status.ok) return unavailableWorldState(cwd, "Git status failed or exceeded its bounded output limit.", root, branch);
+  return parseWorldState(cwd, root, branch, status.output);
 }
 
 export function renderWorldOverlay(state: WorldState): string {
@@ -102,12 +138,39 @@ export function contextFilesFrom(ctx: ExtensionContext, files: ProjectContextFil
   return files ?? [];
 }
 
-function currentProjectFile(file: ProjectContextFile): ProjectContextFile {
+function currentProjectFile(file: ProjectContextFile, existedAtBaseline: boolean): ProjectContextFile {
   try {
     return { path: file.path, content: readFileSync(file.path, "utf8") };
   } catch {
-    return file;
+    return existedAtBaseline ? { path: file.path, content: "", deleted: true } : file;
   }
+}
+
+function discoverProjectFiles(cwd: string | undefined, host: ProjectContextFile[]): ProjectContextFile[] {
+  const directories = new Set(host.map((file) => dirname(file.path)));
+  if (cwd) {
+    let directory = cwd;
+    const root = parse(directory).root;
+    while (true) {
+      directories.add(directory);
+      if (directory === root) break;
+      directory = dirname(directory);
+    }
+  }
+  const found: ProjectContextFile[] = [];
+  for (const directory of directories) {
+    for (const name of PROJECT_INSTRUCTION_NAMES) {
+      const path = join(directory, name);
+      try { found.push({ path, content: readFileSync(path, "utf8") }); }
+      catch { /* absent or unreadable */ }
+    }
+  }
+  return found;
+}
+
+function fileExists(path: string): boolean {
+  try { return statSync(path).isFile(); }
+  catch { return false; }
 }
 
 function fingerprint(file: ProjectContextFile): ContextFileFingerprint {
@@ -122,34 +185,52 @@ function fingerprint(file: ProjectContextFile): ContextFileFingerprint {
 }
 
 function parseWorldState(cwd: string, root: string, branch: string | undefined, status: string): WorldState {
-  const staged: string[] = [];
-  const modified: string[] = [];
-  const untracked: string[] = [];
-  for (const entry of status.split("\0").filter(Boolean)) {
+  const stagedAll: string[] = [];
+  const modifiedAll: string[] = [];
+  const untrackedAll: string[] = [];
+  const entries = status.split("\0");
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (!entry) continue;
     const code = entry.slice(0, 2);
-    const path = entry.slice(3, 3 + MAX_WORLD_PATH_CHARS);
-    if (code === "??") {
-      if (untracked.length < MAX_WORLD_PATHS_PER_SECTION) untracked.push(path);
-    } else {
-      if (code[0] !== " " && code[0] !== "?" && staged.length < MAX_WORLD_PATHS_PER_SECTION) staged.push(path);
-      if (code[1] !== " " && code[1] !== "?" && modified.length < MAX_WORLD_PATHS_PER_SECTION) modified.push(path);
+    const currentPath = entry.slice(3);
+    const rename = code.includes("R") || code.includes("C");
+    const previousPath = rename ? entries[++index] ?? "" : "";
+    const displayPath = (rename ? `${previousPath} -> ${currentPath}` : currentPath).slice(0, MAX_WORLD_PATH_CHARS);
+    if (code === "??") untrackedAll.push(displayPath);
+    else {
+      if (code[0] !== " " && code[0] !== "?") stagedAll.push(displayPath);
+      if (code[1] !== " " && code[1] !== "?") modifiedAll.push(displayPath);
     }
   }
-  return { cwd, repoRoot: root, branch, staged: staged.sort(), modified: modified.sort(), untracked: untracked.sort() };
+  const counts = { staged: stagedAll.length, modified: modifiedAll.length, untracked: untrackedAll.length };
+  const staged = stagedAll.sort().slice(0, MAX_WORLD_PATHS_PER_SECTION);
+  const modified = modifiedAll.sort().slice(0, MAX_WORLD_PATHS_PER_SECTION);
+  const untracked = untrackedAll.sort().slice(0, MAX_WORLD_PATHS_PER_SECTION);
+  return {
+    cwd, available: true, repoRoot: root, branch, staged, modified, untracked, counts,
+    omitted: { staged: counts.staged - staged.length, modified: counts.modified - modified.length, untracked: counts.untracked - untracked.length },
+    statusDigest: createHash("sha256").update(status).digest("hex"),
+  };
 }
 
-async function gitRawAsync(cwd: string, args: string[]): Promise<string> {
+function unavailableWorldState(cwd: string, error: string, repoRoot?: string, branch?: string): WorldState {
+  return {
+    cwd, available: false, error, repoRoot, branch, staged: [], modified: [], untracked: [],
+    counts: { staged: 0, modified: 0, untracked: 0 },
+    omitted: { staged: 0, modified: 0, untracked: 0 },
+    statusDigest: createHash("sha256").update(`unavailable:${error}`).digest("hex"),
+  };
+}
+
+async function gitRawAsyncChecked(cwd: string, args: string[]): Promise<{ ok: boolean; output: string }> {
   try {
     const result = await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", maxBuffer: 2 * 1024 * 1024 });
-    return result.stdout;
-  } catch { return ""; }
+    return { ok: true, output: result.stdout };
+  } catch { return { ok: false, output: "" }; }
 }
 
-function gitRaw(cwd: string, args: string[]): string {
-  try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); }
-  catch { return ""; }
-}
-
-function git(cwd: string, args: string[]): string {
-  return gitRaw(cwd, args).trim();
+function gitRawChecked(cwd: string, args: string[]): { ok: boolean; output: string } {
+  try { return { ok: true, output: execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 2 * 1024 * 1024 }) }; }
+  catch { return { ok: false, output: "" }; }
 }

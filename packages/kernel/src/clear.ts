@@ -33,10 +33,14 @@ export function clearHistoricalContent(
     ...config.excludeTools,
   ]);
   const candidates: Candidate[] = [];
+  let currentTurnStart = messages.length;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]!.role === "user" && !messages[index]!.synthetic) { currentTurnStart = index; break; }
+  }
 
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]!;
-    if (isSafePlaintextReasoning(message, config)) {
+    if (isSafePlaintextReasoning(message, config, index, currentTurnStart, messages)) {
       addCandidate(candidates, index, message.text ?? "", CLEARED_REASONING_MARKER, countTokens);
       continue;
     }
@@ -71,8 +75,20 @@ export function clearHistoricalContent(
 function isSafePlaintextReasoning(
   message: CoreMessage,
   config: ClearingConfig,
+  index: number,
+  currentTurnStart: number,
+  messages: readonly CoreMessage[],
 ): boolean {
+  const group = message.protocolGroupId ?? message.id.split("#", 1)[0]!;
+  const hasExplicitGroup = message.protocolGroupId !== undefined || message.id.includes("#");
+  const companionComplete = messages.some((candidate, candidateIndex) => candidateIndex > index
+    && (!hasExplicitGroup || (candidate.protocolGroupId ?? candidate.id.split("#", 1)[0]!) === group)
+    && candidate.role === "assistant"
+    && (candidate.contentType === "text" || candidate.contentType === "tool-call"));
   return config.reasoning === "safe-only"
+    && index < currentTurnStart
+    && !message.hardProtected
+    && companionComplete
     && message.role === "assistant"
     && message.contentType === "reasoning"
     && message.reasoningKind === "plaintext-provider-agnostic"

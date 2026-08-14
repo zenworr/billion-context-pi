@@ -40,8 +40,16 @@ export interface CompressConfig {
   nudgeGrowthTokens?: number;
   /** Model selected by /acp-model, stored as "provider/model-id". */
   model?: string;
-  /** Thinking level used by the configured compression model. Default: "medium". */
+  /** Default thinking level used by configured compression. Default: "medium". */
   thinkingLevel?: CompressionThinkingLevel;
+  /** Tier-2 override. Default: "low" when omitted. */
+  tier2ThinkingLevel?: CompressionThinkingLevel;
+  /** Tier-3 override. Default: "minimal" when omitted. */
+  tier3ThinkingLevel?: CompressionThinkingLevel;
+  /** Full-checkpoint override. Default: the general level. */
+  checkpointThinkingLevel?: CompressionThinkingLevel;
+  /** Branch-summary override. Default: "low" when omitted. */
+  branchThinkingLevel?: CompressionThinkingLevel;
   /** Summary writer for Tier 1. Default: "main". */
   tier1Compressor?: CompressorMode;
   /** Summary writer for Tier 2. Default: "main". */
@@ -141,14 +149,12 @@ export interface AdapterConfig {
    *  re-run with a larger `timeout`. Set to 0 to disable (restore Pi's
    *  unbounded behavior). */
   toolBashDefaultTimeout?: number;
-  /** Hard byte cap applied to tool result text via the `tool_result` hook.
-   *  Default: 200000 (~200KB, roughly 5000 lines at ~40 bytes/line) — a
-   *  generous ceiling that stops runaway output. Pi already caps bash/read/grep
-   *  at 50KB/2000 lines (bash full output is saved to a temp file), so this
-   *  default mainly caps tools Pi doesn't cap. Set lower (e.g. 8192) for a
-   *  tighter context budget, or 0 to disable. When capped, oversized text is
-   *  head-truncated with a notice telling the model how to see the full output
-   *  (bash: read BashToolDetails.fullOutputPath). */
+  /** Byte cap applied to tool result text via the `tool_result` hook.
+   *  ACP first preserves the complete text in private content-addressed
+   *  storage and includes a bounded retrieval reference. If storage or quota
+   *  validation fails, ACP does not apply an additional cap. Non-text result
+   *  blocks remain unchanged. Default: 200000; set lower (for example, 8192)
+   *  for a tighter context budget, or 0 to disable. */
   toolOutputMaxBytes?: number;
   /** Delegate sub-agent config. Accepts a boolean shorthand (`true` →
    *  `{ enabled: true }`, `false` → `{ enabled: false }`) or a DelegateConfig
@@ -289,12 +295,24 @@ export function compressorModeForTier(adapter: AdapterConfig, tier: CompressionT
   return configured === "configured" ? "configured" : "main";
 }
 
-export function compressionThinkingLevel(adapter: AdapterConfig): CompressionThinkingLevel {
-  const level = adapter.compress?.thinkingLevel;
-  if (level === "off" || level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max") {
-    return level;
-  }
-  return "medium";
+export function compressionThinkingLevel(
+  adapter: AdapterConfig,
+  purpose: CompressionTier | "checkpoint" | "branch" = 1,
+): CompressionThinkingLevel {
+  const compress = adapter.compress;
+  const fallback = purpose === 2 ? "low" : purpose === 3 ? "minimal" : purpose === "branch" ? "low" : "medium";
+  const level = purpose === 2
+    ? compress?.tier2ThinkingLevel
+    : purpose === 3
+      ? compress?.tier3ThinkingLevel
+      : purpose === "checkpoint"
+        ? compress?.checkpointThinkingLevel
+        : purpose === "branch"
+          ? compress?.branchThinkingLevel
+          : compress?.thinkingLevel;
+  const resolved = level ?? (purpose === "checkpoint" ? compress?.thinkingLevel : purpose === 1 ? compress?.thinkingLevel : undefined) ?? fallback;
+  if (resolved === "off" || resolved === "minimal" || resolved === "low" || resolved === "medium" || resolved === "high" || resolved === "xhigh" || resolved === "max") return resolved;
+  return fallback;
 }
 
 export function parseCompressionModel(value: unknown): { provider: string; id: string } | undefined {

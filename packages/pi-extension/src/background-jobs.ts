@@ -66,6 +66,15 @@ export class TransactionalBackgroundJobs {
     if (this.activeKeys.has(key)) return "skipped";
     this.activeKeys.add(key);
     try {
+      // Run the same staleness check immediately before any paid provider call.
+      const preflight = await callbacks.current(snapshot, controller.signal);
+      if (!preflight || !sameSnapshot(snapshot, preflight)) {
+        if (replansRemaining > 0 && !controller.signal.aborted) {
+          this.activeKeys.delete(key);
+          return this.run(callbacks, controller, replansRemaining - 1);
+        }
+        return controller.signal.aborted ? "aborted" : "stale";
+      }
       const proposal = await callbacks.generate(snapshot, controller.signal);
       if (controller.signal.aborted) return "aborted";
       const current = await callbacks.current(snapshot, controller.signal);

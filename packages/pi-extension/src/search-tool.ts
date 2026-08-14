@@ -65,7 +65,7 @@ async function handleSearch(args: SearchArgs, runtime: AcpRuntime, ctx: Extensio
         return `No matches for "${args.query}" across ${blocks} block(s) and ${msgCount} historical message(s).`;
     }
 
-    await recordRecentRetrievals(runtime, ctx, results.map((result) => result.blockId ?? result.ref));
+    await recordRecentRetrievals(runtime, ctx, results.map((result) => result.checkpointId ?? result.blockId ?? result.ref));
     const lines = [`Found ${results.length} match(es) for "${args.query}" (searched ${blockCount} blocks + ${checkpointCount} checkpoints + ${msgCount} messages + ${artifactCount} artifacts):`];
     for (const r of results) lines.push("", formatResult(r));
     return lines.join("\n");

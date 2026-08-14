@@ -1,11 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { PinRecord } from "acp-kernel";
+import { defaultCountTokens, type PinRecord } from "acp-kernel";
 import type { AcpRuntime } from "./runtime.js";
 import { forcedCompressionLimit } from "./config.js";
 
 const MAX_ACTIVE_PINS = 8;
-const MAX_PINNED_CHARS = 48_000;
+const MAX_PINNED_TOKENS = 12_000;
 
 const pinSchema = Type.Object({
   ref: Type.String({ description: "Block id, message ref, or artifact id to keep in the current working set." }),
@@ -44,39 +44,40 @@ export function registerPinTool(pi: ExtensionAPI, runtime: AcpRuntime): void {
   });
 }
 
-export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"], messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"], ctx: ExtensionContext, runtime: AcpRuntime): string | undefined {
+export function renderPins(state: Awaited<ReturnType<AcpRuntime["stateFor"]>>["state"], messages: Awaited<ReturnType<AcpRuntime["stateFor"]>>["coreMessages"], ctx: ExtensionContext, runtime: AcpRuntime, baseProjectedTokens?: number): string | undefined {
   const messageByRef = new Map(messages.map((message) => [state.messageRefs.byRaw[message.id], message]));
   const parts: string[] = [];
   const contextWindow = runtime.liveContextLimit(ctx);
   const hardLimit = forcedCompressionLimit(runtime.adapter, contextWindow);
-  const projectedTokens = runtime.projectionFor(ctx.sessionManager.getSessionId())?.estimatedTokens ?? 0;
-  const budgetChars = Math.max(2_000, (hardLimit - projectedTokens) * 2);
-  let remainingChars = Math.min(MAX_PINNED_CHARS, budgetChars);
+  const projectedTokens = baseProjectedTokens ?? runtime.projectionFor(ctx.sessionManager.getSessionId())?.estimatedTokens ?? 0;
+  let remainingTokens = Math.max(0, Math.min(MAX_PINNED_TOKENS, hardLimit - projectedTokens));
   for (const pin of state.pins) {
-    if (remainingChars <= 0) break;
+    if (remainingTokens <= 0) break;
     if (pin.remainingTurns <= 0) continue;
     const kind = resolvePinKind(state, messages, pin.ref);
     if (kind === "block") {
       const block = state.blocks.find((item) => item.blockId === pin.ref);
       if (!block) continue;
-      const value = pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n");
-      const bounded = value.slice(0, remainingChars);
-      parts.push(`${bounded}${bounded.length < value.length ? `\n[pin truncated; retrieve ${block.blockId} with decompress]` : ""}`);
-      remainingChars -= bounded.length;
+      const full = block.effectiveMessageIds.map((id) => messages.find((message) => message.id === id)?.text ?? "").filter(Boolean).join("\n\n");
+      const value = pin.mode === "summary" ? `[${block.blockId}] ${block.summary}` : full || `[${block.blockId}] Full content is outside the active branch; retrieve with decompress({ blockId: "${block.blockId}" }).`;
+      const bounded = boundPinText(value, remainingTokens, `\n[pin truncated; retrieve ${block.blockId} with decompress]`);
+      parts.push(bounded);
+      remainingTokens -= defaultCountTokens(bounded);
     } else if (kind === "message") {
       const message = messageByRef.get(pin.ref);
       if (message) {
         const value = `[${pin.ref}] ${message.text ?? ""}`;
-        const bounded = value.slice(0, remainingChars);
-        parts.push(`${bounded}${bounded.length < value.length ? `\n[pin truncated; retrieve ${pin.ref} with decompress]` : ""}`);
-        remainingChars -= bounded.length;
+        const bounded = boundPinText(value, remainingTokens, `\n[pin truncated; retrieve ${pin.ref} with decompress]`);
+        parts.push(bounded);
+        remainingTokens -= defaultCountTokens(bounded);
       }
     } else if (kind === "artifact") {
       const artifact = state.artifacts.find((item) => item.id === pin.ref || item.sha256 === pin.ref);
       if (artifact) {
         const value = `[artifact ${artifact.id}] ${artifact.toolName ?? "tool"} output (${artifact.bytes} bytes; retrieve with acp_artifact).`;
-        parts.push(value.slice(0, remainingChars));
-        remainingChars -= value.length;
+        const bounded = boundPinText(value, remainingTokens, "\n[pin truncated; retrieve with acp_artifact]");
+        parts.push(bounded);
+        remainingTokens -= defaultCountTokens(bounded);
       }
     }
   }
@@ -93,6 +94,25 @@ export async function decrementPins(runtime: AcpRuntime, ctx: ExtensionContext):
     const pins = state.pins.map((pin) => ({ ...pin, remainingTurns: Math.max(0, pin.remainingTurns - 1) })).filter((pin) => pin.remainingTurns > 0);
     await runtime.save({ ...state, pins }, ctx);
   } finally { release(); }
+}
+
+export function boundPinText(value: string, maxTokens: number, truncationNotice: string): string {
+  if (maxTokens <= 0) return "";
+  if (defaultCountTokens(value) <= maxTokens) return value;
+  const noticeTokens = defaultCountTokens(truncationNotice);
+  if (noticeTokens >= maxTokens) return truncateToTokens(truncationNotice, maxTokens);
+  return `${truncateToTokens(value, maxTokens - noticeTokens)}${truncationNotice}`;
+}
+
+function truncateToTokens(value: string, maxTokens: number): string {
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (defaultCountTokens(value.slice(0, middle)) <= maxTokens) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low);
 }
 
 type PinKind = "block" | "message" | "artifact";

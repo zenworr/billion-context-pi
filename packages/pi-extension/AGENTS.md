@@ -43,7 +43,7 @@ pi-acp/
 │   ├── status-tool.ts        # acp_status tool (delegates to kernel.buildStatusReport)
 │   ├── commands.ts           # /acp slash command
 │   ├── system-prompt.ts      # System prompt with compression philosophy
-│   ├── update.ts             # Auto-update: checks npm, auto-installs latest
+│   ├── update.ts             # Update check: notification only; never installs
 │   ├── tokens.ts             # Token estimation utilities
 │   └── log.ts                # Debug logging
 ├── tests/                    # 45 tests
@@ -57,7 +57,7 @@ pi-acp/
 2. **Tags use XML format** `<acp tokens="2" type="text">m00001</acp>` — written with hex escapes (`\x3c`, `\x3e`) to avoid Write/Edit tool stripping
 3. **Assistant messages skip tag injection** — prevents model echo of XML tags
 4. **Tags appended to END of text** — matches opencode-acp pattern
-5. **Auto-update on session_start** — checks npm registry (6h throttle), auto-installs if newer
+5. **Notification-only update check on session_start** — checks npm registry with throttling and never installs updates
 6. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.14"`, NEVER `"^0.0.14"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
 
 ## 3. Development Standards

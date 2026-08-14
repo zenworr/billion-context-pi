@@ -60,10 +60,13 @@ export function compileCheckpointSource(input: {
   const activeBlocks = input.state.blocks
     .filter((block) => block.active && block.effectiveMessageIds.every((id) => preparedIds.has(rawMessageId(id))))
     .sort((left, right) => left.createdAt - right.createdAt || left.blockId.localeCompare(right.blockId));
+  const activeCheckpoint = input.state.currentCheckpointId
+    ? input.state.checkpoints.find((checkpoint) => checkpoint.id === input.state.currentCheckpointId)
+    : undefined;
   const priorCheckpoint = input.includePriorCheckpoint === false
     ? ""
     : input.preparation.previousSummary?.trim()
-      || input.state.checkpoints.at(-1)?.summary.trim()
+      || activeCheckpoint?.summary.trim()
       || "";
   const requirements = renderCurrentRequirements(fullManifest);
   const parts: string[] = [];
@@ -84,14 +87,9 @@ export function compileCheckpointSource(input: {
     parts.push(`[Recent raw tail]\n${serializeCoreMessages(rawTail, input.state.messageRefs.byRaw)}`);
   }
   const source = parts.join("\n\n");
-  const priorRecord = input.state.checkpoints.at(-1);
-  // Coverage is exact: every prepared source message represented by the full
-  // manifest is recorded, not only the recent raw tail. Prior checkpoint
-  // coverage remains reachable through the new checkpoint as well.
-  const sourceMessageIds = unique([
-    ...(priorCheckpoint && priorRecord ? priorRecord.sourceMessageIds : []),
-    ...preparedMessages.map((message) => rawMessageId(message.id)),
-  ]);
+  // Store direct ownership only. Prior coverage remains reachable through the
+  // checkpoint parent link instead of being copied into every epoch.
+  const sourceMessageIds = unique(preparedMessages.map((message) => rawMessageId(message.id)));
   return { source, sourceMessageIds, sourceTokens: defaultCountTokens(source) };
 }
 

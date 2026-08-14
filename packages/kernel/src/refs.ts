@@ -2,8 +2,7 @@ import type { CoreMessage, MessageRefMap } from "./types.js";
 
 const REF_WIDTH = 5;
 const MIN_INDEX = 1;
-const MAX_INDEX = 99999;
-const REF_PATTERN = /^m0*(\d{1,5})$/;
+const REF_PATTERN = /^m0*(\d+)$/;
 
 export const BLOCKED_REF = "BLOCKED";
 
@@ -12,10 +11,8 @@ export function emptyRefMap(): MessageRefMap {
 }
 
 export function indexToRef(index: number): string {
-  if (!Number.isInteger(index) || index < MIN_INDEX || index > MAX_INDEX) {
-    throw new RangeError(
-      `ref index out of bounds: ${index} (allowed ${MIN_INDEX}-${MAX_INDEX})`,
-    );
+  if (!Number.isSafeInteger(index) || index < MIN_INDEX) {
+    throw new RangeError(`ref index out of bounds: ${index} (expected a positive safe integer)`);
   }
   return `m${String(index).padStart(REF_WIDTH, "0")}`;
 }
@@ -24,7 +21,7 @@ export function refToIndex(ref: string): number | null {
   const match = REF_PATTERN.exec(ref.trim().toLowerCase());
   if (!match) return null;
   const index = Number(match[1]);
-  if (index < MIN_INDEX || index > MAX_INDEX) return null;
+  if (!Number.isSafeInteger(index) || index < MIN_INDEX) return null;
   return index;
 }
 
@@ -88,16 +85,12 @@ function allocateFreeRef(
   start: number,
 ): { text: string; index: number } {
   let candidate = Math.max(start, MIN_INDEX);
-  while (candidate <= MAX_INDEX) {
+  while (Number.isSafeInteger(candidate)) {
     const text = indexToRef(candidate);
-    if (!map.byRef[text]) {
-      return { text, index: candidate };
-    }
+    if (!map.byRef[text]) return { text, index: candidate };
     candidate++;
   }
-  throw new Error(
-    `ref capacity exhausted: cannot allocate beyond ${indexToRef(MAX_INDEX)}`,
-  );
+  throw new Error("ref capacity exhausted: allocator exceeded the safe integer range");
 }
 
 export function rebuildRefIndex(map: MessageRefMap): MessageRefMap {

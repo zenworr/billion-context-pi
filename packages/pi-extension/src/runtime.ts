@@ -199,13 +199,27 @@ export function reconcileBranchState(
   state: CompressionState,
   messages: ReturnType<typeof entriesToCoreMessages>,
 ): CompressionState {
-  return reconcileArtifactSources(syncBlocks(messages, state).state, messages);
+  const synced = reconcileArtifactSources(syncBlocks(messages, state).state, messages);
+  const activeIds = new Set(messages.map((message) => message.id.split("#", 1)[0]!));
+  const activeCheckpoint = synced.checkpoints.filter((checkpoint) => checkpoint.entryId && activeIds.has(checkpoint.entryId)).at(-1);
+  const currentEpoch = activeCheckpoint?.epoch ?? (synced.checkpoints.some((checkpoint) => checkpoint.entryId) ? 0 : synced.currentEpoch);
+  const currentCheckpointId = activeCheckpoint?.id;
+  return currentEpoch === synced.currentEpoch && currentCheckpointId === synced.currentCheckpointId
+    ? synced
+    : { ...synced, currentEpoch, currentCheckpointId };
 }
 
 function pruneOrphanRefs(state: CompressionState, messages: ReturnType<typeof entriesToCoreMessages>): void {
   const retainedRawIds = new Set(messages.map((message) => message.id));
   for (const block of state.blocks) {
     for (const rawId of [...block.directMessageIds, ...block.effectiveMessageIds]) retainedRawIds.add(rawId);
+  }
+  for (const checkpoint of state.checkpoints) {
+    for (const rootId of checkpoint.sourceMessageIds) {
+      for (const rawId of Object.keys(state.messageRefs.byRaw)) {
+        if (rawId === rootId || rawId.startsWith(`${rootId}#`)) retainedRawIds.add(rawId);
+      }
+    }
   }
   for (const [rawId, ref] of Object.entries(state.messageRefs.byRaw)) {
     if (retainedRawIds.has(rawId)) continue;
@@ -230,12 +244,19 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   const metadataTurns = new Map<string, number>();
 
   async function acquireLock(sid: string): Promise<() => void> {
-    const prev = locks.get(sid) ?? Promise.resolve();
-    let release!: () => void;
-    const next = new Promise<void>((resolve) => { release = () => { locks.delete(sid); resolve(); }; });
-    locks.set(sid, prev.then(() => next));
-    await prev;
-    return release;
+    const previous = locks.get(sid) ?? Promise.resolve();
+    let unlock!: () => void;
+    const current = new Promise<void>((resolve) => { unlock = resolve; });
+    const tail = previous.then(() => current);
+    locks.set(sid, tail);
+    await previous;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      unlock();
+      if (locks.get(sid) === tail) locks.delete(sid);
+    };
   }
 
   function liveContextLimit(ctx: ExtensionContext): number {

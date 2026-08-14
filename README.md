@@ -12,6 +12,15 @@ The hybrid architecture keeps the host transcript immutable and builds a pure ac
 
 Configured cross-provider compression requires both consent settings. Configured inputs are split below 220,000 tokens. Updates are notification-only and are never installed automatically.
 
+Safety properties:
+
+- ACP protects the first user request, the complete current turn, non-text media, pins, and provider protocol groups as indivisible working-set data.
+- Final-request accounting includes the projected history, authoritative project/world overlays, pins, nudge text, media estimates, and calibrated host overhead. The same projection controls status, the hard tool gate, and threshold-compaction cancellation.
+- Plaintext reasoning is preserved by default. Optional `safe-only` clearing requires an unsigned provider-agnostic reasoning block with a complete companion response.
+- Tool output is capped only after exact durable spooling succeeds. If storage or quota checks fail, ACP does not apply an additional irreversible cap.
+- Checkpoints record direct transactional ownership and parent links. They do not copy all ancestral message IDs into each epoch.
+- Provider work uses a fresh source/model/auth/consent preflight. Invalid configured summaries get one configured repair attempt, then an authenticated main-model or host fallback.
+
 ## Verification
 
 ```bash

@@ -17,9 +17,6 @@ export function prune(
   if (covered.size === 0) return [...messages];
 
   const inject = options.injectSummaries ?? true;
-  const firstUserIndex = messages.findIndex(
-    (message) => message.role === "user",
-  );
 
   const indexById = new Map<string, number>();
   messages.forEach((message, index) => indexById.set(message.id, index));
@@ -29,7 +26,7 @@ export function prune(
   return stripOrphanedReasoning(
     stripOrphanedToolResults(
       stripOrphanedToolCalls(
-        rebuildMessages(messages, covered, firstUserIndex, anchors),
+        rebuildMessages(messages, covered, anchors),
       ),
     ),
   );
@@ -69,7 +66,6 @@ function collectSummaryAnchors(
 function rebuildMessages(
   messages: CoreMessage[],
   covered: Set<string>,
-  firstUserIndex: number,
   anchors: SummaryAnchor[],
 ): CoreMessage[] {
   const result: CoreMessage[] = [];
@@ -78,10 +74,6 @@ function rebuildMessages(
   for (let index = 0; index < messages.length; index++) {
     while (pending.length > 0 && pending[0]!.insertAt === index) {
       result.push(renderSummary(pending.shift()!));
-    }
-    if (index === firstUserIndex && firstUserIndex >= 0) {
-      result.push(messages[index]!);
-      continue;
     }
     if (covered.has(messages[index]!.id)) continue;
     result.push(messages[index]!);

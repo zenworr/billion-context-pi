@@ -30,7 +30,7 @@
 ```json
 {
   "debug": false,
-  "autoUpdate": true,
+  "autoUpdate": false,
   "modelContextLimit": 200000,
   "toolBashDefaultTimeout": 60,
   "toolOutputMaxBytes": 200000,
@@ -94,10 +94,10 @@
 | 键 | 类型 | 默认值 | 状态 | 说明 |
 |----|------|--------|------|------|
 | `debug` | boolean | `false` | 🟢 ACTIVE | 开启日志中的详细调试事件。 |
-| `autoUpdate` | boolean | `true` | 🟢 ACTIVE | 启动时检查 npm 并自动安装更新。 |
+| `autoUpdate` | boolean | `false` | 🟢 ACTIVE | 检查 npm 并只显示更新通知；绝不自动安装。 |
 | `modelContextLimit` | number | *(自动)* | 🟢 ACTIVE | 覆盖上下文窗口大小（token 数）。 |
 | `toolBashDefaultTimeout` | number | `60` | 🟢 ACTIVE | 模型省略 `timeout` 时注入 bash 工具的默认超时秒数。 |
-| `toolOutputMaxBytes` | number | `200000` | 🟢 ACTIVE | 工具返回文本的硬性字节上限。 |
+| `toolOutputMaxBytes` | number | `200000` | 🟢 ACTIVE | 完整输出持久化后的文本上限；存储失败时不施加。 |
 
 **delegate 键**
 
@@ -114,7 +114,11 @@
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | 触发紧急截断的上下文阈值。 |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | 软压缩 nudge 的 token 增长步长。 |
 | `compress.model` | string | *(未设置)* | 🟢 ACTIVE | `/acp-model` 选择的 `provider/model-id`。 |
-| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | 已配置模型的思考级别：`"off"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"` 或 `"max"`。 |
+| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | 已配置模型的默认思考级别。 |
+| `compress.tier2ThinkingLevel` | string | `"low"` | 🟢 ACTIVE | Tier 2 思考级别。 |
+| `compress.tier3ThinkingLevel` | string | `"minimal"` | 🟢 ACTIVE | Tier 3 思考级别。 |
+| `compress.checkpointThinkingLevel` | string | *(通用级别)* | 🟢 ACTIVE | 完整检查点思考级别。 |
+| `compress.branchThinkingLevel` | string | `"low"` | 🟢 ACTIVE | 分支摘要思考级别。 |
 | `compress.tier1Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 1 摘要模型。 |
 | `compress.tier2Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 2 摘要模型。 |
 | `compress.tier3Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Tier 3 摘要模型。 |
@@ -151,9 +155,9 @@
 ### `autoUpdate`
 
 - **类型：** `boolean`
-- **默认值：** `true`
+- **默认值：** `false`
 - **状态：** 🟢 ACTIVE
-- **说明：** Pi 启动时检查 npm 是否有更新版本的 `billion-context-pi` 并自动安装。设为 `false` 可避免启动时的所有网络请求。也可通过 `ACP_AUTO_UPDATE` 环境变量（`ACP_AUTO_UPDATE=0` 或 `ACP_AUTO_UPDATE=false`）禁用，该变量优先于此配置。
+- **说明：** 启用后只检查 npm 是否有更新并显示通知。ACP 绝不会自动安装更新。设为 `false` 可避免启动时的网络请求。也可通过 `ACP_AUTO_UPDATE` 环境变量（`ACP_AUTO_UPDATE=0` 或 `ACP_AUTO_UPDATE=false`）禁用，该变量优先于此配置。
 
 ### `modelContextLimit`
 
@@ -174,7 +178,7 @@
 - **类型：** `number`
 - **默认值：** `200000`
 - **状态：** 🟢 ACTIVE
-- **说明：** 通过 `tool_result` 钩子对工具返回文本施加的硬性字节上限（约 200KB，约 5000 行）。它拦截 Pi 自身上限无法覆盖的失控输出（例如 Pi 不做限制的工具）。触发上限时，超长文本会被头部截断，并附带提示告知模型如何查看完整输出。设小一些（如 `8192`）可收紧上下文预算，设为 `0` 则完全禁用。
+- **说明：** 通过 `tool_result` 钩子限制工具返回文本。ACP 先把完整文本写入私有、内容寻址的 gzip artifact，并提供 `acp_artifact` 检索 ID；非文本块保持不变。只有持久化成功后才截断文本。若持久化或配额检查失败，ACP 不施加额外的不可逆截断。设小一些（如 `8192`）可收紧上下文预算，设为 `0` 则禁用。
 
 ---
 
@@ -210,7 +214,7 @@
 
 1. **基于增长的软 nudge**（0–75%）——由 `compress.nudgeGrowthTokens` 控制。
 2. **强制 nudge**（75–95%）——当用量越过 `compress.maxContextLimit` 时，无论增长门控如何都会触发 nudge。此阶段无损。
-3. **紧急截断**（95%+）——当用量越过 `compress.emergencyThresholdPercent` 时，截断大型工具输出以防止上下文溢出。此阶段有损。
+3. **紧急截断**（95%+）——当用量越过 `compress.emergencyThresholdPercent` 时，先外部化完整输出，再截断大型内联文本。持久化成功时完整输出可检索；持久化失败时 ACP 不施加额外截断。
 
 ### `compress.maxContextLimit`
 

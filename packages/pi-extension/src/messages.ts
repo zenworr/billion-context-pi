@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
-import { CLEARED_TOOL_RESULT_MARKER, type CoreMessage } from "acp-kernel";
+import { CLEARED_TOOL_RESULT_MARKER, type CoreMedia, type CoreMessage } from "acp-kernel";
 
 type AgentMessage = SessionMessageEntry["message"];
 
@@ -13,7 +14,7 @@ type AnyMessage = {
   summary?: string;
 };
 
-const REF_TAG_SOURCE = "(?:\x3cacp\\s[^>]*\x3em\\d{5}\x3c/acp\x3e|\\[m\\d{1,5}\\])";
+const REF_TAG_SOURCE = "(?:\x3cacp\\s[^>]*\x3em\\d+\x3c/acp\x3e|\\[m\\d+\\])";
 const REF_TAG = new RegExp(`^${REF_TAG_SOURCE}\\s?\\n?`);
 const TRAILING_REF_TAG = new RegExp(`\\n*${REF_TAG_SOURCE}\\s*$`);
 
@@ -25,8 +26,9 @@ export function entriesToCoreMessages(entries: SessionEntry[]): CoreMessage[] {
       // (session-manager.d.ts) — project it as a user message.
       if (entry.type === "custom_message") {
         const text = extractText(entry.content);
-        if (text.length > 0) {
-          out.push({ id: entry.id, role: "user", contentType: "text", text });
+        const media = mediaContent(entry.content);
+        if (text.length > 0 || media.length > 0) {
+          out.push(...protectUnsupportedContent([{ id: entry.id, role: "user", contentType: "text", text, synthetic: true }], entry.id, media));
         }
       } else if (entry.type === "compaction") {
         const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
@@ -54,24 +56,37 @@ export function entriesToCoreMessages(entries: SessionEntry[]): CoreMessage[] {
     const cores = projectMessage(entry.message, entry.id);
     out.push(...cores);
   }
-  return out;
+  const firstUserIndex = out.findIndex((message) => message.role === "user" && !message.synthetic);
+  let lastUserIndex = -1;
+  for (let index = out.length - 1; index >= 0; index--) {
+    if (out[index]!.role === "user" && !out[index]!.synthetic) { lastUserIndex = index; break; }
+  }
+  const protectedGroups = new Set<string>();
+  if (firstUserIndex >= 0) protectedGroups.add(out[firstUserIndex]!.protocolGroupId ?? out[firstUserIndex]!.id.split("#", 1)[0]!);
+  if (lastUserIndex >= 0) {
+    for (let index = lastUserIndex; index < out.length; index++) protectedGroups.add(out[index]!.protocolGroupId ?? out[index]!.id.split("#", 1)[0]!);
+  }
+  return out.map((message) => protectedGroups.has(message.protocolGroupId ?? message.id.split("#", 1)[0]!)
+    ? { ...message, hardProtected: true }
+    : message);
 }
 
 function projectMessage(message: AgentMessage, id: string): CoreMessage[] {
   const msg = message as AnyMessage;
   const role = msg.role;
+  const media = mediaContent(msg.content);
   if (role === "user") {
-    return [{ id, role: "user", contentType: "text", text: extractText(msg.content) }];
+    return protectUnsupportedContent([{ id, role: "user", contentType: "text", text: extractText(msg.content) }], id, media);
   }
   if (role === "toolResult") {
-    return [{
+    return protectUnsupportedContent([{
       id,
       role: "tool",
       contentType: "tool-result",
       toolName: msg.toolName,
       toolCallId: msg.toolCallId,
       text: extractText(msg.content),
-    }];
+    }], `tool:${msg.toolCallId ?? id}`, media);
   }
   if (role === "assistant") {
     const reasoning = reasoningContent(msg.content);
@@ -89,29 +104,60 @@ function projectMessage(message: AgentMessage, id: string): CoreMessage[] {
       const projectedText: CoreMessage[] = textParts.trim()
         ? [{ id: `${id}#text`, role: "assistant", contentType: "text", text: textParts }]
         : [];
-      const projectedCalls = calls.map((call) => {
-        const argStr = stringifyArgs(call.arguments);
-        return {
-          id: calls.length === 1 && !reasoning && projectedText.length === 0 ? id : `${id}#${call.id}`,
-          role: "assistant" as const,
-          contentType: "tool-call" as const,
-          toolName: call.name,
-          toolCallId: call.id,
-          text: argStr,
-        };
-      });
-      return [...projectedReasoning, ...projectedText, ...projectedCalls];
+      const projectedCalls: CoreMessage[] = calls.map((call) => ({
+        id: calls.length === 1 && !reasoning && projectedText.length === 0 ? id : `${id}#${call.id}`,
+        role: "assistant",
+        contentType: "tool-call",
+        toolName: call.name,
+        toolCallId: call.id,
+        text: stringifyArgs(call.arguments),
+      }));
+      return protectUnsupportedContent([...projectedReasoning, ...projectedText, ...projectedCalls], id, media);
     }
     const text = extractText(msg.content);
     const projectedText: CoreMessage[] = text.trim()
       ? [{ id, role: "assistant", contentType: "text", text }]
       : [];
-    return [...projectedReasoning, ...projectedText];
+    return protectUnsupportedContent([...projectedReasoning, ...projectedText], id, media);
   }
   const customText = extractText(msg.content) || fallbackText(msg);
-  return customText.length > 0
-    ? [{ id, role: "user", contentType: "text", text: customText }]
+  return customText.length > 0 || media.length > 0
+    ? protectUnsupportedContent([{ id, role: "user", contentType: "text", text: customText }], id, media)
     : [];
+}
+
+function protectUnsupportedContent(cores: CoreMessage[], protocolGroupId: string, media: CoreMedia[]): CoreMessage[] {
+  if (cores.length === 0 && media.length === 0) return [];
+  const base = cores.length > 0 ? cores : [{ id: protocolGroupId, role: "user" as const, contentType: "text" as const, text: "" }];
+  const estimatedInputTokens = media.reduce((sum, item) => sum + item.estimatedInputTokens, 0);
+  return base.map((core, index) => ({
+    ...core,
+    protocolGroupId,
+    hardProtected: media.length > 0 || undefined,
+    media: index === 0 && media.length > 0 ? media : undefined,
+    estimatedInputTokens: index === 0 && estimatedInputTokens > 0 ? estimatedInputTokens : undefined,
+  }));
+}
+
+function mediaContent(content: unknown): CoreMedia[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const block = item as { type?: string; mimeType?: string; data?: string; url?: string };
+    if (block.type === "text" || block.type === "thinking" || block.type === "toolCall") return [];
+    const serialized = safeStringify(block);
+    const byteLength = typeof block.data === "string"
+      ? Math.ceil(block.data.length * 0.75)
+      : Buffer.byteLength(serialized, "utf8");
+    const kind: CoreMedia["kind"] = block.type === "image" ? "image" : block.type === "audio" ? "audio" : block.type === "file" ? "file" : "unknown";
+    return [{
+      kind,
+      mimeType: block.mimeType,
+      byteLength,
+      digest: createHash("sha256").update(serialized).digest("hex"),
+      estimatedInputTokens: Math.max(2_048, Math.ceil(byteLength / 3)),
+    }];
+  });
 }
 
 function fallbackText(msg: AnyMessage): string {
@@ -160,7 +206,7 @@ export function messageRef(message: unknown): string | undefined {
       : [];
   for (const text of texts) {
     const tag = text.match(REF_TAG)?.[0] ?? text.match(TRAILING_REF_TAG)?.[0];
-    const ref = tag?.match(/m\d{1,5}/)?.[0];
+    const ref = tag?.match(/m\d+/)?.[0];
     if (ref) return ref;
   }
   return undefined;

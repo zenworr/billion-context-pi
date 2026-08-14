@@ -13,7 +13,37 @@ export async function recordRecentRetrievals(runtime: AcpRuntime, ctx: Extension
     const now = Date.now();
     const recent = Object.fromEntries(Object.entries(state.policyState.recentRetrievals)
       .filter(([, timestamp]) => now - timestamp <= RETRIEVAL_RETENTION_MS));
-    for (const ref of refs) recent[ref] = now;
+    const expanded = new Set(refs);
+    for (const ref of refs) {
+      const raw = state.messageRefs.byRef[ref] ?? ref;
+      const checkpoint = state.checkpoints.find((candidate) => candidate.id === ref
+        || candidate.sourceMessageIds.includes(raw)
+        || candidate.directSourceMessageIds?.includes(raw));
+      if (checkpoint) {
+        expanded.add(checkpoint.id);
+        let parent = checkpoint.parentCheckpointId;
+        while (parent) {
+          expanded.add(parent);
+          parent = state.checkpoints.find((candidate) => candidate.id === parent)?.parentCheckpointId;
+        }
+      }
+      const blockIds = new Set(state.blocks
+        .filter((block) => block.blockId === ref || block.effectiveMessageIds.includes(raw) || block.directMessageIds.includes(raw))
+        .map((block) => block.blockId));
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const block of state.blocks) {
+          if (blockIds.has(block.blockId)) continue;
+          if (block.directBlockIds?.some((child) => blockIds.has(child)) || (block.active && block.effectiveMessageIds.includes(raw))) {
+            blockIds.add(block.blockId);
+            changed = true;
+          }
+        }
+      }
+      for (const blockId of blockIds) expanded.add(blockId);
+    }
+    for (const ref of expanded) recent[ref] = now;
     await runtime.save({
       ...state,
       metadataRevision: state.metadataRevision + 1,

@@ -19,7 +19,7 @@ Settings are read from JSON files named `acp.json`. The global file applies to e
 
 > **Precedence:** Environment variable &gt; Project file &gt; Global file &gt; Built-in default.
 
-Files are loaded at session start. Missing files, malformed JSON, and unknown keys are silently ignored — the extension never fails to start because of a config issue. Only the documented keys are read; everything else is discarded.
+Files are loaded at session start. Missing files do not produce an error. Malformed JSON, unknown keys, invalid values, and unsafe cross-field relationships are ignored and logged with their configuration path; they never stop extension startup. Only documented, validated keys are applied.
 
 ---
 
@@ -30,7 +30,7 @@ Create `~/.pi/acp.json` (or `<project>/.pi/acp.json`) and drop in whichever keys
 ```json
 {
   "debug": false,
-  "autoUpdate": true,
+  "autoUpdate": false,
   "modelContextLimit": 200000,
   "toolBashDefaultTimeout": 60,
   "toolOutputMaxBytes": 200000,
@@ -97,7 +97,7 @@ All keys below are currently **ACTIVE**.
 | `autoUpdate` | boolean | `false` | 🟢 ACTIVE | Check npm for a newer version and show a notification. Never installs updates. |
 | `modelContextLimit` | number | *(auto)* | 🟢 ACTIVE | Override the context limit (in tokens). |
 | `toolBashDefaultTimeout` | number | `60` | 🟢 ACTIVE | Default `bash` tool timeout in seconds when the model omits it. |
-| `toolOutputMaxBytes` | number | `200000` | 🟢 ACTIVE | Hard byte cap on tool result text. |
+| `toolOutputMaxBytes` | number | `200000` | 🟢 ACTIVE | Byte cap after exact durable externalization; skipped if storage fails. |
 
 **Delegate keys**
 
@@ -114,7 +114,11 @@ All keys below are currently **ACTIVE**.
 | `compress.emergencyThresholdPercent` | number \| string | `"95%"` | 🟢 ACTIVE | Context threshold that triggers emergency truncation. |
 | `compress.nudgeGrowthTokens` | number | `50000` | 🟢 ACTIVE | Token growth step for soft compression nudges. |
 | `compress.model` | string | *(none)* | 🟢 ACTIVE | Model selected by `/acp-model`, written as `provider/model-id`. |
-| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | Thinking level for the configured model: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. |
+| `compress.thinkingLevel` | string | `"medium"` | 🟢 ACTIVE | Default thinking level for the configured model. |
+| `compress.tier2ThinkingLevel` | string | `"low"` | 🟢 ACTIVE | Tier-2 thinking override. |
+| `compress.tier3ThinkingLevel` | string | `"minimal"` | 🟢 ACTIVE | Tier-3 thinking override. |
+| `compress.checkpointThinkingLevel` | string | *(general level)* | 🟢 ACTIVE | Full-checkpoint thinking override. |
+| `compress.branchThinkingLevel` | string | `"low"` | 🟢 ACTIVE | Branch-summary thinking override. |
 | `compress.tier1Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 1. |
 | `compress.tier2Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 2. |
 | `compress.tier3Compressor` | `"main"` \| `"configured"` | `"main"` | 🟢 ACTIVE | Summary writer for Tier 3. |
@@ -149,7 +153,7 @@ Configured compression runs in an isolated, no-tools request. Every request is c
 
 Top-level `budget` controls `targetActiveTokens`, context percentages, `outputReserveTokens`, and `safetyMarginTokens`. The hard tool gate is derived per active model from the compiled provider projection and these reserves; it is not a fixed 204K threshold. The gate keeps bounded ACP recovery tools available and relaxes after a failed compression. Host compaction remains the checkpoint and overflow recovery path.
 
-Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`). `safe-only` clears only explicitly unsigned, provider-agnostic plaintext reasoning; opaque, encrypted, signed, or provider-specific reasoning is preserved. Cleared tool output is retrievable with `acp_artifact`; inline retrieval is byte-bounded and supports `offset`/`limit`. Artifacts are limited to 50 MiB each and 500 MiB per session. Orphaned session files are removed at startup or explicitly with `/acp artifacts-cleanup`. `pin_context` is capped at eight pins and a 48K-character total payload.
+Top-level `clearing` controls deterministic T0 clearing. Important fields are `enabled`, `keepRecentToolUses` (default 5), `clearAtLeastTokens` (default 16000), `excludeTools`, and `reasoning` (`"safe-only"` or `"preserve"`, default `"preserve"`). `safe-only` clears only explicitly unsigned, provider-agnostic plaintext reasoning after ACP confirms a complete companion response; opaque, encrypted, signed, current-turn, incomplete, or provider-specific reasoning is preserved. Cleared tool output is retrievable with `acp_artifact`; inline retrieval is byte-bounded and supports `offset`/`limit`. Artifacts are limited by default to 50 MiB each, 500 MiB per session, and 2 GiB globally. Quota updates use an inter-process lock and a bounded persistent index. If durable storage fails, ACP does not apply an additional irreversible cap. Fork shutdown keeps inherited artifact paths valid. Orphaned session files are removed at startup or explicitly with `/acp artifacts-cleanup`. `pin_context` is capped at eight pins and a token-estimated 48K-character total payload.
 
 Top-level `memory.mode` is `"off"`, `"session"`, or `"project"`. Project files are written only after an explicit `/acp promote bN`; `automaticPromotion` must remain `false`.
 
@@ -190,7 +194,7 @@ Top-level `optimization` is opt-in. `automaticDistillation` schedules T2/T3 prov
 - **Type:** `number`
 - **Default:** `200000`
 - **Status:** 🟢 ACTIVE
-- **Description:** A hard byte cap (~200 KB, roughly 5000 lines) applied to tool result text via the `tool_result` hook. It stops runaway output that Pi's own caps cannot catch (for example, from tools Pi does not cap). When the cap fires, the oversized text is head-truncated with a notice telling the model how to see the full output. Set lower (e.g. `8192`) for a tighter context budget, or set to `0` to disable the cap entirely.
+- **Description:** A byte cap applied to tool result text via the `tool_result` hook. Before ACP caps text, it stores the complete text in private content-addressed gzip storage and includes an `acp_artifact` retrieval ID. Non-text result blocks remain intact. If spooling or quota validation fails, ACP does not apply an additional cap and reports the recoverable inline or host-file source. Set lower (for example, `8192`) for a tighter context budget, or set to `0` to disable the cap.
 
 ---
 
@@ -226,7 +230,7 @@ The flow is:
 
 1. **Growth-driven soft nudges** (0–75%) — governed by `compress.nudgeGrowthTokens`.
 2. **Forced nudges** (75–95%) — once usage crosses `compress.maxContextLimit`, nudges fire regardless of the growth gate. These are lossless.
-3. **Emergency truncation** (95%+) — once usage crosses `compress.emergencyThresholdPercent`, large tool outputs are truncated to prevent context overflow. This is lossy.
+3. **Emergency truncation** (95%+) — once usage crosses `compress.emergencyThresholdPercent`, large inline tool output is externalized and truncated to prevent context overflow. The complete output remains retrievable when durable spooling succeeds; ACP skips its additional cap if spooling fails.
 
 ### `compress.maxContextLimit`
 

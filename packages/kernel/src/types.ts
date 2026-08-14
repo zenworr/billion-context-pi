@@ -9,6 +9,15 @@ export type ReasoningContentKind =
   | "opaque"
   | "provider-specific";
 
+export interface CoreMedia {
+  kind: "image" | "audio" | "file" | "unknown";
+  mimeType?: string;
+  byteLength?: number;
+  digest?: string;
+  estimatedInputTokens: number;
+  retrievableArtifactId?: string;
+}
+
 export interface CoreMessage {
   id: string;
   role: MessageRole;
@@ -18,6 +27,14 @@ export interface CoreMessage {
   toolCallId?: string;
   reasoningKind?: ReasoningContentKind;
   reasoningSignature?: string;
+  /** Root Pi entry used to keep provider protocol units indivisible. */
+  protocolGroupId?: string;
+  /** Unsupported provider content must stay verbatim in the active request. */
+  hardProtected?: boolean;
+  /** Synthetic host notifications are context, but are not user-turn boundaries. */
+  synthetic?: boolean;
+  media?: CoreMedia[];
+  estimatedInputTokens?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -207,7 +224,11 @@ export interface CheckpointRecord {
   summary: string;
   sourceBlockIds: string[];
   sourceMessageIds: string[];
+  parentCheckpointId?: string;
+  directSourceBlockIds?: string[];
+  directSourceMessageIds?: string[];
   firstKeptEntryId?: string;
+  entryId?: string;
   tokensBefore: number;
   createdAt: number;
   provider?: string;
@@ -264,8 +285,12 @@ export interface CompressionState {
   revision: number;
   sessionId: string;
   currentEpoch: number;
+  /** Checkpoint entry active on the current branch, if any. */
+  currentCheckpointId?: string;
   blocks: CompressionBlock[];
   messageRefs: MessageRefMap;
+  /** Persistent monotonic allocator; decimal string avoids namespace exhaustion. */
+  nextMessageRefId: string;
   tokenSnapshots: Record<string, number>;
   artifacts: ArtifactRecord[];
   checkpoints: CheckpointRecord[];
@@ -275,6 +300,8 @@ export interface CompressionState {
     nudgeBaselines: Record<string, number>;
     lastActionAt: Record<string, number>;
     recentRetrievals: Record<string, number>;
+    /** Stable completed-turn identity; prevents duplicate lifecycle hooks from aging blocks twice. */
+    lastSurvivedTurnId?: string;
     tokenCalibration: Record<string, TokenCalibrationState>;
   };
   stats: CompressionStats;

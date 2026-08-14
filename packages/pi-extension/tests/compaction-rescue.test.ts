@@ -193,7 +193,8 @@ test("synchronous Tier-1 rescue uses the authenticated configured model before c
   assert.match(fixture.calls[0]!.systemPrompt, /within 40000 characters/);
   assert.equal(fixture.calls[0]!.cacheRetention, "none");
   assert.notEqual(fixture.calls[0]!.sessionId, "tier-one-rescue-test");
-  assert.match(fixture.calls[0]!.source, /OLD_ALPHA/);
+  assert.doesNotMatch(fixture.calls[0]!.source, /OLD_ALPHA/, "first user remains hard-protected");
+  assert.match(fixture.calls[0]!.source, /OLD_BETA/);
   assert.match(fixture.calls[0]!.source, /OLD_DELTA/);
   assert.doesNotMatch(fixture.calls[0]!.source, /RECENT_PROTECTED|CURRENT_REQUEST/);
   assert.equal(result?.cancel, undefined, "uncalibrated rescue cannot cancel host compaction");
@@ -213,7 +214,7 @@ test("synchronous Tier-1 rescue uses the authenticated configured model before c
   assert.equal(state.blocks.length, 1);
   const block = state.blocks[0]!;
   assert.equal(block.tier, 1);
-  assert.deepEqual(block.effectiveMessageIds, ["e1", "e2", "e3", "e4"]);
+  assert.deepEqual(block.effectiveMessageIds, ["e2", "e3", "e4"]);
   assert.match(block.sourceHash ?? "", /^[a-f0-9]{64}$/);
   assert.match(block.summaryHash ?? "", /^[a-f0-9]{64}$/);
   assert.match(block.manifest?.sourceHash ?? "", /^[a-f0-9]{64}$/);
@@ -301,7 +302,7 @@ test("Tier-1 rescue abort preserves host compaction without committing a block",
 
 test("Tier-1 rescue rejects a stale raw prefix and preserves host fallback", async (t) => {
   const fixture = await rescueFixture((entries) => {
-    entries[0] = userEntry("e1", `CHANGED_AFTER_SNAPSHOT ${"new branch content ".repeat(180)}`);
+    entries[1] = userEntry("e2", `CHANGED_AFTER_SNAPSHOT ${"new branch content ".repeat(180)}`);
   });
   t.after(() => rm(fixture.dir, { recursive: true, force: true }));
 

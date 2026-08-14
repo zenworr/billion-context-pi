@@ -2,10 +2,14 @@ import type { CompressionState, CheckpointRecord } from "./types.js";
 
 export interface CommitCheckpointInput {
   summary: string;
-  /** Raw message ids actually included in the checkpoint source. */
+  /** Raw message ids actually included in this checkpoint source. */
   sourceMessageIds?: string[];
+  /** ACP blocks captured before Pi mutates the active branch. */
+  sourceBlockIds?: string[];
   tokensBefore?: number;
   firstKeptEntryId?: string;
+  entryId?: string;
+  parentCheckpointId?: string;
   provider?: string;
   model?: string;
   provenance?: CheckpointRecord["provenance"];
@@ -25,17 +29,24 @@ export function commitCheckpointEpoch(state: CompressionState, input: CommitChec
   const epoch = state.currentEpoch + 1;
   const createdAt = input.createdAt ?? Date.now();
   const sourceIds = new Set<string>(input.sourceMessageIds ?? []);
-  const subsumedBlocks = sourceIds.size === 0
-    ? []
-    : state.blocks.filter((block) => block.active && block.effectiveMessageIds.every((id) => sourceIds.has(id)));
+  const explicitBlockIds = new Set(input.sourceBlockIds ?? []);
+  const subsumedBlocks = explicitBlockIds.size > 0
+    ? state.blocks.filter((block) => explicitBlockIds.has(block.blockId))
+    : sourceIds.size === 0
+      ? []
+      : state.blocks.filter((block) => block.active && block.effectiveMessageIds.every((id) => sourceIds.has(id) || sourceIds.has(id.split("#", 1)[0]!)));
   const subsumedIds = new Set(subsumedBlocks.map((block) => block.blockId));
   const checkpoint: CheckpointRecord = {
     id: `c${state.nextCheckpointId}`,
     epoch,
     summary: input.summary,
     firstKeptEntryId: input.firstKeptEntryId,
+    entryId: input.entryId,
     sourceBlockIds: [...subsumedIds],
     sourceMessageIds: [...sourceIds],
+    parentCheckpointId: input.parentCheckpointId ?? state.currentCheckpointId,
+    directSourceBlockIds: [...subsumedIds],
+    directSourceMessageIds: [...sourceIds],
     tokensBefore: input.tokensBefore ?? 0,
     createdAt,
     provider: input.provider,
@@ -51,6 +62,7 @@ export function commitCheckpointEpoch(state: CompressionState, input: CommitChec
     state: {
       ...state,
       currentEpoch: epoch,
+      currentCheckpointId: checkpoint.id,
       blocks: state.blocks.map((block) => subsumedIds.has(block.blockId) ? { ...block, active: false } : block),
       checkpoints: [...state.checkpoints, checkpoint],
       nextCheckpointId: state.nextCheckpointId + 1,

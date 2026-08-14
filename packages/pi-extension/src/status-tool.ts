@@ -13,7 +13,7 @@ const StatusParams = Type.Object({
   view: Type.Optional(Type.Union([Type.Literal("ranges"), Type.Literal("messages")], { description: 'For uncompressed scope: "ranges" (default) or "messages" (per-message listing).' })),
   tool: Type.Optional(Type.String({ description: 'Filter by tool name (e.g. "bash", "read"). Only for uncompressed+messages.' })),
   sort: Type.Optional(Type.Union([Type.Literal("size"), Type.Literal("time"), Type.Literal("tool"), Type.Literal("age")], { description: "Sort order. Default: size." })),
-  limit: Type.Optional(Type.Number({ description: "Max items to show (default: 30)." })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max items to show (default: 30, maximum: 100)." })),
 });
 
 type StatusArgs = Static<typeof StatusParams>;
@@ -84,7 +84,9 @@ async function handleStatus(args: StatusArgs, runtime: AcpRuntime, ctx: Extensio
   const globalArtifactBytes = await artifactStoreBytes().catch(() => undefined);
   const readyArtifacts = turn.state.artifacts.filter((artifact) => artifact.retrievable).length;
   const unavailableArtifacts = turn.state.artifacts.length - readyArtifacts;
+  const finalProjection = runtime.projectionFor(ctx.sessionManager.getSessionId());
   extra.push("");
+  if (finalProjection) extra.push(`Final request projection: ${Math.round(finalProjection.estimatedTokens).toLocaleString("en-US")} tokens (${finalProjection.projectedMessages} messages; hash ${finalProjection.projectionHash.slice(0, 12)}).`);
   extra.push(`Artifacts: ${readyArtifacts} ready, ${unavailableArtifacts} unavailable; session ${formatStorage(sessionArtifactBytes)}/${formatStorage(runtime.adapter.artifacts?.maxSessionBytes ?? 500 * 1024 * 1024)}; global ${globalArtifactBytes === undefined ? "unavailable" : `${formatStorage(globalArtifactBytes)}/${formatStorage(runtime.adapter.artifacts?.maxGlobalBytes ?? 2 * 1024 * 1024 * 1024)}`}; lifecycle ${runtime.adapter.artifacts?.lifecycle ?? "retain"}.`);
   if (nudge) {
     extra.push("");

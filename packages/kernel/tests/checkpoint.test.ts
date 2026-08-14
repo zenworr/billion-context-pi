@@ -37,6 +37,35 @@ test("checkpoint epochs deactivate but retain prior active blocks", () => {
   assert.equal(second.state.currentEpoch, 2);
   assert.equal(second.state.checkpoints.length, 2);
   assert.equal(second.checkpoint.id, "c2");
+  assert.equal(second.checkpoint.parentCheckpointId, "c1");
+  assert.deepEqual(second.checkpoint.directSourceMessageIds, [], "checkpoint ownership is direct, not cumulatively copied");
   assert.equal(second.checkpoint.coverageComplete, false, "missing migrated ownership never claims completeness");
   assert.equal(second.state.revision, state.revision + 2);
+});
+
+test("checkpoint parent follows the active branch rather than global creation order", () => {
+  const base = createInitialState("branched-checkpoint");
+  const first = commitCheckpointEpoch(base, { summary: "common", entryId: "entry-common" });
+  const sibling = commitCheckpointEpoch(first.state, { summary: "sibling", entryId: "entry-sibling" });
+  const rewound = { ...sibling.state, currentEpoch: first.checkpoint.epoch, currentCheckpointId: first.checkpoint.id };
+  const branch = commitCheckpointEpoch(rewound, { summary: "new branch", entryId: "entry-branch" });
+  assert.equal(branch.checkpoint.parentCheckpointId, first.checkpoint.id);
+  assert.notEqual(branch.checkpoint.parentCheckpointId, sibling.checkpoint.id);
+});
+
+test("checkpoint commit consumes the blocks captured before Pi mutates the branch", () => {
+  const state = createInitialState("transactional-checkpoint");
+  state.blocks.push({
+    blockId: "b1", runId: "r1", active: false, tier: 1, epoch: 0,
+    summary: "captured summary", compressedTokens: 100,
+    directMessageIds: ["raw-1"], effectiveMessageIds: ["raw-1"], directBlockIds: [],
+    createdAt: 1, survivedCount: 0, generation: "young",
+  });
+  const committed = commitCheckpointEpoch(state, {
+    summary: "host checkpoint", sourceMessageIds: ["raw-1"], sourceBlockIds: ["b1"],
+    entryId: "compaction-entry", coverageComplete: true,
+  });
+  assert.deepEqual(committed.checkpoint.directSourceBlockIds, ["b1"]);
+  assert.equal(committed.checkpoint.entryId, "compaction-entry");
+  assert.equal(committed.state.blocks[0]!.active, false);
 });

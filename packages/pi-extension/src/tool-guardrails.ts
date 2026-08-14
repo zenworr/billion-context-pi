@@ -19,6 +19,7 @@ export function isBashToolResult(e: ToolResultEvent): e is BashToolResultEvent {
 type ContentPart = ToolResultEvent["content"][number];
 
 const RECOVERY_TOOLS = new Set(["compress", "acp_status", "search_context", "decompress", "acp_artifact"]);
+const RECOVERY_OUTPUT_MAX_BYTES = 32 * 1024;
 
 export function forcedCompressionReason(tokens: number, limit: number): string {
   return `⚠️ Context limit reached — compress now, or use a bounded ACP recovery tool. ACP's current compiled projection is ${Math.round(tokens).toLocaleString("en-US")} tokens (active-model hard limit: ${Math.round(limit).toLocaleString("en-US")}). Only compression and bounded ACP recovery tools are allowed until the projection is below the limit.`;
@@ -159,7 +160,11 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
     const fullPath = isBash ? event.details?.fullOutputPath : undefined;
     const timeoutSecs =
       isBash && event.isError ? detectBashTimeout(event.content) : undefined;
-    const max = runtime.adapter.toolOutputMaxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
+    const configuredMax = runtime.adapter.toolOutputMaxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
+    const projection = runtime.projectionFor(ctx.sessionManager.getSessionId());
+    const hardLimit = forcedCompressionLimit(runtime.adapter, runtime.liveContextLimit(ctx));
+    const recoveryConstrained = RECOVERY_TOOLS.has(event.toolName) && (projection?.estimatedTokens ?? 0) >= hardLimit;
+    const max = recoveryConstrained ? Math.min(configuredMax, RECOVERY_OUTPUT_MAX_BYTES) : configuredMax;
     const textParts = fullPath ? [] : toolResultTextParts(event.content);
     const willCapNonBash = !isBash && max > 0
       && Buffer.byteLength(textParts.join("\n"), "utf8") > max;
@@ -176,6 +181,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         textParts: fullPath ? undefined : textParts,
+        contentParts: isBash ? undefined : event.content,
         bashFullOutputPath: fullPath,
         force: willCapNonBash,
         maxArtifactBytes: runtime.adapter.artifacts?.maxArtifactBytes,
@@ -217,7 +223,7 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
     }
 
     let modified: ToolResultEvent["content"] | undefined;
-    if (max > 0) {
+    if (max > 0 && !spoolFailure) {
       const next = capToolOutput(event.content, max, fullPath);
       if (next) {
         modified = next;
@@ -226,15 +232,15 @@ export function wireToolGuardrails(pi: ExtensionAPI, runtime: AcpRuntime): void 
       }
     }
 
-    if (spoolFailure && !isBash) {
+    if (spoolFailure) {
       modified = appendTextNotice(
-        modified ?? event.content,
-        `[ACP guardrail: durable artifact storage failed (${spoolFailure}); output was explicitly capped and the full non-Bash result is unavailable. Retry with narrower output or free artifact quota.]`,
+        event.content,
+        `[ACP guardrail: durable artifact storage failed (${spoolFailure}); ${fullPath ? `ACP did not apply an additional cap and the host full-output file remains at ${fullPath}. ` : "the full exact result was preserved inline and was not capped. "}Retry with narrower output or free artifact quota.]`,
       );
     } else if (modified && readyArtifactId && !isBash) {
       modified = appendTextNotice(
         modified,
-        `[ACP artifact: full exact output is available as ${readyArtifactId}. Retrieve it with acp_artifact({ id: "${readyArtifactId}" }).]`,
+        `[ACP artifact: the full exact ordered tool-result blocks are available as ${readyArtifactId}. Retrieve the versioned structured artifact with acp_artifact({ id: "${readyArtifactId}" }).]`,
       );
     }
 

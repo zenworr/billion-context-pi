@@ -138,6 +138,42 @@ test("loadUserConfig and applyUserConfig preserve validated budget and memory se
   }
 });
 
+test("loadUserConfig accepts explicit zero caps and rejects unsafe cross-field order", async () => {
+  const tmpDir = path.join(os.tmpdir(), `acp-test-cross-fields-${Date.now()}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  await writeConfig(tmpDir, {
+    toolBashDefaultTimeout: 0,
+    toolOutputMaxBytes: 0,
+    budget: { targetContextPercent: 0.9, hardContextPercent: 0.8, emergencyContextPercent: 0.95 },
+    artifacts: { maxArtifactBytes: 3_000, maxSessionBytes: 2_000, maxGlobalBytes: 4_000 },
+    compress: { maxContextLimit: "100.1%", emergencyThresholdPercent: "95%" },
+  });
+  try {
+    const loaded = await loadUserConfig(tmpDir);
+    assert.equal(loaded.toolBashDefaultTimeout, 0);
+    assert.equal(loaded.toolOutputMaxBytes, 0);
+    assert.equal(loaded.budget, undefined);
+    assert.equal(loaded.artifacts, undefined);
+    assert.deepEqual(loaded.compress, { emergencyThresholdPercent: "95%" });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("applyUserConfig revalidates cross-source thresholds and total reserves", () => {
+  const applied = applyUserConfig({
+    modelContextLimit: 10_000,
+    compress: { maxContextLimit: "90%" },
+    budget: { outputReserveTokens: 4_000 },
+  }, {
+    compress: { emergencyThresholdPercent: "80%" },
+    budget: { safetyMarginTokens: 7_000 },
+  });
+  assert.equal(applied.compress?.maxContextLimit, "90%", "unsafe merged compression relation falls back to adapter values");
+  assert.equal(applied.compress?.emergencyThresholdPercent, undefined);
+  assert.deepEqual(applied.budget, { outputReserveTokens: 4_000 }, "reserve sum larger than context falls back safely");
+});
+
 test("loadUserConfig preserves validated artifact quotas and lifecycle", async () => {
   const tmpDir = path.join(os.tmpdir(), `acp-test-artifacts-${Date.now()}`);
   await fs.mkdir(tmpDir, { recursive: true });
@@ -223,6 +259,24 @@ test("applyUserConfig preserves protected adapter fields", () => {
   assert.deepEqual(result.coreOverrides, { someKey: "someValue" }, "coreOverrides preserved");
   assert.deepEqual(result.protectedTools, ["read", "write"], "protectedTools preserved");
   assert.equal(result.preserveRecentMessages, 5000, "preserveRecentMessages preserved");
+});
+
+test("loadUserConfig rejects malformed nested values before runtime use", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "acp-invalid-config-"));
+  await writeConfig(tmpDir, {
+    modelContextLimit: "huge",
+    compress: { tier1Compressor: "unsafe", thinkingLevel: "infinite", nudgeGrowthTokens: -1, allowCrossProvider: "yes" },
+    clearing: { keepRecentToolUses: -4, excludeTools: ["read", 42], reasoning: "erase" },
+    optimization: { minimumBlocks: -1, automaticDistillation: "yes" },
+    delegate: { enabled: "yes", displayUsage: "combined" },
+  });
+  const loaded = await loadUserConfig(tmpDir);
+  assert.notEqual(typeof loaded.modelContextLimit, "string");
+  assert.equal(loaded.compress?.tier1Compressor, undefined);
+  assert.equal(loaded.compress?.thinkingLevel, undefined);
+  assert.equal(loaded.clearing?.keepRecentToolUses, undefined);
+  assert.equal(loaded.optimization?.minimumBlocks, undefined);
+  assert.notEqual((loaded.delegate as { enabled?: unknown } | undefined)?.enabled, "yes");
 });
 
 test("applyUserConfig with empty user config returns adapter unchanged", () => {

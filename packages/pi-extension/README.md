@@ -150,7 +150,7 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
 ```json
 {
   "debug": false,
-  "autoUpdate": true,
+  "autoUpdate": false,
   "modelContextLimit": 200000,
   "delegate": true,
   "toolBashDefaultTimeout": 60,
@@ -179,16 +179,16 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
 | Key | Default | Description |
 |-----|---------|-------------|
 | `debug` | `false` | Enable verbose **debug-level** events in the log. The always-on log (lifecycle events, errors, warnings) is written regardless; `debug` only adds extra diagnostics. Also enabled by env `ACP_DEBUG=1`. |
-| `autoUpdate` | `true` | On Pi startup, check npm for a newer version and auto-install it (throttled to one check per 3 minutes). Disable to avoid all startup network calls. |
+| `autoUpdate` | `false` | Check npm and show a notification only. ACP never installs updates. Disable to avoid startup network calls. |
 | `modelContextLimit` | *(auto)* | Override the context limit (in tokens). Defaults to the model's `contextWindow`. |
 | `delegate` | `true` | Enable the `acp_delegate` tools (delegate/wait/cancel) and their system-prompt section. Set `false` to skip registering them (e.g. you use a different sub-agent extension, or run headless where async injection adds no value). |
 | `toolBashDefaultTimeout` | `60` | Seconds injected into the `bash` tool when the model omits `timeout`. Pi has **no** default of its own, so without this a forgotten timeout can hang for thousands of seconds. On timeout the model is guided to re-run with a larger `timeout`. `0` restores Pi's unbounded behavior. |
-| `toolOutputMaxBytes` | `200000` | Hard byte cap on tool result text (~5000 lines at ~40 B/line; applied via the `tool_result` hook). Stops runaway output that Pi's own 50KB/2000-line cap can't catch (e.g. tools Pi doesn't cap). When it fires the model is told how to see the full output — for `bash` the full output is in its temp file (`BashToolDetails.fullOutputPath`); set lower (e.g. `8192`) for a tighter context budget, or `0` to disable. |
+| `toolOutputMaxBytes` | `200000` | Byte cap on tool result text. ACP first stores exact output in private content-addressed storage. If storage fails, ACP does not apply an additional cap. Non-text blocks remain intact. |
 | `compress.maxContextLimit` | `"75%"` | Context usage threshold that triggers **forced compression** nudges (bypasses growth-gate + cadence). Accepts a ratio (`0.75`) or percent string (`"75%"`). Lower = compress earlier / more aggressively. |
 | `compress.emergencyThresholdPercent` | `"95%"` | Context usage threshold that triggers **emergency truncation** of large tool outputs. Must be ≥ `compress.maxContextLimit`. |
 | `compress.nudgeGrowthTokens` | `50000` | Token growth step for soft compression nudges. |
 | `compress.model` | *(none)* | Authenticated `provider/model-id` selected by `/acp-model`. |
-| `compress.thinkingLevel` | `"medium"` | Thinking level used by the configured model. |
+| `compress.thinkingLevel` | `"medium"` | Default thinking level used by the configured model. Tier 2, Tier 3, checkpoint, and branch overrides are also available. |
 | `compress.tier1Compressor` | `"main"` | Tier-1 summary writer: `"main"` or `"configured"`. |
 | `compress.tier2Compressor` | `"main"` | Tier-2 summary writer: `"main"` or `"configured"`. |
 | `compress.tier3Compressor` | `"main"` | Tier-3 summary writer: `"main"` or `"configured"`. |

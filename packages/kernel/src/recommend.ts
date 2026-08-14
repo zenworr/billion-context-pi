@@ -53,6 +53,25 @@ function isSyntheticOrPruned(
   return false;
 }
 
+export function expandProtocolMessageIds(seedIds: Iterable<string>, messages: CoreMessage[]): Set<string> {
+  const selected = new Set(seedIds);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const groups = new Set(messages.filter((message) => selected.has(message.id)).map((message) => message.protocolGroupId ?? message.id.split("#", 1)[0]!));
+    const callIds = new Set(messages.filter((message) => selected.has(message.id) && message.toolCallId).map((message) => message.toolCallId!));
+    for (const message of messages) {
+      const group = message.protocolGroupId ?? message.id.split("#", 1)[0]!;
+      const linked = groups.has(group) || Boolean(message.toolCallId && callIds.has(message.toolCallId));
+      if (linked && !selected.has(message.id)) {
+        selected.add(message.id);
+        changed = true;
+      }
+    }
+  }
+  return selected;
+}
+
 // ─── 1. Protected Refs (soft protection zone) ─────────────────────────────────
 
 /**
@@ -90,6 +109,18 @@ export function computeProtectedRefs(
     visible.push({ ref, tokens: countTokens(msg.text ?? "") });
   }
 
+  const hardProtectedIds = new Set(messages.filter((message) => message.hardProtected).map((message) => message.id));
+  for (const pin of state.pins ?? []) {
+    const rawId = state.messageRefs.byRef[pin.ref];
+    if (rawId) hardProtectedIds.add(rawId);
+    const block = state.blocks.find((candidate) => candidate.blockId === pin.ref && candidate.active);
+    for (const id of block?.effectiveMessageIds ?? []) hardProtectedIds.add(id);
+  }
+  for (const id of expandProtocolMessageIds(hardProtectedIds, messages)) {
+    const ref = state.messageRefs.byRaw[id];
+    if (ref && ref !== "BLOCKED") result.add(ref);
+  }
+
   // Rule 1: last N messages
   if (preserveN > 0) {
     for (const m of visible.slice(-preserveN)) {
@@ -118,7 +149,7 @@ export function computeProtectedRefs(
   if (preserveN > 0) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i]!;
-      if (msg.role !== "user" || isSyntheticOrPruned(msg, state)) continue;
+      if (msg.role !== "user" || msg.synthetic || isSyntheticOrPruned(msg, state)) continue;
       const ref = state.messageRefs.byRaw[msg.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
       break;
@@ -193,7 +224,7 @@ export function buildCompressibleRanges(
       refNum: rn,
       tokens: countTokens(msg.text ?? ""),
       isTool: isToolMessage(msg),
-      isUser: msg.role === "user",
+      isUser: msg.role === "user" && !msg.synthetic,
     });
   }
 

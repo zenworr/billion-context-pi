@@ -26,6 +26,8 @@ export interface SpoolArtifactInput {
   toolName?: string;
   text?: string;
   textParts?: readonly string[];
+  /** Exact ordered tool-result blocks. Stored as a versioned JSON envelope. */
+  contentParts?: readonly unknown[];
   bashFullOutputPath?: string;
   createdAt?: number;
   maxArtifactBytes?: number;
@@ -53,6 +55,7 @@ export interface ArtifactCleanupResult { removed: number; reclaimedBytes: number
 
 export async function removeArtifactSession(sessionId: string, root = artifactStoreRoot()): Promise<void> {
   await fs.rm(artifactSessionDirectory(sessionId, root), { recursive: true, force: true });
+  await fs.rm(join(root, ".quota-index.json"), { force: true });
 }
 
 /** Remove only files not referenced by the current session state. */
@@ -80,10 +83,18 @@ export async function cleanupArtifactStore(
     await fs.rm(path, { force: true });
     removed += 1;
   }
+  if (removed > 0) await fs.rm(join(root, ".quota-index.json"), { force: true });
   return { removed, reclaimedBytes };
 }
 
 export async function artifactStoreBytes(root = artifactStoreRoot()): Promise<number> {
+  const indexPath = join(root, ".quota-index.json");
+  try {
+    const parsed = JSON.parse(await fs.readFile(indexPath, "utf8")) as { bytes?: unknown };
+    if (typeof parsed.bytes === "number" && Number.isSafeInteger(parsed.bytes) && parsed.bytes >= 0) return parsed.bytes;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+  }
   let total = 0;
   const pending = [root];
   while (pending.length > 0) {
@@ -97,10 +108,28 @@ export async function artifactStoreBytes(root = artifactStoreRoot()): Promise<nu
     for (const entry of entries) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) pending.push(path);
-      else if (entry.isFile()) total += (await fs.stat(path)).size;
+      else if (entry.isFile() && entry.name.endsWith(".gz")) total += await gzipUncompressedBytes(path);
     }
   }
+  await writePrivateFile(indexPath, Buffer.from(`${JSON.stringify({ bytes: total, updatedAt: Date.now() })}\n`));
   return total;
+}
+
+async function recordArtifactStoreBytes(root: string, bytes: number): Promise<void> {
+  await writePrivateFile(join(root, ".quota-index.json"), Buffer.from(`${JSON.stringify({ bytes, updatedAt: Date.now() })}\n`));
+}
+
+async function gzipUncompressedBytes(file: string): Promise<number> {
+  const handle = await fs.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    if (stat.size < 4) return 0;
+    const footer = Buffer.allocUnsafe(4);
+    await handle.read(footer, 0, 4, stat.size - 4);
+    return footer.readUInt32LE(0);
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function ensureArtifactStore(root = artifactStoreRoot()): Promise<void> {
@@ -123,36 +152,43 @@ export async function spoolArtifact(
   const textTokens = textParts.reduce((sum, part) => sum + defaultCountTokens(part), 0);
   const estimatedTokens = reusable?.estimatedTokens ?? textTokens;
   if (estimatedTokens < ARTIFACT_MIN_TOKENS && input.force !== true) return undefined;
+  const structuredContent = !reusable && input.contentParts
+    ? Buffer.from(JSON.stringify({ version: 1, kind: "tool-result-content", content: input.contentParts }), "utf8")
+    : undefined;
+  const storedParts = structuredContent ? [structuredContent.toString("utf8")] : textParts;
+  const artifactMime = structuredContent
+    ? "application/vnd.billion-context-pi.tool-result+json; version=1"
+    : "text/plain; charset=utf-8";
 
-  const contentHash = reusable?.sha256 ?? hashTextParts(textParts);
-  const existing = state.artifacts.find((artifact) => (
+  const contentHash = reusable ? undefined : hashTextParts(storedParts);
+  const existing = contentHash ? state.artifacts.find((artifact) => (
     input.toolCallId !== undefined
     && artifact.toolCallId === input.toolCallId
     && artifact.toolName === input.toolName
     && artifact.sha256 === contentHash
     && artifact.retrievable
-  ));
-  if (existing) return { state, record: existing, reusedExistingPath: !existing.localPath.endsWith(".gz") };
+  )) : undefined;
+  if (existing) return { state, record: existing, reusedExistingPath: true };
 
-  const bytes = reusable?.bytes ?? textParts.reduce((sum, part) => sum + Buffer.byteLength(part, "utf8"), 0);
+  const bytes = reusable?.bytes ?? storedParts.reduce((sum, part) => sum + Buffer.byteLength(part, "utf8"), 0);
   const maxArtifactBytes = input.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
   const maxSessionBytes = input.maxSessionBytes ?? DEFAULT_MAX_SESSION_ARTIFACT_BYTES;
   const maxGlobalBytes = input.maxGlobalBytes ?? DEFAULT_MAX_GLOBAL_ARTIFACT_BYTES;
   const sessionBytes = state.artifacts.filter((artifact) => artifact.retrievable).reduce((sum, artifact) => sum + artifact.bytes, 0);
+  const releaseQuota = await acquireArtifactQuotaLock(root);
+  try {
   const globalBytes = await artifactStoreBytes(root);
   const next = structuredClone(state);
   const id = `a${Math.max(1, next.nextArtifactId)}`;
   next.nextArtifactId = Math.max(1, next.nextArtifactId) + 1;
-  if (bytes > maxArtifactBytes || sessionBytes + bytes > maxSessionBytes || globalBytes + bytes > maxGlobalBytes) {
+  if (bytes > maxArtifactBytes || sessionBytes + bytes > maxSessionBytes) {
     const error = bytes > maxArtifactBytes
       ? `artifact exceeds per-artifact quota (${bytes}/${maxArtifactBytes} bytes)`
-      : sessionBytes + bytes > maxSessionBytes
-        ? `session artifact quota exceeded (${sessionBytes + bytes}/${maxSessionBytes} bytes)`
-        : `global artifact quota exceeded (${globalBytes + bytes}/${maxGlobalBytes} bytes)`;
+      : `session artifact quota exceeded (${sessionBytes + bytes}/${maxSessionBytes} bytes)`;
     const record: ArtifactRecord = {
-      id, status: "unavailable", error, sha256: contentHash,
+      id, status: "unavailable", error, sha256: contentHash ?? "unavailable",
       sourceMessageId: input.sourceMessageId, toolCallId: input.toolCallId, toolName: input.toolName,
-      mime: "text/plain; charset=utf-8", bytes, estimatedTokens, localPath: "",
+      mime: artifactMime, bytes, estimatedTokens, localPath: "",
       createdAt: input.createdAt ?? Date.now(), retrievable: false,
     };
     next.artifacts.push(record);
@@ -162,8 +198,19 @@ export async function spoolArtifact(
   // Stream Bash files into private gzip storage; never duplicate a huge output
   // into a JavaScript string or depend on an ephemeral host path.
   const stored = reusable
-    ? await storeCompressedFile(root, input.sessionId, reusable.localPath, reusable.sha256, reusable.bytes)
-    : await storeCompressedParts(root, input.sessionId, textParts);
+    ? await storeCompressedFile(root, input.sessionId, reusable.localPath, reusable.bytes)
+    : await storeCompressedParts(root, input.sessionId, storedParts);
+  const physicalDelta = stored.reusedExistingPath ? 0 : stored.bytes;
+  if (globalBytes + physicalDelta > maxGlobalBytes) {
+    if (!stored.reusedExistingPath) await fs.rm(stored.localPath, { force: true });
+    const record: ArtifactRecord = {
+      id, status: "unavailable", error: `global artifact quota exceeded (${globalBytes + physicalDelta}/${maxGlobalBytes} bytes)`,
+      sha256: stored.sha256, sourceMessageId: input.sourceMessageId, toolCallId: input.toolCallId, toolName: input.toolName,
+      mime: artifactMime, bytes: stored.bytes, estimatedTokens, localPath: "", createdAt: input.createdAt ?? Date.now(), retrievable: false,
+    };
+    next.artifacts.push(record);
+    return { state: next, record, reusedExistingPath: false };
+  }
   const record: ArtifactRecord = {
     id,
     status: "ready",
@@ -171,7 +218,7 @@ export async function spoolArtifact(
     sourceMessageId: input.sourceMessageId,
     toolCallId: input.toolCallId,
     toolName: input.toolName,
-    mime: "text/plain; charset=utf-8",
+    mime: artifactMime,
     bytes: stored.bytes,
     estimatedTokens,
     localPath: stored.localPath,
@@ -180,7 +227,45 @@ export async function spoolArtifact(
   };
   next.artifacts.push(record);
   next.stats.rawTokensExternalized += estimatedTokens;
-  return { state: next, record, reusedExistingPath: false };
+  await recordArtifactStoreBytes(root, globalBytes + physicalDelta);
+  return { state: next, record, reusedExistingPath: stored.reusedExistingPath };
+  } finally {
+    await releaseQuota();
+  }
+}
+
+async function acquireArtifactQuotaLock(root: string): Promise<() => Promise<void>> {
+  await fs.mkdir(root, { recursive: true, mode: PRIVATE_DIR_MODE });
+  const lockPath = join(root, ".quota.lock");
+  const owner = `${randomUUID()}:${process.pid}`;
+  for (;;) {
+    try {
+      const handle = await fs.open(lockPath, "wx", PRIVATE_FILE_MODE);
+      await handle.writeFile(`${owner}\n${Date.now()}\n`);
+      await handle.sync();
+      return async () => {
+        await handle.close().catch(() => undefined);
+        const current = await fs.readFile(lockPath, "utf8").catch(() => "");
+        if (current.startsWith(`${owner}\n`)) await fs.rm(lockPath, { force: true });
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stat = await fs.stat(lockPath).catch(() => undefined);
+      if (stat && Date.now() - stat.mtimeMs > 10 * 60_000) {
+        const current = await fs.readFile(lockPath, "utf8").catch(() => "");
+        const pid = Number(current.split(":", 2)[1]?.split("\n", 1)[0]);
+        let alive = Number.isSafeInteger(pid) && pid > 0;
+        if (alive) {
+          try { process.kill(pid, 0); } catch { alive = false; }
+        }
+        if (!alive) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+  }
 }
 
 export function reconcileArtifactSources(
@@ -331,7 +416,7 @@ async function storeCompressedText(
   root: string,
   sessionId: string,
   text: string,
-): Promise<{ sha256: string; bytes: number; localPath: string }> {
+): Promise<{ sha256: string; bytes: number; localPath: string; reusedExistingPath: boolean }> {
   return storeCompressedParts(root, sessionId, [text]);
 }
 
@@ -339,7 +424,7 @@ async function storeCompressedParts(
   root: string,
   sessionId: string,
   parts: readonly string[],
-): Promise<{ sha256: string; bytes: number; localPath: string }> {
+): Promise<{ sha256: string; bytes: number; localPath: string; reusedExistingPath: boolean }> {
   const bytes = parts.reduce((sum, part) => sum + Buffer.byteLength(part, "utf8"), 0);
   return storeCompressedStream(root, sessionId, Readable.from(parts), hashTextParts(parts), bytes);
 }
@@ -354,10 +439,41 @@ async function storeCompressedFile(
   root: string,
   sessionId: string,
   sourcePath: string,
-  sha256: string,
   bytes: number,
-): Promise<{ sha256: string; bytes: number; localPath: string }> {
-  return storeCompressedStream(root, sessionId, createReadStream(sourcePath), sha256, bytes);
+): Promise<{ sha256: string; bytes: number; localPath: string; reusedExistingPath: boolean }> {
+  const sessionDir = artifactSessionDirectory(sessionId, root);
+  await fs.mkdir(sessionDir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  const temporary = join(sessionDir, `.stream-${process.pid}-${randomUUID()}.tmp`);
+  const hash = createHash("sha256");
+  let observedBytes = 0;
+  const hasher = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+    hash.update(chunk);
+    observedBytes += chunk.byteLength;
+    callback(null, chunk);
+  } });
+  try {
+    await pipeline(createReadStream(sourcePath), hasher, createGzip({ level: 6 }), createWriteStream(temporary, { flags: "wx", mode: PRIVATE_FILE_MODE }));
+    if (observedBytes !== bytes) throw new Error(`Bash full-output file changed while spooling (${observedBytes}/${bytes} bytes).`);
+    const sha256 = hash.digest("hex");
+    const localPath = join(sessionDir, `${sha256}.gz`);
+    try {
+      const existing = await hashGunzipFile(localPath);
+      if (existing.sha256 === sha256 && existing.bytes === bytes) {
+        await fs.rm(temporary, { force: true });
+        return { sha256, bytes, localPath, reusedExistingPath: true };
+      }
+      await fs.rename(localPath, `${localPath}.corrupt-${Date.now()}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await fs.chmod(temporary, PRIVATE_FILE_MODE);
+    await fs.rename(temporary, localPath);
+    await fs.chmod(localPath, PRIVATE_FILE_MODE);
+    return { sha256, bytes, localPath, reusedExistingPath: false };
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function storeCompressedStream(
@@ -366,7 +482,7 @@ async function storeCompressedStream(
   source: NodeJS.ReadableStream,
   sha256: string,
   bytes: number,
-): Promise<{ sha256: string; bytes: number; localPath: string }> {
+): Promise<{ sha256: string; bytes: number; localPath: string; reusedExistingPath: boolean }> {
   const sessionDir = artifactSessionDirectory(sessionId, root);
   await fs.mkdir(sessionDir, { recursive: true, mode: PRIVATE_DIR_MODE });
   const localPath = join(sessionDir, `${sha256}.gz`);
@@ -374,7 +490,7 @@ async function storeCompressedStream(
     const stat = await fs.stat(localPath);
     if (stat.isFile()) {
       const existing = await hashGunzipFile(localPath);
-      if (existing.sha256 === sha256 && existing.bytes === bytes) return { sha256, bytes, localPath };
+      if (existing.sha256 === sha256 && existing.bytes === bytes) return { sha256, bytes, localPath, reusedExistingPath: true };
       await fs.rename(localPath, `${localPath}.corrupt-${Date.now()}`);
     }
   } catch (error) {
@@ -390,7 +506,7 @@ async function storeCompressedStream(
     await fs.rm(temporary, { force: true }).catch(() => undefined);
     throw error;
   }
-  return { sha256, bytes, localPath };
+  return { sha256, bytes, localPath, reusedExistingPath: false };
 }
 
 async function hashGunzipFile(file: string): Promise<{ sha256: string; bytes: number }> {
@@ -405,14 +521,12 @@ async function hashGunzipFile(file: string): Promise<{ sha256: string; bytes: nu
 
 async function inspectReusableBashOutput(
   candidatePath: string,
-): Promise<{ sha256: string; bytes: number; estimatedTokens: number; localPath: string } | undefined> {
+): Promise<{ bytes: number; estimatedTokens: number; localPath: string } | undefined> {
   if (!isAbsolute(candidatePath)) return undefined;
   try {
     const stat = await fs.stat(candidatePath);
     if (!stat.isFile() || stat.size <= 0) return undefined;
-    const sha256 = await hashFile(candidatePath);
     return {
-      sha256,
       bytes: stat.size,
       estimatedTokens: Math.ceil(stat.size / 4),
       localPath: candidatePath,
@@ -420,12 +534,6 @@ async function inspectReusableBashOutput(
   } catch {
     return undefined;
   }
-}
-
-async function hashFile(file: string): Promise<string> {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
-  return hash.digest("hex");
 }
 
 async function gunzipFile(file: string): Promise<Buffer> {

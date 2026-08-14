@@ -248,7 +248,7 @@ test("batch applyCompression does not advance survival per range", () => {
     );
   }
 
-  // And processTurn advances survival exactly once.
+  // Projection is read-only for survival; the extension advances age once at turn_end.
   const turn = core.processTurn({
     messages,
     state: after,
@@ -259,8 +259,8 @@ test("batch applyCompression does not advance survival per range", () => {
     if (block.active) {
       assert.equal(
         block.survivedCount,
-        1,
-        `processTurn must advance each active block exactly once (${block.blockId})`,
+        0,
+        `processTurn must not advance active block age (${block.blockId})`,
       );
     }
   }

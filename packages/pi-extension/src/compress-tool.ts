@@ -69,6 +69,7 @@ export function makeCompressTool(runtime: AcpRuntime): ToolDefinition<typeof Com
       const release = await runtime.acquireLock(sid);
       try {
         const result = await handleCompress(params as CompressArgs, runtime, ctx, signal, toolCallId);
+        if (!result.committed) runtime.relaxCompressionGate(sid);
         return { details: undefined, content: [{ type: "text", text: result.text }], usage: result.usage };
       } catch (error) {
         logThrow("compress", error, { sid, ranges: (params as CompressArgs).content?.length ?? 0 });
@@ -83,6 +84,7 @@ export function makeCompressTool(runtime: AcpRuntime): ToolDefinition<typeof Com
 interface HandleCompressResult {
   text: string;
   usage?: CompressionUsage;
+  committed?: boolean;
 }
 
 interface GeneratedSummary {
@@ -164,7 +166,19 @@ async function handleCompress(
   if (!planned.plan) {
     return { text: `Compression failed before generation: ${planned.errors.join("; ")}` };
   }
+  const planComplete = planned.plan.ranges.length === ranges.length
+    && planned.plan.ranges.every((candidate, index) => (
+      candidate.startRef === ranges[index]?.startId
+      && candidate.endRef === ranges[index]?.endId
+      && (candidate.outputTier === 1 || candidate.sourceMessageIds.length === 0)
+    ));
+  if (!planComplete) {
+    return { text: "Compression failed before generation: the frozen plan did not preserve every requested range in order, or a higher-tier range contained raw message gaps." };
+  }
   const preview = previewRanges(runtime, ranges, state, compressionMessages, config, summaryMaxChars);
+  if (preview.errors.length > 0 || preview.blocksByIndex.size !== ranges.length) {
+    return { text: `Compression failed before generation: ${preview.errors.join("; ") || "not every requested range produced a valid preview"}` };
+  }
   const configuredSources = new Map<number, { tier: CompressionTier; source: string }>();
   for (let index = 0; index < ranges.length; index++) {
     const range = ranges[index]!;
@@ -198,7 +212,7 @@ async function handleCompress(
         const sourceBlock = state.blocks.find((block) => block.blockId === blockId);
         return sourceBlock?.manifest ? [sourceBlock.manifest] : [];
       }),
-    ], plannedRange.sourceHash);
+    ], plannedRange.sourceHash, plannedRange.outputTier);
     const supplied = range.summary?.trim();
     if (supplied) {
       const validation = validateAndRepairSummary({
@@ -239,7 +253,26 @@ async function handleCompress(
     if (!configuredSource) throw new Error(`Cannot resolve configured compression source for ${range.startId}..${range.endId}.`);
     const { tier, source } = configuredSource;
     try {
-      const generated = await generateConfiguredSummary(
+      const preflight = await runtime.stateFor(ctx);
+      if (preflight.state.revision !== planned.plan.stateRevision || preflight.state.graphRevision !== state.graphRevision) {
+        throw new Error("Compression source changed before model generation; retry with fresh refs.");
+      }
+      const freshPlan = runtime.core.planCompression({
+        ranges: ranges.map((candidate) => ({
+          startRef: candidate.startId,
+          endRef: candidate.endId,
+          topic: candidate.topic ?? topLevelTopic,
+          preserve: candidate.preserve,
+          rationale: candidate.rationale,
+        })),
+        messages: preflight.coreMessages,
+        state: preflight.state,
+        config: runtime.configFor(ctx),
+      });
+      if (!freshPlan.plan || freshPlan.plan.sourceHash !== planned.plan.sourceHash) {
+        throw new Error("Compression source hash changed before model generation; retry with fresh refs.");
+      }
+      let generated = await generateConfiguredSummary(
         runtime,
         ctx,
         tier,
@@ -247,15 +280,73 @@ async function handleCompress(
         externalSummaryMaxChars,
         signal,
       );
+      let attempts = 1;
+      let validation: ReturnType<typeof validateAndRepairSummary> | undefined;
+      let validationFailure: unknown;
+      try {
+        validation = validateAndRepairSummary({
+          summary: generated.summary,
+          manifest,
+          preserve: range.preserve,
+          sourceTokens: plannedRange.sourceTokens,
+          tier,
+          summaryMaxChars: externalSummaryMaxChars,
+        });
+      } catch (error) {
+        validationFailure = error;
+      }
+      if (!validation) {
+        const repairSource = [
+          "[Validation repair request]",
+          `The prior summary failed validation: ${validationFailure instanceof Error ? validationFailure.message : String(validationFailure)}`,
+          "Produce a corrected summary that obeys the tier contract and length limit.",
+          `[Prior summary]\n${generated.summary}`,
+          `[Authoritative source]\n${source}`,
+        ].join("\n\n");
+        const repair = await generateConfiguredSummary(runtime, ctx, tier, repairSource, externalSummaryMaxChars, signal);
+        generated = { ...repair, usage: addUsage(generated.usage, repair.usage), fallbackFrom: repair.fallbackFrom ?? generated.fallbackFrom };
+        attempts += 1;
+        try {
+          validation = validateAndRepairSummary({
+            summary: generated.summary,
+            manifest,
+            preserve: range.preserve,
+            sourceTokens: plannedRange.sourceTokens,
+            tier,
+            summaryMaxChars: externalSummaryMaxChars,
+          });
+        } catch (error) {
+          validationFailure = error;
+        }
+      }
+      if (!validation) {
+        const fallback = await generateMainSummary(runtime, ctx, tier, source, externalSummaryMaxChars, signal);
+        generated = { ...fallback, usage: addUsage(generated.usage, fallback.usage), fallbackFrom: runtime.adapter.compress?.model ?? "configured model" };
+        attempts += 1;
+        try {
+          validation = validateAndRepairSummary({
+            summary: generated.summary,
+            manifest,
+            preserve: range.preserve,
+            sourceTokens: plannedRange.sourceTokens,
+            tier,
+            summaryMaxChars: externalSummaryMaxChars,
+          });
+        } catch (mainValidationFailure) {
+          const chunks = splitCompressionSource(source);
+          if (chunks.length < 2) throw mainValidationFailure;
+          const chunkResults = [];
+          for (const chunk of chunks) chunkResults.push(await generateMainSummary(runtime, ctx, tier, chunk, Math.ceil(externalSummaryMaxChars / chunks.length), signal));
+          for (const chunkResult of chunkResults) generated = { ...chunkResult, usage: addUsage(generated.usage, chunkResult.usage), fallbackFrom: runtime.adapter.compress?.model ?? "configured model" };
+          generated = { ...generated, summary: chunkResults.map((result) => result.summary).join("\n\n") };
+          attempts += chunks.length;
+          validation = validateAndRepairSummary({
+            summary: generated.summary, manifest, preserve: range.preserve,
+            sourceTokens: plannedRange.sourceTokens, tier, summaryMaxChars: externalSummaryMaxChars,
+          });
+        }
+      }
       totalUsage = addUsage(totalUsage, generated.usage);
-      const validation = validateAndRepairSummary({
-        summary: generated.summary,
-        manifest,
-        preserve: range.preserve,
-        sourceTokens: plannedRange.sourceTokens,
-        tier,
-        summaryMaxChars: externalSummaryMaxChars,
-      });
       const execution = generated.fallbackFrom ? "isolated-main" : "isolated-configured";
       resolved.push({
         startId: range.startId,
@@ -269,7 +360,7 @@ async function handleCompress(
           status: generated.fallbackFrom ? "fallback" : validation.status,
           missingRequiredFacts: validation.missingRequiredFacts,
           compressionRatio: validation.compressionRatio,
-          attempts: generated.fallbackFrom ? 2 : 1,
+          attempts,
         },
         provenance: {
           requestedRoute: "configured",
@@ -292,8 +383,8 @@ async function handleCompress(
       return { text: `Compression model failed before ACP state was changed: ${message}`, usage: totalUsage };
     }
   }
-  if (resolved.length === 0) {
-    return { text: `Compression failed: ${preview.errors.join("; ") || "no range created a block"}`, usage: totalUsage };
+  if (resolved.length !== ranges.length) {
+    return { text: "Compression transaction aborted before ACP state was changed: not every requested range produced a validated summary.", usage: totalUsage };
   }
 
   const applied = runtime.core.applyCompression({
@@ -396,7 +487,7 @@ async function handleCompress(
     const fallback = range.generated.fallbackFrom ? `; fallback from ${range.generated.fallbackFrom}` : "";
     lines.push("", `Generated summary for ${blockId} (Tier ${range.generated.tier}, ${range.generated.model}${fallback}):`, range.summary);
   }
-  return { text: lines.join("\n"), usage: totalUsage };
+  return { text: lines.join("\n"), usage: totalUsage, committed: true };
 }
 
 interface BatchPreview {
@@ -503,7 +594,7 @@ async function generateConfiguredSummary(
         acknowledgeCrossProviderDataTransfer: runtime.adapter.compress?.acknowledgeCrossProviderDataTransfer === true,
       });
       const redactedSource = redactCompactionSecrets(source, runtime.adapter.compress?.secretPatterns);
-      return await compressWithModel({ ctx, model: configured, thinkingLevel: compressionThinkingLevel(runtime.adapter), tier, source: redactedSource, prompts: runtime.prompts, summaryMaxChars, signal });
+      return await compressWithModel({ ctx, model: configured, thinkingLevel: compressionThinkingLevel(runtime.adapter, tier), tier, source: redactedSource, prompts: runtime.prompts, summaryMaxChars, signal });
     } catch (error) {
       if (signal?.aborted) throw error;
       failedUsage = compressionErrorUsage(error);
@@ -529,6 +620,30 @@ async function generateConfiguredSummary(
       failedUsage && fallbackUsage ? addUsage(failedUsage, fallbackUsage) : failedUsage ?? fallbackUsage,
     );
   }
+}
+
+async function generateMainSummary(
+  runtime: AcpRuntime,
+  ctx: ExtensionContext,
+  tier: CompressionTier,
+  source: string,
+  summaryMaxChars: number,
+  signal: AbortSignal | undefined,
+): Promise<{ summary: string; usage: CompressionUsage; model: string; thinking: string }> {
+  const main = ctx.model;
+  if (!main || !ctx.modelRegistry.hasConfiguredAuth(main)) {
+    throw new Error("No authenticated main model is available for validated compression fallback.");
+  }
+  return compressWithModel({
+    ctx,
+    model: main,
+    thinkingLevel: ctx.thinkingLevel ?? compressionThinkingLevel(runtime.adapter, tier),
+    tier,
+    source,
+    prompts: runtime.prompts,
+    summaryMaxChars,
+    signal,
+  });
 }
 
 export function ensureCompactionTransferAllowed(input: {
@@ -572,6 +687,14 @@ function shortDigest(value: string): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function splitCompressionSource(source: string): string[] {
+  if (source.length < 8_000) return [source];
+  const midpoint = Math.floor(source.length / 2);
+  const splitAt = source.indexOf("\n", midpoint);
+  const boundary = splitAt > midpoint && splitAt < source.length - 1_000 ? splitAt : midpoint;
+  return [source.slice(0, boundary), source.slice(boundary)].filter((chunk) => chunk.trim().length > 0);
 }
 
 function addUsage(total: CompressionUsage | undefined, usage: CompressionUsage): CompressionUsage {

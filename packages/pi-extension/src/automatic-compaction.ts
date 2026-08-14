@@ -19,7 +19,7 @@ import {
   structuredSummaryFromRendered,
   validateAndRepairSummary,
 } from "./manifest.js";
-import { compressWithModel, type CompressionUsage } from "./model-compressor.js";
+import { compressionErrorUsage, compressWithModel, type CompressionUsage } from "./model-compressor.js";
 import { OptimizationTelemetry, type OptimizationRoute } from "./optimization-telemetry.js";
 import { QualityAdapter } from "./quality-adaptation.js";
 import type { AcpRuntime } from "./runtime.js";
@@ -97,6 +97,10 @@ export function createAutomaticCompaction(runtime: AcpRuntime): AutomaticCompact
     async runNow(ctx, signal) {
       const snapshot = await captureSnapshot(runtime, ctx, signal);
       if (!snapshot || signal.aborted) return false;
+      // The synchronous rescue path bypasses TransactionalBackgroundJobs, so it
+      // must perform the same fresh preflight immediately before provider I/O.
+      const preflight = await currentSnapshot(runtime, ctx, snapshot, signal);
+      if (!preflight || !sameSnapshot(snapshot, preflight) || signal.aborted) return false;
       const proposal = await generateProposal(runtime, ctx, snapshot, signal, telemetry, quality);
       if (signal.aborted) return false;
       const current = await currentSnapshot(runtime, ctx, snapshot, signal);
@@ -184,7 +188,7 @@ async function captureSnapshot(runtime: AcpRuntime, ctx: ExtensionContext, signa
       manifest: mergeCompressionManifests([
         rawManifest,
         ...plannedBlocks.flatMap((block) => block.manifest ? [block.manifest] : []),
-      ], planRange.sourceHash),
+      ], planRange.sourceHash, candidate.tier),
     };
   } finally {
     release();
@@ -241,7 +245,7 @@ async function generateProposal(
   let selected = route === "configured" ? configured : main;
   if (!selected) throw new Error(`No authenticated ${route} model is available for automatic Tier-${snapshot.tier} compaction.`);
   const selectedKey = `${selected.provider}/${selected.id}`;
-  const decision = quality.decide(selectedKey, snapshot.tier, compressionThinkingLevel(runtime.adapter), {
+  const decision = quality.decide(selectedKey, snapshot.tier, compressionThinkingLevel(runtime.adapter, snapshot.tier), {
     enabled: runtime.adapter.optimization?.qualityAdaptation === true,
     fallbackAfterFailures: runtime.adapter.optimization?.fallbackAfterFailures ?? 2,
     maxThinking: runtime.adapter.optimization?.maxAdaptiveThinking ?? "high",
@@ -261,24 +265,95 @@ async function generateProposal(
   }
   const started = Date.now();
   try {
-    const result = await compressWithModel({
+    const runModel = (model: CompressionModel, routeForCall: OptimizationRoute, source: string) => compressWithModel({
       ctx,
-      model: selected,
+      model,
       thinkingLevel: decision.thinking,
       tier: snapshot.tier,
-      source: actualRoute === "configured" ? redactCompactionSecrets(snapshot.source, runtime.adapter.compress?.secretPatterns) : snapshot.source,
+      source: routeForCall === "configured" ? redactCompactionSecrets(source, runtime.adapter.compress?.secretPatterns) : source,
       prompts: runtime.prompts,
       summaryMaxChars: 20_000,
       signal,
     });
+    let accumulatedUsage: CompressionUsage | undefined;
+    const paidCall = async (model: CompressionModel, routeForCall: OptimizationRoute, source: string) => {
+      try {
+        const result = await runModel(model, routeForCall, source);
+        accumulatedUsage = mergeCompressionUsage(accumulatedUsage, result.usage);
+        return result;
+      } catch (error) {
+        accumulatedUsage = mergeCompressionUsage(accumulatedUsage, compressionErrorUsage(error));
+        throw error;
+      }
+    };
+    let attempts = 1;
+    let result;
+    try {
+      result = await paidCall(selected, actualRoute, snapshot.source);
+    } catch (error) {
+      if (signal.aborted || actualRoute !== "configured" || !authenticated(ctx, main)) throw error;
+      selected = main!;
+      actualRoute = "main";
+      attempts += 1;
+      result = await paidCall(selected, actualRoute, snapshot.source);
+    }
+    let validation: ReturnType<typeof validateAndRepairSummary> | undefined;
+    let validationFailure: unknown;
+    try {
+      validation = validateAndRepairSummary({
+        summary: result.summary,
+        manifest: snapshot.manifest,
+        sourceTokens: snapshot.sourceTokens,
+        tier: snapshot.tier,
+        summaryMaxChars: 20_000,
+      });
+    } catch (error) {
+      validationFailure = error;
+    }
+    if (!validation) {
+      const repairSource = [
+        `[Validation repair request] The prior output failed: ${validationFailure instanceof Error ? validationFailure.message : String(validationFailure)}`,
+        `[Prior summary]\n${result.summary}`,
+        `[Authoritative source]\n${snapshot.source}`,
+      ].join("\n\n");
+      attempts += 1;
+      try {
+        result = await paidCall(selected, actualRoute, repairSource);
+      } catch (error) {
+        if (signal.aborted || actualRoute !== "configured" || !authenticated(ctx, main)) throw error;
+        selected = main!;
+        actualRoute = "main";
+        attempts += 1;
+        result = await paidCall(selected, actualRoute, snapshot.source);
+      }
+      try {
+        validation = validateAndRepairSummary({
+          summary: result.summary,
+          manifest: snapshot.manifest,
+          sourceTokens: snapshot.sourceTokens,
+          tier: snapshot.tier,
+          summaryMaxChars: 20_000,
+        });
+      } catch (error) {
+        validationFailure = error;
+      }
+    }
+    if (!validation && actualRoute === "configured" && authenticated(ctx, main)) {
+      selected = main!;
+      actualRoute = "main";
+      attempts += 1;
+      result = await paidCall(selected, actualRoute, snapshot.source);
+      validation = validateAndRepairSummary({
+        summary: result.summary,
+        manifest: snapshot.manifest,
+        sourceTokens: snapshot.sourceTokens,
+        tier: snapshot.tier,
+        summaryMaxChars: 20_000,
+      });
+    }
+    if (!validation) throw validationFailure instanceof Error ? validationFailure : new Error(String(validationFailure));
+    result = { ...result, usage: accumulatedUsage ?? result.usage };
     if (runtime.adapter.optimization?.telemetry === true) telemetry.recordUsage(actualRoute, result.usage);
-    const validation = validateAndRepairSummary({
-      summary: result.summary,
-      manifest: snapshot.manifest,
-      sourceTokens: snapshot.sourceTokens,
-      tier: snapshot.tier,
-      summaryMaxChars: 20_000,
-    });
     const outcome = validation.status === "repaired" ? "repaired" : "passed";
     quality.record(`${selected.provider}/${selected.id}`, snapshot.tier, outcome);
     return {
@@ -288,7 +363,7 @@ async function generateProposal(
         status: validation.status,
         missingRequiredFacts: validation.missingRequiredFacts,
         compressionRatio: validation.compressionRatio,
-        attempts: 1,
+        attempts,
       },
       provenance: {
         requestedRoute: "configured",
@@ -308,7 +383,7 @@ async function generateProposal(
       generatedAt: Date.now(),
     };
   } catch (error) {
-    quality.record(selectedKey, snapshot.tier, "failed");
+    quality.record(`${selected.provider}/${selected.id}`, snapshot.tier, "failed");
     throw error;
   }
 }
@@ -462,6 +537,27 @@ function blockDigest(block: CompressionBlock): string {
     summaryHash: block.summaryHash,
     summary: block.summary,
   }));
+}
+
+function mergeCompressionUsage(left: CompressionUsage | undefined, right: CompressionUsage | undefined): CompressionUsage | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: left.cacheRead + right.cacheRead,
+    cacheWrite: left.cacheWrite + right.cacheWrite,
+    cacheWrite1h: left.cacheWrite1h !== undefined || right.cacheWrite1h !== undefined ? (left.cacheWrite1h ?? 0) + (right.cacheWrite1h ?? 0) : undefined,
+    reasoning: left.reasoning !== undefined || right.reasoning !== undefined ? (left.reasoning ?? 0) + (right.reasoning ?? 0) : undefined,
+    totalTokens: left.totalTokens + right.totalTokens,
+    cost: {
+      input: left.cost.input + right.cost.input,
+      output: left.cost.output + right.cost.output,
+      cacheRead: left.cost.cacheRead + right.cost.cacheRead,
+      cacheWrite: left.cost.cacheWrite + right.cost.cacheWrite,
+      total: left.cost.total + right.cost.total,
+    },
+  };
 }
 
 function activeModelKey(ctx: ExtensionContext): string {

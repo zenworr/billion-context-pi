@@ -337,8 +337,8 @@ test("prune: first user message pruned when covered (no duplication)", () => {
 
   const resultIds = result.map((m) => m.id);
   assert.ok(
-    resultIds.includes("u0"),
-    "first user message always survives (even when covered — some providers reject 0-user)",
+    !resultIds.includes("u0"),
+    "covered first user is represented by the checkpoint instead of duplicated",
   );
   assert.ok(
     !resultIds.includes("a0"),

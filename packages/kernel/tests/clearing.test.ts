@@ -134,7 +134,15 @@ test("safe-only reasoning clears only explicit provider-agnostic plaintext", () 
       role: "assistant",
       contentType: "reasoning",
       reasoningKind: "plaintext-provider-agnostic",
+      protocolGroupId: "plain-group",
       text: `plain:${"r".repeat(20_000)}`,
+    },
+    {
+      id: "plain-text",
+      role: "assistant",
+      contentType: "text",
+      protocolGroupId: "plain-group",
+      text: "final response",
     },
     {
       id: "unknown",

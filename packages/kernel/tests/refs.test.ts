@@ -21,11 +21,12 @@ test("indexToRef zero-pads to 5 digits", () => {
   assert.equal(indexToRef(1), "m00001");
   assert.equal(indexToRef(42), "m00042");
   assert.equal(indexToRef(99999), "m99999");
+  assert.equal(indexToRef(100001), "m100001");
 });
 
-test("indexToRef rejects out-of-range indices", () => {
+test("indexToRef rejects invalid indices without a fixed namespace ceiling", () => {
   assert.throws(() => indexToRef(0));
-  assert.throws(() => indexToRef(100000));
+  assert.throws(() => indexToRef(Number.MAX_SAFE_INTEGER + 1));
   assert.throws(() => indexToRef(1.5));
 });
 
@@ -33,9 +34,17 @@ test("refToIndex parses and normalizes", () => {
   assert.equal(refToIndex("m00001"), 1);
   assert.equal(refToIndex("m1"), 1);
   assert.equal(refToIndex("M0042"), 42);
+  assert.equal(refToIndex("m100001"), 100001);
   assert.equal(refToIndex("BLOCKED"), null);
   assert.equal(refToIndex("b3"), null);
   assert.equal(refToIndex("xyz"), null);
+});
+
+test("assignRefs allocates beyond 100,000 without reuse or exhaustion", () => {
+  const result = assignRefs([msg("a"), msg("b")], { existing: emptyRefMap(), nextIndex: 100_000 });
+  assert.equal(refForRaw(result.map, "a"), "m100000");
+  assert.equal(refForRaw(result.map, "b"), "m100001");
+  assert.equal(result.nextIndex, 100_002);
 });
 
 test("assignRefs assigns sequential refs to new messages", () => {

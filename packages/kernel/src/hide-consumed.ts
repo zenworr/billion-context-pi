@@ -1,6 +1,6 @@
 import type { CompressionState, CoreMessage } from "./types.js";
 
-const KEEP_LAST_ORPHANED = 0;
+const KEEP_LAST_ORPHANED = 1;
 
 export interface HideConsumedResult {
     messages: CoreMessage[];

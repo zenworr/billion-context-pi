@@ -72,6 +72,33 @@ test("Feature 2: protected tool-call is excluded from compression range", () => 
   assert.ok(block.effectiveMessageIds.includes("d"), "regular msg 'd' in effective coverage");
 });
 
+test("protected tool preserves the complete provider protocol group", () => {
+  const core = createCore();
+  const group = "assistant-root";
+  const messages: CoreMessage[] = [
+    msg("a", longText),
+    { id: "b#reasoning", role: "assistant", contentType: "reasoning", text: "signed thought", reasoningKind: "provider-specific", protocolGroupId: group },
+    { id: "b#text", role: "assistant", contentType: "text", text: "I will call a protected tool.", protocolGroupId: group },
+    { ...toolCall("b#call1", "skill", "call1", '{"name":"git-master"}'), protocolGroupId: group },
+    { ...toolCall("b#call2", "bash", "call2", '{"command":"pwd"}'), protocolGroupId: group },
+    { ...toolResult("c", "call1", "skill output"), protocolGroupId: "result-call1" },
+    { ...toolResult("e", "call2", "pwd output"), protocolGroupId: "result-call2" },
+    msg("d", longText),
+  ];
+  const state = setupRefs(messages);
+  const result = core.applyCompression({
+    ranges: [{ startRef: "m00001", endRef: "m00008", summary: validSummary }],
+    messages,
+    state,
+    config: cfg({ protectedTools: ["skill"] }),
+  });
+  const block = result.state.blocks[0]!;
+  for (const id of ["b#reasoning", "b#text", "b#call1", "b#call2", "c", "e"]) {
+    assert.ok(!block.effectiveMessageIds.includes(id), `${id} remains visible with its complete protocol group`);
+  }
+  assert.deepEqual(block.directMessageIds, ["a", "d"]);
+});
+
 test("Feature 2: protected tool messages are filtered out, not appended", () => {
   const core = createCore();
   const messages = [

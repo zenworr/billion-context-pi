@@ -26,7 +26,7 @@ export function defaultConfig(
       keepRecentToolUses: 5,
       clearAtLeastTokens: 16000,
       excludeTools: ["compress", "edit", "write", "memory_write"],
-      reasoning: "safe-only",
+      reasoning: "preserve",
     },
     compress: {
       minCompressRange: 5000,

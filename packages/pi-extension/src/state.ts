@@ -56,6 +56,16 @@ export async function readParentSessionPath(sessionFile: string): Promise<string
   }
 }
 
+function hasDurableState(state: CompressionState): boolean {
+  return state.blocks.length > 0
+    || state.checkpoints.length > 0
+    || state.pins.length > 0
+    || state.artifacts.length > 0
+    || Object.keys(state.messageRefs.byRaw).length > 0
+    || Object.keys(state.messageRefs.byRef).length > 0
+    || state.nextMessageRefId !== "1";
+}
+
 function cacheKey(sessionFile: string | undefined, sessionId: string): string {
   return sessionFile ? `file:${sessionFile}` : `session:${sessionId}`;
 }
@@ -105,7 +115,7 @@ export class SessionStateStore {
         }
       }
 
-      if (state.blocks.length === 0 && sessionFile) {
+      if (!hasDurableState(state) && sessionFile) {
         const parentState = await this.tryLoadParentState(sessionFile, sessionId);
         if (parentState) state = parentState;
       }
@@ -121,7 +131,6 @@ export class SessionStateStore {
     sessionId: string,
   ): Promise<CompressionState> {
     const file = stateFileFor(sessionFile);
-    if (!file) return structuredClone(state);
     const key = cacheKey(sessionFile, sessionId);
     const slot = this.cache.get(key);
     if (slot && state.revision !== slot.state.revision) {
@@ -138,6 +147,11 @@ export class SessionStateStore {
       metadataRevision: slot.state.metadataRevision + (metadataChanged ? 1 : 0),
     } : state;
     const liveRefOrigins = slot?.liveRefOrigins ?? [];
+    if (!file) {
+      const next = migrateState({ ...preparedState, revision: preparedState.revision + 1 }, sessionId);
+      this.cache.set(key, { state: structuredClone(next), liveRefOrigins });
+      return structuredClone(next);
+    }
     const persisted = await withStateFileLock(file, async () => {
       try {
         const disk = JSON.parse(await fs.readFile(file, "utf8")) as { schemaVersion?: unknown; revision?: unknown };
@@ -192,8 +206,12 @@ export class SessionStateStore {
             throw new FutureSchemaError(`Parent ACP state schema ${schema} is newer than supported schema 2; refusing inheritance.`);
           }
         }
-        if (isStoredState(parsed) && Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
+        if (isStoredState(parsed)) {
           const inherited = migrateState(parsed, sessionId);
+          if (!hasDurableState(inherited)) {
+            current = parentJsonl;
+            continue;
+          }
           inherited.revision = 0;
           inherited.sessionId = sessionId;
           logInfo("state", {
@@ -259,11 +277,13 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
     revision: numberValue(parsed.revision, fresh.revision),
     sessionId: stringValue(parsed.sessionId, sessionId),
     currentEpoch: numberValue(parsed.currentEpoch, fresh.currentEpoch),
+    currentCheckpointId: typeof parsed.currentCheckpointId === "string" ? parsed.currentCheckpointId : undefined,
     blocks,
     messageRefs: {
       byRaw: stringRecord(refs.byRaw),
       byRef: stringRecord(refs.byRef),
     },
+    nextMessageRefId: stringValue(parsed.nextMessageRefId, String(highestHistoricalRef(refs) + 1)),
     tokenSnapshots: numberRecord(parsed.tokenSnapshots),
     artifacts: Array.isArray(parsed.artifacts) ? structuredClone(parsed.artifacts) as CompressionState["artifacts"] : [],
     checkpoints: Array.isArray(parsed.checkpoints) ? structuredClone(parsed.checkpoints) as CompressionState["checkpoints"] : [],
@@ -278,6 +298,7 @@ function migrateState(parsed: Record<string, unknown>, sessionId: string): Compr
       nudgeBaselines: numberRecord(policy.nudgeBaselines),
       lastActionAt: numberRecord(policy.lastActionAt),
       recentRetrievals: numberRecord(policy.recentRetrievals),
+      lastSurvivedTurnId: typeof policy.lastSurvivedTurnId === "string" ? policy.lastSurvivedTurnId : undefined,
       tokenCalibration: Object.fromEntries(
         Object.entries(calibration).flatMap(([key, value]) => {
           if (!value || typeof value !== "object") return [];
@@ -381,7 +402,9 @@ function graphSignature(state: CompressionState): string {
     artifacts: state.artifacts,
     pins: state.pins,
     currentEpoch: state.currentEpoch,
+    currentCheckpointId: state.currentCheckpointId,
     messageRefs: state.messageRefs,
+    nextMessageRefId: state.nextMessageRefId,
   });
 }
 
@@ -508,6 +531,16 @@ function numberRecord(value: unknown): Record<string, number> {
 
 function tierValue(value: unknown): 1 | 2 | 3 {
   return value === 2 || value === 3 ? value : 1;
+}
+
+function highestHistoricalRef(refs: Record<string, unknown>): number {
+  let highest = 0;
+  for (const ref of Object.keys(stringRecord(refs.byRef))) {
+    const match = /^m0*(\d+)$/.exec(ref);
+    const value = match ? Number(match[1]) : 0;
+    if (Number.isSafeInteger(value) && value > highest) highest = value;
+  }
+  return highest;
 }
 
 function sha256(value: string): string {

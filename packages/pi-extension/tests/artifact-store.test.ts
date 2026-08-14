@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createInitialState, type CoreMessage } from "acp-kernel";
 import {
   artifactSessionDirectory,
+  artifactStoreBytes,
   cleanupArtifactStore,
   readArtifact,
   readArtifactSlice,
@@ -158,6 +159,24 @@ test("reused provider call ids cannot alias different artifact content", async (
     assert.notEqual(second.record.id, first.record.id);
     assert.notEqual(second.record.sha256, first.record.sha256);
     assert.equal(second.state.artifacts.length, 2);
+  });
+});
+
+test("global quota counts deduplicated physical content once", async () => {
+  await withTempDir(async (dir) => {
+    const bytes = Buffer.byteLength(largeText);
+    const first = await spoolArtifact(createInitialState("dedupe-session"), {
+      sessionId: "dedupe-session", sourceMessageId: "m1", toolCallId: "c1", toolName: "read", text: largeText,
+      maxGlobalBytes: bytes + 1,
+    }, dir);
+    assert.equal(first?.record.status, "ready");
+    const second = await spoolArtifact(first!.state, {
+      sessionId: "dedupe-session", sourceMessageId: "m2", toolCallId: "c2", toolName: "read", text: largeText,
+      maxGlobalBytes: bytes + 1, maxSessionBytes: bytes * 3,
+    }, dir);
+    assert.equal(second?.record.status, "ready");
+    assert.equal(second?.reusedExistingPath, true);
+    assert.equal(await artifactStoreBytes(dir), bytes);
   });
 });
 

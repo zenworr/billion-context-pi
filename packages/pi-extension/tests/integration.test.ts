@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAcpExtension, remainingToolBudgetText, shouldCancelHostCompaction } from "../src/index.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createInitialState } from "acp-kernel";
 
 // Mock Pi's ExtensionAPI — captures the event handlers the factory registers,
 // so we can invoke them with a fake ExtensionContext and assert the wiring works.
@@ -45,6 +46,19 @@ function fakeCtx(entries: any[], stateFile: string) {
 
 function userMsg(id: string, text: string) {
   return { type: "message", id, parentId: null, timestamp: "", message: { role: "user", content: text, timestamp: Date.now() } };
+}
+
+function assistantMsg(id: string, text: string, timestamp = Date.now()) {
+  return {
+    type: "message", id, parentId: null, timestamp: "",
+    message: {
+      role: "assistant", content: [{ type: "text", text }], timestamp,
+      usage: {
+        input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    },
+  };
 }
 
 test("factory registers ACP tools and 6 flat commands", () => {
@@ -166,18 +180,31 @@ test("capped non-Bash output exposes its durable artifact id", async (t) => {
   for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
 });
 
-test("newline-only multipart overflow forces a below-threshold non-Bash artifact", async (t) => {
+test("multipart overflow stores the exact ordered blocks in a versioned artifact", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "acp-multipart-artifact-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const { api, handlers } = captureApi();
   createAcpExtension({ toolOutputMaxBytes: 200, artifacts: { lifecycle: "session" } })(api as unknown as ExtensionAPI);
   const ctx = fakeCtx([], join(dir, "session.jsonl"));
+  const originalContent = [
+    { type: "text", text: "x".repeat(100) },
+    { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+    { type: "text", text: "y".repeat(100) },
+  ];
   const result = await handlers.get("tool_result")![0]!({
     type: "tool_result", toolName: "read", toolCallId: "tc-multipart", input: {},
-    content: [{ type: "text", text: "x".repeat(100) }, { type: "text", text: "y".repeat(100) }],
+    content: originalContent,
     details: undefined, isError: false,
   }, ctx);
   assert.match(result.content.map((part: { text?: string }) => part.text ?? "").join("\n"), /acp_artifact\(\{ id: "a1" \}\)/);
+  const artifactTool = api.tools.find((tool) => tool.name === "acp_artifact");
+  assert.ok(artifactTool);
+  const outputPath = join(dir, "multipart.json");
+  await artifactTool.execute("retrieve-multipart", { id: "a1", toFile: outputPath }, undefined, undefined, ctx);
+  const envelope = JSON.parse(await readFile(outputPath, "utf8")) as { version: number; kind: string; content: unknown[] };
+  assert.equal(envelope.version, 1);
+  assert.equal(envelope.kind, "tool-result-content");
+  assert.deepEqual(envelope.content, originalContent);
   for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
 });
 
@@ -194,8 +221,37 @@ test("capped non-Bash output reports explicit unavailability when artifact quota
   }, ctx);
   const visible = result.content.map((part: { text?: string }) => part.text ?? "").join("\n");
   assert.match(visible, /durable artifact storage failed/);
-  assert.match(visible, /full non-Bash result is unavailable/);
+  assert.match(visible, /full exact result was preserved inline and was not capped/);
+  assert.match(visible, new RegExp(`x{100}\\ny{100}`));
   for (const shutdown of handlers.get("session_shutdown") ?? []) await shutdown({}, ctx);
+});
+
+test("duplicate agent_end hooks age blocks and pins only once per settled user turn", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "acp-turn-age-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sessionFile = join(dir, "session.jsonl");
+  const state = createInitialState("test-session");
+  state.blocks.push({
+    blockId: "b1", runId: 1, tier: 1, generation: "young", active: true,
+    summary: "historical summary", directMessageIds: ["e1"], effectiveMessageIds: ["e1"],
+    directBlockIds: [], survivedCount: 0, createdAt: Date.now(), epoch: 0,
+    compressedTokens: 100, startRef: "m00001", endRef: "m00001",
+  });
+  state.pins.push({ id: "p1", ref: "m00001", mode: "summary", remainingTurns: 3, createdAt: Date.now() });
+  state.messageRefs.byRaw.e1 = "m00001";
+  state.messageRefs.byRef.m00001 = "e1";
+  await writeFile(`${sessionFile}.acp.json`, JSON.stringify(state), "utf8");
+  const entries = [userMsg("e1", "old"), assistantMsg("e2", "completed turn", 12345)];
+  const ctx = fakeCtx(entries, sessionFile);
+  const { api, handlers } = captureApi();
+  createAcpExtension({ autoUpdate: false, delegate: false })(api as unknown as ExtensionAPI);
+  const ageSettledTurn = handlers.get("agent_end")![0]!;
+  await ageSettledTurn({ messages: entries.map((entry) => entry.message) }, ctx);
+  await ageSettledTurn({ messages: entries.map((entry) => entry.message) }, ctx);
+  const persisted = JSON.parse(await readFile(`${sessionFile}.acp.json`, "utf8")) as typeof state;
+  assert.equal(persisted.blocks[0]!.survivedCount, 1);
+  assert.equal(persisted.pins[0]!.remainingTurns, 2);
+  assert.equal(persisted.policyState.lastSurvivedTurnId, "e1");
 });
 
 test("tool hook does not hard-block from stale host usage without a compiled projection", () => {
@@ -213,7 +269,7 @@ test("tool hook does not hard-block from stale host usage without a compiled pro
 test("host compaction is preserved for manual requests and issue-122 underestimation", async () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as unknown as ExtensionAPI);
-  const manual = await handlers.get("session_before_compact")![0]!({ reason: "manual" }, {});
+  const manual = await handlers.get("session_before_compact")![0]!({ reason: "manual" }, fakeCtx([]));
   assert.equal(manual, undefined, "manual /compact always proceeds");
 
   assert.equal(shouldCancelHostCompaction({
@@ -595,7 +651,7 @@ test("acp_status refs remain usable by the next compress call", async () => {
   const stateFile = "/tmp/nonexistent-pai-acp-status-compress.session.json";
   await rm(`${stateFile}.acp.json`, { force: true });
   const originalText = "This range is reported by acp_status and must remain addressable by compress. ".repeat(130);
-  const persisted = [userMsg("e1", originalText), ...["two", "three", "four", "five", "six", "seven"].map((n, index) => userMsg(`e${index + 2}`, `filler ${n} `.repeat(400)))];
+  const persisted = [userMsg("e1", originalText), ...["two", "three", "four", "five", "six", "seven"].map((n, index) => userMsg(`e${index + 2}`, `filler ${n} `.repeat(600)))];
   const ctx = { ...fakeCtx(persisted, stateFile), sessionManager: { getBranch: () => persisted, getSessionId: () => "test-session", getSessionFile: () => stateFile } };
   const statusTool = api.tools.find((tool: { name: string }) => tool.name === "acp_status")!;
   const status = await statusTool.execute("tc-status", {}, undefined, undefined, ctx);
@@ -611,7 +667,7 @@ test("omp rebuilds refs after stale live state before status compression", async
   const stateFile = "/tmp/nonexistent-pai-acp-stale-live.session.json";
   await rm(`${stateFile}.acp.json`, { force: true });
   const longText = "This stale live state must be rebuilt against the current persisted branch. ".repeat(130);
-  const filler = (n: string) => `filler ${n} `.repeat(400);
+  const filler = (n: string) => `filler ${n} `.repeat(600);
   const texts = [longText, filler("two"), filler("three"), filler("four"), filler("five"), filler("six"), filler("seven")];
   let persisted: ReturnType<typeof userMsg>[] = [];
   const ctx = { ...fakeCtx(persisted, stateFile), sessionManager: { getBranch: () => persisted, getSessionId: () => "test-session", getSessionFile: () => stateFile } };
@@ -621,7 +677,7 @@ test("omp rebuilds refs after stale live state before status compression", async
   const statusTool = api.tools.find((tool: { name: string }) => tool.name === "acp_status")!;
   const status = await statusTool.execute("tc-stale-live-status", {}, undefined, undefined, ctx);
   const targetRef = status.content[0].text.match(/m\d{5}/)![0];
-  assert.equal(targetRef, "m00001", status.content[0].text);
+  assert.match(targetRef, /^m\d+$/, status.content[0].text);
   const compressTool = api.tools.find((tool: { name: string }) => tool.name === "compress")!;
   const result = await compressTool.execute("tc-stale-live-compress", { content: [{ startId: targetRef, endId: targetRef, summary: "This stale live range was rebuilt against stable persisted entries and is now safely compressed." }] }, undefined, undefined, ctx);
   assert.match(result.content[0].text, /1 block/, result.content[0].text);
@@ -782,7 +838,7 @@ test("omp keeps compression blocks active when provider context has an extra pre
   const texts = [
     "This first message is large enough to compress. ".repeat(130),
     "This second message is also part of the compressed range. ".repeat(130),
-    ...["three", "four", "five", "six", "seven"].map((n) => `filler ${n} `.repeat(400)),
+    ...["three", "four", "five", "six", "seven", "eight"].map((n) => `filler ${n} `.repeat(400)),
   ];
   const persisted = texts.map((text, index) => userMsg(`e${index + 1}`, text));
   const ctx = {
@@ -802,7 +858,7 @@ test("omp keeps compression blocks active when provider context has an extra pre
   const compressTool = api.tools.find((tool: { name: string }) => tool.name === "compress")!;
   const compressed = await compressTool.execute(
     "tc-omp-provider-prefix",
-    { content: [{ startId: targetRef, endId: "m00002", summary: "The first two messages were compressed into a durable ACP summary." }] },
+    { content: [{ startId: targetRef, endId: "m00003", summary: "Two historical messages were compressed into a durable ACP summary." }] },
     undefined,
     undefined,
     ctx,
@@ -821,7 +877,8 @@ test("omp keeps compression blocks active when provider context has an extra pre
   );
   const saved = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8"));
   assert.equal(saved.blocks[0].active, true, "the compressed block must remain active after the prefix");
-  assert.ok(next.messages.length < texts.length + 1, "covered messages must be replaced in provider context");
+  const nextText = JSON.stringify(next.messages);
+  assert.ok(!nextText.includes(texts[2]!), `covered historical message must be replaced in provider context: ${JSON.stringify(next.messages.map((message: { content?: unknown }) => typeof message.content === "string" ? message.content.slice(0, 80) : Array.isArray(message.content) ? message.content.map((part: { text?: string }) => part.text?.slice(0, 80)) : null))}`);
 });
 
 test("omp keeps compression active when persisted and provider tails diverge", async (t) => {
@@ -833,7 +890,7 @@ test("omp keeps compression active when persisted and provider tails diverge", a
   const commonTexts = [
     "This first common message is large enough to compress. ".repeat(130),
     "This second common message is also part of the compressed range. ".repeat(130),
-    ...["three", "four", "five", "six", "seven"].map((n) => `common filler ${n} `.repeat(400)),
+    ...["three", "four", "five", "six", "seven", "eight"].map((n) => `common filler ${n} `.repeat(400)),
   ];
   let persisted = commonTexts.map((text, index) => userMsg(`e${index + 1}`, text));
   const ctx = {
@@ -851,7 +908,7 @@ test("omp keeps compression active when persisted and provider tails diverge", a
   const compressTool = api.tools.find((tool: { name: string }) => tool.name === "compress")!;
   const compressed = await compressTool.execute(
     "tc-omp-branch-divergence",
-    { content: [{ startId: targetRef, endId: "m00002", summary: "The first two common messages were compressed into a durable ACP summary." }] },
+    { content: [{ startId: targetRef, endId: "m00003", summary: "Two historical common messages were compressed into a durable ACP summary." }] },
     undefined,
     undefined,
     ctx,
@@ -874,7 +931,8 @@ test("omp keeps compression active when persisted and provider tails diverge", a
   );
   const saved = JSON.parse(await readFile(`${stateFile}.acp.json`, "utf8"));
   assert.equal(saved.blocks[0].active, true, "the compressed block must remain active across divergent branch tails");
-  assert.ok(divergent.messages.length < commonTexts.length + 3, "covered common messages must stay pruned");
+  const divergentText = JSON.stringify(divergent.messages);
+  assert.ok(!divergentText.includes(commonTexts[2]!), `covered historical common message must stay pruned: ${JSON.stringify(divergent.messages.map((message: { content?: unknown }) => typeof message.content === "string" ? message.content.slice(0, 80) : Array.isArray(message.content) ? message.content.map((part: { text?: string }) => part.text?.slice(0, 80)) : null))}`);
 });
 
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,18 +10,11 @@ function git(cwd: string, command: string): void {
   execFileSync("git", ["-C", cwd, ...command.split(" ")]);
 }
 
-test("project fingerprints are emitted only on freshness changes", () => {
+test("unchanged host project context needs no authoritative override", () => {
   const tracker = new FreshnessTracker();
   const files = [{ path: "/virtual/AGENTS.md", content: "Rule one." }];
-  const first = tracker.projectOverlay(files);
-  assert.match(first ?? "", /acp-project-freshness/);
-  assert.doesNotMatch(first ?? "", /Rule one/, "Pi remains the sole injector of project contents");
   assert.equal(tracker.projectOverlay(files), undefined);
-  const changed = tracker.projectOverlay([{ ...files[0]!, content: "Rule two." }]);
-  assert.notEqual(changed, first);
-  tracker.queueRuntimeOverlay(changed, "");
-  assert.equal(tracker.consumeRuntimeOverlay(), changed);
-  assert.equal(tracker.consumeRuntimeOverlay(), undefined);
+  assert.equal(tracker.projectOverlay(files), undefined);
 });
 
 test("project fingerprint reads current disk content instead of stale host content", () => {
@@ -32,8 +25,40 @@ test("project fingerprint reads current disk content instead of stale host conte
   const current = tracker.projectOverlay([{ path: file, content: "stale rule" }]);
   writeFileSync(file, "new current rule\n");
   const changed = tracker.projectOverlay([{ path: file, content: "still stale" }]);
+  assert.match(current ?? "", /current rule/);
   assert.notEqual(current, changed, "disk content hash drives freshness");
-  assert.doesNotMatch(changed ?? "", /new current rule|still stale/, "contents are not duplicated into ACP context");
+  assert.match(changed ?? "", /new current rule/);
+  assert.doesNotMatch(changed ?? "", /still stale/);
+  tracker.queueRuntimeOverlay(changed, "world");
+  assert.match(tracker.consumeRuntimeOverlay() ?? "", /new current rule/);
+  assert.match(tracker.consumeRuntimeOverlay() ?? "", /new current rule/, "override remains active across provider calls");
+  assert.equal(tracker.projectOverlay([{ path: file, content: "new current rule\n" }]), undefined, "override clears after Pi catches up");
+});
+
+test("project instructions refresh after a mutating tool without replacing the host baseline", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "acp-project-tool-refresh-"));
+  const file = join(cwd, "AGENTS.md");
+  writeFileSync(file, "host rule\n");
+  const tracker = new FreshnessTracker();
+  assert.equal(tracker.projectOverlay([{ path: file, content: "host rule\n" }]), undefined);
+  writeFileSync(file, "tool changed rule\n");
+  const changed = tracker.refreshProjectOverlay();
+  assert.match(changed ?? "", /tool changed rule/);
+  assert.match(tracker.refreshProjectOverlay() ?? "", /tool changed rule/, "authoritative override persists until Pi supplies the new baseline");
+});
+
+test("project refresh discovers new instruction files and emits deletion tombstones", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "acp-project-discovery-"));
+  const tracked = join(cwd, "AGENTS.md");
+  writeFileSync(tracked, "host rule\n");
+  const tracker = new FreshnessTracker();
+  assert.equal(tracker.projectOverlay([{ path: tracked, content: "host rule\n" }], cwd), undefined);
+  writeFileSync(join(cwd, "AGENTS.override.md"), "new override\n");
+  rmSync(tracked);
+  const overlay = tracker.refreshProjectOverlay() ?? "";
+  assert.match(overlay, /new override/);
+  assert.match(overlay, /deleted="true"/);
+  assert.match(overlay, /Ignore stale host copies/);
 });
 
 test("world state deterministically reports branch and working tree without blocking production hooks", async () => {

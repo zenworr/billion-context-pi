@@ -256,13 +256,15 @@ test("entriesToCoreMessages extracts only text blocks from array content", () =>
   assert.equal(core[0]!.text, "visible text\nmore text", "only text blocks extracted, joined with newline");
 });
 
-test("entriesToCoreMessages drops custom_message with non-text-only array content", () => {
+test("entriesToCoreMessages preserves custom_message non-text content conservatively", () => {
   const entries: SessionEntry[] = [
     customEntry("a", "subagent_result", [{ type: "image", url: "https://example.com/img.png" }]),
   ];
   const core = entriesToCoreMessages(entries);
 
-  assert.equal(core.length, 0, "non-text array content yields empty text → skipped");
+  assert.equal(core.length, 1);
+  assert.equal(core[0]!.hardProtected, true);
+  assert.ok((core[0]!.estimatedInputTokens ?? 0) > 0);
 });
 
 test("custom_message round-trip: entriesToCoreMessages → collectOriginals → coreOutToAgentMessages preserves user role", () => {
@@ -511,6 +513,21 @@ test("coreOutToAgentMessages drops pruned tool-call blocks when only some surviv
   const toolCalls = content.filter((b) => b.type === "toolCall");
   assert.equal(toolCalls.length, 2, "only 2 surviving tool-call blocks");
   assert.deepEqual(toolCalls.map((b) => b.id), ["call_a", "call_c"]);
+});
+
+test("synthetic custom messages do not move the real current-turn boundary and preserve media", () => {
+  const entries = [
+    msgEntry("user", { role: "user", content: "Do the work", timestamp: 1 }),
+    msgEntry("assistant", { role: "assistant", content: [{ type: "thinking", thinking: "active reasoning" }], timestamp: 2 }),
+    { type: "custom_message", id: "notification", parentId: "assistant", timestamp: new Date().toISOString(), content: [{ type: "image", data: "abc", mimeType: "image/png" }] },
+  ] as unknown as SessionEntry[];
+  const projected = entriesToCoreMessages(entries);
+  const reasoning = projected.find((message) => message.contentType === "reasoning");
+  const notification = projected.find((message) => message.id === "notification");
+  assert.equal(reasoning?.hardProtected, true);
+  assert.equal(notification?.synthetic, true);
+  assert.equal(notification?.hardProtected, true, "unsupported custom media remains verbatim");
+  assert.ok((notification?.estimatedInputTokens ?? 0) > 0);
 });
 
 test("message identity ignores tag-only text blocks but preserves original empty blocks", () => {

@@ -96,6 +96,7 @@ async function setupWithCompressedBlock() {
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
   const filler = (n: string) => `filler ${n} `.repeat(400);
   const entries = [
+    userMsg("e0", "Protected initial request."),
     userMsg("e1", longText),
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -108,7 +109,7 @@ async function setupWithCompressedBlock() {
   const compressTool = api.tools.find((t: any) => t.name === "compress")!;
   await compressTool.execute(
     "tc1",
-    { content: [{ startId: "m00001", endId: "m00001", summary: "Detailed initial context message for the decompress-tool tests." }] },
+    { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message for the decompress-tool tests." }] },
     undefined, undefined, ctx,
   );
 
@@ -181,6 +182,7 @@ test("decompress restores a block's original text via getEntry fallback after tr
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
   const filler = (n: string) => `filler ${n} `.repeat(400);
   const allEntries = [
+    userMsg("e0", "Protected initial request."),
     userMsg("e1", longText),
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -193,7 +195,7 @@ test("decompress restores a block's original text via getEntry fallback after tr
   const compressTool = api.tools.find((t: any) => t.name === "compress")!;
   await compressTool.execute(
     "tc1",
-    { content: [{ startId: "m00001", endId: "m00001", summary: "Detailed initial context message for the decompress-tool tests." }] },
+    { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message for the decompress-tool tests." }] },
     undefined, undefined, compressCtx,
   );
 
@@ -217,6 +219,7 @@ test("decompress keeps the degraded message when the ref is gone from both branc
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
   const filler = (n: string) => `filler ${n} `.repeat(400);
   const allEntries = [
+    userMsg("e0", "Protected initial request."),
     userMsg("e1", longText),
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -226,7 +229,7 @@ test("decompress keeps the degraded message when the ref is gone from both branc
   const compressCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, compressCtx);
   const compressTool = api.tools.find((t: any) => t.name === "compress")!;
-  await compressTool.execute("tc1", { content: [{ startId: "m00001", endId: "m00001", summary: "Detailed initial context message that needs restoration after navigation." }] }, undefined, undefined, compressCtx);
+  await compressTool.execute("tc1", { content: [{ startId: "m00002", endId: "m00002", summary: "Detailed initial context message that needs restoration after navigation." }] }, undefined, undefined, compressCtx);
 
   // e1 vanished from the full tree entirely: getEntry → undefined AND the
   // active branch is empty — nothing to fall back to.
@@ -257,6 +260,7 @@ test("decompress restores multi tool-call assistant messages (refs carry # suffi
     },
   };
   const allEntries = [
+    userMsg("e0", "Protected initial request."),
     toolCallsEntry,
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -270,7 +274,7 @@ test("decompress restores multi tool-call assistant messages (refs carry # suffi
   // e1#call-2), each with its own ref (m00001, m00002).
   await compressTool.execute(
     "tc1",
-    { content: [{ startId: "m00001", endId: "m00002", summary: "Tool call summary covering the multi tool-call assistant message content for the test." }] },
+    { content: [{ startId: "m00002", endId: "m00003", summary: "Tool call summary covering the multi tool-call assistant message content for the test." }] },
     undefined, undefined, compressCtx,
   );
 
@@ -293,6 +297,7 @@ test("decompress survives repeated compress → navigate → decompress cycles (
   const longText = "This is a detailed message that needs to be compressed. ".repeat(130);
   const filler = (n: string) => `filler ${n} `.repeat(600);
   const allEntries = [
+    userMsg("e0", "Protected initial request."),
     userMsg("e1", longText),
     userMsg("e2", filler("two")), userMsg("e3", filler("three")),
     userMsg("e4", filler("four")), userMsg("e5", filler("five")),
@@ -305,7 +310,7 @@ test("decompress survives repeated compress → navigate → decompress cycles (
   // Cycle 1: compress e1 → navigate away → decompress (fallback restores).
   const compressCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, compressCtx);
-  await compressTool.execute("tc1", { content: [{ startId: "m00001", endId: "m00001", summary: "First compression cycle summary for the repeated round-trip navigation test." }] }, undefined, undefined, compressCtx);
+  await compressTool.execute("tc1", { content: [{ startId: "m00002", endId: "m00002", summary: "First compression cycle summary for the repeated round-trip navigation test." }] }, undefined, undefined, compressCtx);
 
   let active = allEntries.filter((e) => e.id !== "e1");
   let res = await decompressTool.execute("tc2", { blockId: "b1", inline: true }, undefined, undefined, fakeCtxFullTree(allEntries, active, stateFile));
@@ -316,7 +321,7 @@ test("decompress survives repeated compress → navigate → decompress cycles (
   // NEW block over e2, navigate away, decompress the new block.
   const redoCtx = fakeCtxFullTree(allEntries, allEntries, stateFile);
   await handlers.get("context")![0]!({ type: "context", messages: [] }, redoCtx);
-  await compressTool.execute("tc3", { content: [{ startId: "m00002", endId: "m00002", summary: "Second compression cycle summary covering the filler two message for the test." }] }, undefined, undefined, redoCtx);
+  await compressTool.execute("tc3", { content: [{ startId: "m00003", endId: "m00003", summary: "Second compression cycle summary covering the filler two message for the test." }] }, undefined, undefined, redoCtx);
 
   active = allEntries.filter((e) => e.id !== "e2");
   res = await decompressTool.execute("tc4", { blockId: "b2", inline: true }, undefined, undefined, fakeCtxFullTree(allEntries, active, stateFile));

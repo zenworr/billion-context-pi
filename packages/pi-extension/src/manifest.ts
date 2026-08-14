@@ -79,7 +79,7 @@ export function extractCompressionManifest(
     .map((message) => refsByRaw[message.id])
     .filter((ref): ref is string => typeof ref === "string");
   const userMessageRefs = messages
-    .filter((message) => message.role === "user")
+    .filter((message) => message.role === "user" && !message.synthetic)
     .map((message) => refsByRaw[message.id])
     .filter((ref): ref is string => typeof ref === "string");
   const source = messages.map((message) => message.text ?? "").join("\n");
@@ -188,24 +188,22 @@ export function structuredSummaryFromRendered(
   const requirements = mergeFacts(source.requirements, rendered.requirements);
   for (const text of preserve) mergeFactInto(requirements, { text, sourceRefs: manifest.userMessageRefs });
   const files = mergeFiles(source.files, rendered.files);
-  for (const path of manifest.paths) {
-    if (!files.some((file) => file.path === path)) files.push({ path, status: "read", sourceRefs: manifest.sourceRefs });
-  }
   const commands = mergeCommands(source.commands, rendered.commands);
-  for (const command of manifest.commands) {
-    if (!commands.some((detail) => detail.command === command)) {
-      commands.push({ command, result: "Recorded in source", sourceRefs: manifest.sourceRefs });
-    }
-  }
   const errors = mergeErrors(source.errors, rendered.errors);
-  for (const exactText of manifest.errorStrings) {
-    if (!errors.some((detail) => detail.exactText === exactText)) {
-      errors.push({ exactText, sourceRefs: manifest.sourceRefs });
-    }
-  }
   const facts = mergeFacts(source.facts, rendered.facts).map((fact) => fact.text);
-  for (const exact of unique([...manifest.symbols, ...manifest.numbersAndIds])) {
-    if (!facts.includes(exact)) facts.push(exact);
+  if (tier === 1) {
+    for (const path of manifest.paths) {
+      if (!files.some((file) => file.path === path)) files.push({ path, status: "read", sourceRefs: manifest.sourceRefs });
+    }
+    for (const command of manifest.commands) {
+      if (!commands.some((detail) => detail.command === command)) commands.push({ command, result: "Recorded in source", sourceRefs: manifest.sourceRefs });
+    }
+    for (const exactText of manifest.errorStrings) {
+      if (!errors.some((detail) => detail.exactText === exactText)) errors.push({ exactText, sourceRefs: manifest.sourceRefs });
+    }
+    for (const exact of unique([...manifest.symbols, ...manifest.numbersAndIds])) {
+      if (!facts.includes(exact)) facts.push(exact);
+    }
   }
   return {
     objective: mergeFacts(source.objectives, rendered.objectives).map((fact) => fact.text),
@@ -254,18 +252,23 @@ export function structuredSummaryFromRendered(
 export function mergeCompressionManifests(
   manifests: CompressionManifest[],
   sourceHash: string,
+  tier: 1 | 2 | 3 = 1,
 ): CompressionManifest {
   const values = (select: (manifest: CompressionManifest) => string[]): string[] => unique(manifests.flatMap(select));
+  const semanticFacts = semanticFactsForTier(mergeManifestSemanticFacts(manifests), tier);
+  const semanticRefs = unique(Object.values(semanticFacts).flatMap((items) => Array.isArray(items)
+    ? items.flatMap((item) => item && typeof item === "object" && "sourceRefs" in item ? (item as { sourceRefs?: string[] }).sourceRefs ?? [] : [])
+    : []));
   return {
-    sourceRefs: values((manifest) => manifest.sourceRefs),
-    userMessageRefs: values((manifest) => manifest.userMessageRefs),
-    paths: values((manifest) => manifest.paths),
-    symbols: values((manifest) => manifest.symbols),
-    commands: values((manifest) => manifest.commands),
-    errorStrings: values((manifest) => manifest.errorStrings),
-    numbersAndIds: values((manifest) => manifest.numbersAndIds),
-    toolCalls: manifests.flatMap((manifest) => manifest.toolCalls),
-    semanticFacts: mergeManifestSemanticFacts(manifests),
+    sourceRefs: tier === 1 ? values((manifest) => manifest.sourceRefs) : semanticRefs,
+    userMessageRefs: tier === 1 ? values((manifest) => manifest.userMessageRefs) : unique(semanticFacts.requirements.flatMap((fact) => fact.sourceRefs)),
+    paths: tier === 1 ? values((manifest) => manifest.paths) : unique(semanticFacts.files.map((file) => file.path)),
+    symbols: tier === 1 ? values((manifest) => manifest.symbols) : [],
+    commands: tier === 1 ? values((manifest) => manifest.commands) : unique(semanticFacts.commands.map((command) => command.command)),
+    errorStrings: tier === 1 ? values((manifest) => manifest.errorStrings) : unique(semanticFacts.errors.map((error) => error.exactText)),
+    numbersAndIds: tier === 1 ? values((manifest) => manifest.numbersAndIds) : [],
+    toolCalls: tier === 1 ? manifests.flatMap((manifest) => manifest.toolCalls) : [],
+    semanticFacts,
     sourceHash,
   };
 }
@@ -320,7 +323,7 @@ export function sha256(value: string): string {
 function sourceSegments(messages: CoreMessage[], refsByRaw: Record<string, string>): SourceSegment[] {
   return messages.flatMap((message) => {
     const sourceRefs = refsByRaw[message.id] ? [refsByRaw[message.id]!] : [];
-    return splitText(message.text ?? "").map((text) => ({ text, sourceRefs, role: message.role }));
+    return splitText(message.text ?? "").map((text) => ({ text, sourceRefs, role: message.synthetic ? "system" : message.role }));
   });
 }
 
@@ -536,22 +539,31 @@ function semanticFactsForTier(semantic: ManifestSemanticFacts, tier: 1 | 2 | 3):
   if (tier === 1) return semantic;
   const durableDecision = (decision: ManifestDecision): boolean =>
     DURABLE_SEMANTIC_RE.test(`${decision.decision} ${decision.rationale ?? ""}`);
+  const durableFact = (fact: ManifestFact): boolean => DURABLE_SEMANTIC_RE.test(fact.text);
   if (tier === 2) {
     return {
       ...emptySemanticFacts(),
+      objectives: semantic.objectives,
       requirements: semantic.requirements,
       decisions: semantic.decisions,
+      facts: semantic.facts.filter(durableFact),
+      completed: semantic.completed,
       active: semantic.active,
       blocked: semantic.blocked,
       openQuestions: semantic.openQuestions,
       nextSteps: semantic.nextSteps,
+      files: semantic.files.filter((file) => file.status !== "read"),
+      errors: semantic.errors,
       contradictions: semantic.contradictions,
     };
   }
   return {
     ...emptySemanticFacts(),
+    objectives: semantic.objectives.filter(durableFact),
     requirements: semantic.requirements,
     decisions: semantic.decisions.filter(durableDecision),
+    facts: semantic.facts.filter(durableFact),
+    completed: semantic.completed.filter(durableFact),
     blocked: semantic.blocked,
     openQuestions: semantic.openQuestions,
     nextSteps: semantic.nextSteps,
@@ -559,7 +571,7 @@ function semanticFactsForTier(semantic: ManifestSemanticFacts, tier: 1 | 2 | 3):
   };
 }
 
-const DURABLE_SEMANTIC_RE = /\b(must|never|required|requirement|constraint|decision|because|rationale|block(?:ed|er)?|unresolved|security|compatib|invariant|do not|cannot|shall)\b/i;
+const DURABLE_SEMANTIC_RE = /\b(must|never|required|requirement|constraint|decision|because|rationale|block(?:ed|er)?|unresolved|security|compatib|invariant|do not|cannot|shall|shipped|released|merged|milestone|version|open|next)\b/i;
 
 function requiredSemanticFacts(semantic: ManifestSemanticFacts | undefined, tier: 1 | 2 | 3): RequiredSemanticFact[] {
   if (!semantic) return [];
@@ -575,6 +587,7 @@ function requiredSemanticFacts(semantic: ManifestSemanticFacts | undefined, tier
   selected.files.filter((file) => file.status !== "read").forEach((file) => {
     facts.push({ rendered: `Modified file (${file.status}): ${file.path}`, parts: [file.path] });
   });
+  selected.facts.forEach((fact) => add("Durable fact", fact));
   selected.completed.forEach((fact) => add("Completed work", fact));
   selected.active.forEach((fact) => add("Active work", fact));
   selected.blocked.forEach((fact) => add("Blocked", fact));

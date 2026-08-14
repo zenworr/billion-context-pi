@@ -95,6 +95,51 @@ test("load merges forward-compat: missing fields filled from fresh state", async
   await rm(dir, { recursive: true, force: true });
 });
 
+test("fileless sessions persist transactional state in memory", async () => {
+  const store = new SessionStateStore();
+  const loaded = await store.load(undefined, "memory-sid");
+  const stale = structuredClone(loaded);
+  loaded.nextBlockId = 9;
+  loaded.pins.push({ id: "p1", ref: "m1", mode: "summary", remainingTurns: 2, createdAt: 1 });
+  const saved = await store.save(loaded, undefined, "memory-sid");
+  assert.equal(saved.revision, 1);
+  assert.equal(saved.graphRevision, 1);
+  const reloaded = await store.load(undefined, "memory-sid");
+  assert.equal(reloaded.nextBlockId, 9);
+  assert.equal(reloaded.pins.length, 1);
+  await assert.rejects(store.save(stale, undefined, "memory-sid"), /revision changed/);
+});
+
+test("runtime session mutex serializes queued, late, and throwing holders", async () => {
+  const runtime = createRuntime({});
+  let active = 0;
+  let maximum = 0;
+  const entered: string[] = [];
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const hold = async (name: string, delay: number, shouldThrow = false) => {
+    const release = await runtime.acquireLock("mutex-sid");
+    active++;
+    maximum = Math.max(maximum, active);
+    entered.push(name);
+    try {
+      await sleep(delay);
+      if (shouldThrow) throw new Error(`holder ${name} failed`);
+    } finally {
+      active--;
+      release();
+    }
+  };
+  const first = hold("a", 20);
+  const second = hold("b", 25, true);
+  const third = hold("c", 5);
+  await sleep(22);
+  const late = hold("d", 1);
+  const results = await Promise.allSettled([first, second, third, late]);
+  assert.equal(maximum, 1);
+  assert.deepEqual(entered, ["a", "b", "c", "d"]);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+});
+
 test("inter-process lock serializes competing stores and rejects the stale writer", async () => {
   const dir = await tempDir();
   const file = path.join(dir, "session.json");
@@ -340,6 +385,27 @@ test("P1: clone inherits when own .acp.json exists but has empty blocks", async 
   assert.equal(state.blocks.length, 1);
   assert.equal(state.blocks[0]!.blockId, "b0");
   assert.equal(state.nextBlockId, 2);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("checkpoint-only fork inherits the monotonic ref ledger", async () => {
+  const dir = await tempDir();
+  const parentJsonl = path.join(dir, "parent.jsonl");
+  const childJsonl = path.join(dir, "child.jsonl");
+  await writeSessionHeader(parentJsonl);
+  const parent = createInitialState();
+  parent.messageRefs.byRaw.old = "m00042";
+  parent.messageRefs.byRef.m00042 = "old";
+  parent.messageRefs.nextRef = 43;
+  parent.nextMessageRefId = "43";
+  parent.checkpoints.push({ id: "cp1", epoch: 0, summary: "checkpoint", sourceBlockIds: [], sourceMessageIds: ["old"], tokensBefore: 0, createdAt: 1 });
+  await fs.writeFile(`${parentJsonl}.acp.json`, JSON.stringify(parent), "utf8");
+  await writeSessionHeader(childJsonl, { parentSession: parentJsonl });
+
+  const state = await new SessionStateStore().load(childJsonl, "child-sid");
+  assert.equal(state.messageRefs.byRaw.old, "m00042");
+  assert.equal(state.nextMessageRefId, "43");
+  assert.equal(state.checkpoints[0]?.id, "cp1");
   await rm(dir, { recursive: true, force: true });
 });
 

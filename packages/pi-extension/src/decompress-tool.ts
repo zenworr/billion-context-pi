@@ -213,6 +213,10 @@ async function handleDecompress(args: DecompressArgs, runtime: AcpRuntime, ctx: 
   if (checkpointOwner) {
     return handleMessageRef(arg, checkpointOwner.id, args, ctx);
   }
+  const canonicalRawId = state.messageRefs.byRef[arg];
+  if (canonicalRawId) {
+    return handleMessageRef(canonicalRawId, "canonical session history", args, ctx);
+  }
 
   // Otherwise treat as a block id.
   const blockId = parseBlockIdArg(arg);

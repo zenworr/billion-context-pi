@@ -25,7 +25,7 @@ export function estimateTokens(messages: CoreMessage[], coveredIds?: Set<string>
   for (const message of messages) {
     if (message.toolName === "compress") continue;
     if (coveredIds?.has(message.id)) continue;
-    tokens += defaultCountTokens(message.text ?? "");
+    tokens += defaultCountTokens(message.text ?? "") + Math.max(0, message.estimatedInputTokens ?? 0);
   }
   return tokens;
 }

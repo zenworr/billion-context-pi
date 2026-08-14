@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { assignRefs, highestUsedIndex } from "./refs.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import { advanceSurvival, activeBlocks, blockById } from "./state.js";
+import { activeBlocks, blockById } from "./state.js";
 import {
   allocateBlockId,
   allocateRunId,
@@ -28,6 +28,7 @@ import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
 import {
   computeProtectedRefs,
   buildCompressibleRanges,
+  expandProtocolMessageIds,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -173,6 +174,12 @@ export function createCore(ports: Ports = {}): CompressionCore {
           warnings.push(`Excluded ${protectedIds.length} protected message(s) from ${request.startRef}..${request.endRef}.`);
         }
         const sourceBlockIds = [...resolved.nestedBlockIds];
+        const pinnedBlockIds = new Set((input.state.pins ?? []).map((pin) => pin.ref));
+        const pinnedSources = sourceBlockIds.filter((id) => pinnedBlockIds.has(id));
+        if (pinnedSources.length > 0) {
+          errors.push(rangeError(request, `range overlaps pinned block(s): ${pinnedSources.join(", ")}`));
+          continue;
+        }
         const isBlockBoundary = resolved.boundaryKind === "block";
         const sourceTiers = new Set(sourceBlockIds
           .map((id) => blockById(input.state, id))
@@ -474,8 +481,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const strategy: RenderStrategy = input.renderTags ?? "all";
     const nodes = buildNodes(strategy);
     const result = runPipeline(nodes, initial, ctx);
-    const originalTokens = input.messages.reduce((sum, message) => sum + countTokens(message.text ?? ""), 0);
-    const projectedTokens = result.messages.reduce((sum, message) => sum + countTokens(message.text ?? ""), 0);
+    const originalTokens = input.messages.reduce((sum, message) => sum + messageInputTokens(message, countTokens), 0);
+    const projectedTokens = result.messages.reduce((sum, message) => sum + messageInputTokens(message, countTokens), 0);
     const tokensCleared = result.effects.clearing?.savedTokens ?? 0;
     const beforeShape = input.messages.map(projectionIdentity).join("\n");
     const afterShape = result.messages.map(projectionIdentity).join("\n");
@@ -573,7 +580,7 @@ const assignRefsNode: PipelineNode = {
       : undefined;
     const refResult = assignRefs(io.messages, {
       existing: io.state.messageRefs,
-      nextIndex: highestUsedIndex(io.state.messageRefs) + 1,
+      nextIndex: Number(io.state.nextMessageRefId ?? highestUsedIndex(io.state.messageRefs) + 1),
       isProtected: protectedFn,
     });
     const tokenSnapshots = { ...(io.state.tokenSnapshots ?? {}) };
@@ -583,15 +590,22 @@ const assignRefsNode: PipelineNode = {
         tokenSnapshots[message.id] = countTokens(message.text ?? "");
       }
     }
-    return { ...io, state: { ...io.state, messageRefs: refResult.map, tokenSnapshots } };
+    return {
+      ...io,
+      state: {
+        ...io.state,
+        messageRefs: refResult.map,
+        nextMessageRefId: String(refResult.nextIndex),
+        tokenSnapshots,
+      },
+    };
   },
 };
 
 const syncBlocksNode: PipelineNode = {
   name: "sync-blocks",
-  run(io, ctx) {
+  run(io) {
     const synced = syncBlocks(io.messages, io.state);
-    advanceSurvival(synced.state, ctx.config.promotionThreshold);
     return { ...io, state: synced.state };
   },
 };
@@ -627,8 +641,16 @@ const clearHistoricalNode: PipelineNode = {
   run(io, ctx) {
     const clearing = ctx.config.clearing;
     if (!clearing) return io;
+    const pinnedIds = new Set<string>();
+    for (const pin of io.state.pins ?? []) {
+      const rawId = io.state.messageRefs.byRef[pin.ref];
+      if (rawId) pinnedIds.add(rawId);
+      const block = blockById(io.state, pin.ref);
+      for (const id of block?.effectiveMessageIds ?? []) pinnedIds.add(id);
+    }
+    const clearingMessages = io.messages.map((message) => pinnedIds.has(message.id) ? { ...message, hardProtected: true } : message);
     const cleared = clearHistoricalContent(
-      io.messages,
+      clearingMessages,
       io.state.artifacts,
       clearing,
       ctx.countTokens,
@@ -770,6 +792,9 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     messages: input.messages,
     state: input.state,
   });
+  const pinnedBlockIds = new Set((input.state.pins ?? []).map((pin) => pin.ref));
+  const pinnedSources = resolved.nestedBlockIds.filter((id) => pinnedBlockIds.has(id));
+  if (pinnedSources.length > 0) throw new Error(`Range overlaps pinned block(s): ${pinnedSources.join(", ")}.`);
 
   const rangeMessageIds = applyPairBoundaryAdjustments(
     resolved,
@@ -946,45 +971,19 @@ function applyPairBoundaryAdjustments(
   resolved: { startIndex: number; endIndex: number; messageIds: string[]; boundaryKind: string },
   messages: CoreMessage[],
 ): string[] {
-  if (resolved.boundaryKind === "block") {
-    return resolved.messageIds;
-  }
-  // Compose tool-pair and reasoning-pair boundary adjustments to a fixpoint
-  // (≤2 passes). Reasoning may pull in a tool-call whose result tool-pairs
-  // then extends for; tool-pairs may pull in a tool-call whose preceding
-  // reasoning is then drawn in. Both only ever WIDEN the range.
+  if (resolved.boundaryKind === "block") return resolved.messageIds;
   let startIndex = resolved.startIndex;
   let endIndex = resolved.endIndex;
   for (let pass = 0; pass < 2; pass++) {
-    const reasoningAdjusted = adjustBoundariesForReasoningPairs(
-      startIndex,
-      endIndex,
-      messages,
-    );
-    const toolAdjusted = adjustBoundariesForToolPairs(
-      reasoningAdjusted.startIndex,
-      reasoningAdjusted.endIndex,
-      messages,
-    );
-    const changed =
-      toolAdjusted.startIndex !== startIndex ||
-      toolAdjusted.endIndex !== endIndex;
-    startIndex = toolAdjusted.startIndex;
-    endIndex = toolAdjusted.endIndex;
-    if (!changed) break;
+    const reasoning = adjustBoundariesForReasoningPairs(startIndex, endIndex, messages);
+    const tools = adjustBoundariesForToolPairs(reasoning.startIndex, reasoning.endIndex, messages);
+    if (tools.startIndex === startIndex && tools.endIndex === endIndex) break;
+    startIndex = tools.startIndex;
+    endIndex = tools.endIndex;
   }
-  if (
-    startIndex === resolved.startIndex &&
-    endIndex === resolved.endIndex
-  ) {
-    return resolved.messageIds;
-  }
-  const ids: string[] = [];
-  for (let i = startIndex; i <= endIndex; i++) {
-    const msg = messages[i];
-    if (msg) ids.push(msg.id);
-  }
-  return ids;
+  const legacyIds = messages.slice(startIndex, endIndex + 1).map((message) => message.id);
+  const expanded = expandProtocolMessageIds(legacyIds, messages);
+  return messages.filter((message) => expanded.has(message.id)).map((message) => message.id);
 }
 
 function validateCompressionRange(
@@ -1029,41 +1028,26 @@ function filterProtectedToolMessages(
   messages: CoreMessage[],
   config: Config,
 ): string[] {
-  // Protected tool calls (and their results, paired by toolCallId) stay in
-  // visible context and are simply dropped from the compressible set. They are
-  // NOT folded into the summary — the summary reflects what the author wrote,
-  // nothing auto-appended.
+  // If one member is protected, preserve its complete provider replay group.
+  // A partial assistant reasoning/text/call group is not valid provider input.
   const protectedCallIds = new Set<string>();
-  const removedIds = new Set<string>();
-  for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
-      protectedCallIds.add(msg.toolCallId);
-    }
+  const removedSeeds = new Set<string>();
+  const messageById = new Map(messages.map((message) => [message.id, message]));
+  for (const message of messages) {
+    if (isMessageProtected(message, config) && message.toolCallId) protectedCallIds.add(message.toolCallId);
   }
-
   for (const id of directMessageIds) {
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (isMessageProtected(msg, config)) {
-      removedIds.add(id);
-      if (msg.toolCallId) protectedCallIds.add(msg.toolCallId);
-    }
+    const message = messageById.get(id);
+    if (!message) continue;
+    if (isMessageProtected(message, config)) removedSeeds.add(id);
+    if (message.contentType === "tool-result" && message.toolCallId && protectedCallIds.has(message.toolCallId)) removedSeeds.add(id);
   }
-
-  for (const id of directMessageIds) {
-    if (removedIds.has(id)) continue;
-    const msg = messages.find((m) => m.id === id);
-    if (!msg) continue;
-    if (
-      msg.contentType === "tool-result" &&
-      msg.toolCallId &&
-      protectedCallIds.has(msg.toolCallId)
-    ) {
-      removedIds.add(id);
-    }
-  }
-
+  const removedIds = expandProtocolMessageIds(removedSeeds, messages);
   return directMessageIds.filter((id) => !removedIds.has(id));
+}
+
+function messageInputTokens(message: CoreMessage, countTokens: (text: string) => number): number {
+  return countTokens(message.text ?? "") + Math.max(0, message.estimatedInputTokens ?? 0);
 }
 
 function resolveTargetTier(

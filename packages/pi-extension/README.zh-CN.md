@@ -149,7 +149,7 @@ billion-context-pi 开箱即用,无需任何配置。可以在 JSON 配置文件
 ```json
 {
   "debug": false,
-  "autoUpdate": true,
+  "autoUpdate": false,
   "modelContextLimit": 200000,
   "delegate": true,
   "toolBashDefaultTimeout": 60,
@@ -178,16 +178,16 @@ billion-context-pi 开箱即用,无需任何配置。可以在 JSON 配置文件
 | Key | 默认值 | 说明 |
 |-----|--------|------|
 | `debug` | `false` | 启用诊断日志(`error`/`warn`/`info` 始终写入 `~/.pi/acp.log`,此开关仅额外打开详细 `debug` 事件)。也可用环境变量 `ACP_DEBUG=1` 启用。 |
-| `autoUpdate` | `true` | Pi 启动时检查 npm 是否有更新版本并自动安装(限频:每 3 分钟最多一次检查)。禁用以避免所有启动时的网络请求。 |
+| `autoUpdate` | `false` | 检查 npm 并只显示更新通知。ACP 绝不自动安装更新。禁用可避免启动网络请求。 |
 | `modelContextLimit` | *(自动)* | 覆盖上下文上限(token 数)。默认为模型的 `contextWindow`。 |
 | `delegate` | `true` | 启用 `acp_delegate` 工具(delegate/wait/cancel)及其系统提示词段落。设为 `false` 则不注册这些工具(例如你用了别的子代理扩展,或跑 headless 场景异步注入没有意义)。 |
 | `toolBashDefaultTimeout` | `60` | 当模型未指定 `timeout` 时注入 `bash` 工具的超时秒数。Pi **本身没有默认超时**,不加这个,一次遗漏的超时可能挂起几千秒。超时后会提示模型用更大的 `timeout` 重跑。设为 `0` 恢复 Pi 的无界行为。 |
-| `toolOutputMaxBytes` | `200000` | 工具结果文本硬上限(字节,约 5000 行 @ ~40 字节/行,通过 `tool_result` hook 应用)。用于兜住 Pi 自身 50KB/2000 行截断管不到的输出(例如 Pi 未加限制的工具)。触发截断时会告诉模型如何查看完整输出——对 `bash`,完整输出在其临时文件(`BashToolDetails.fullOutputPath`)中;设更小(如 `8192`)可更省上下文,设 `0` 关闭。 |
+| `toolOutputMaxBytes` | `200000` | 工具结果文本上限。ACP 先将完整输出写入私有、内容寻址存储；存储失败时不施加额外截断。非文本块保持不变。 |
 | `compress.maxContextLimit` | `"75%"` | 触发强制压缩 nudge 的上下文阈值。 |
 | `compress.emergencyThresholdPercent` | `"95%"` | 触发紧急截断的上下文阈值。 |
 | `compress.nudgeGrowthTokens` | `50000` | 软压缩 nudge 的 token 增长步长。 |
 | `compress.model` | *(未设置)* | `/acp-model` 选择的 `provider/model-id`。 |
-| `compress.thinkingLevel` | `"medium"` | 已配置模型使用的思考级别。 |
+| `compress.thinkingLevel` | `"medium"` | 已配置模型的默认思考级别；也可分别配置 Tier 2、Tier 3、检查点和分支摘要。 |
 | `compress.tier1Compressor` | `"main"` | Tier 1 摘要模型：`"main"` 或 `"configured"`。 |
 | `compress.tier2Compressor` | `"main"` | Tier 2 摘要模型：`"main"` 或 `"configured"`。 |
 | `compress.tier3Compressor` | `"main"` | Tier 3 摘要模型：`"main"` 或 `"configured"`。 |
